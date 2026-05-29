@@ -14,6 +14,7 @@ _ATOMS = [
     ("HETATM", 9, "O",   "HOH", "W", 2, 6.000,  5.000, 0.000, "O"),
 ]
 
+
 def write_mini_pdb(path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

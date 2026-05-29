@@ -24,6 +24,8 @@ class SmokeTests(unittest.TestCase):
                 ["vmd", "-dispdev", "text", "-eofexit", "-e", str(script)],
                 capture_output=True, text=True, timeout=120,
             )
+            self.assertEqual(out.returncode, 0,
+                             msg=f"VMD exited {out.returncode}\nstderr:\n{out.stderr}")
             self.assertIn(f"PROBE> numatoms={EXPECTED_NUMATOMS}", out.stdout,
                           msg=f"stdout was:\n{out.stdout}\nstderr:\n{out.stderr}")
 
