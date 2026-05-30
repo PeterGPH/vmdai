@@ -1,0 +1,21 @@
+task_id: traj_render_001
+category: trajectory
+bucket: operational
+difficulty: easy
+dimensions: [actionability, reproducibility]
+initial_state:
+  files: [mini.pdb]
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+user_prompt: Load the structure and render a publication image with white background to out.tga.
+verify:
+  required:
+    - {kind: molecule_loaded,  where: {}}
+    - {kind: frames_loaded,    where: {min: 1}}
+    - {kind: display_property, where: {bg_color: white}}
+    - {kind: file_rendered,    where: {path: out.tga, must_be_image: true, min_bytes: 1000}}
+  optional:
+    - {kind: no_runtime_errors, where: {}}
+reproducibility:
+  exports: [tcl]
+  replay_clean: true

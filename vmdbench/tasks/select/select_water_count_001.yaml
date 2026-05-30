@@ -1,0 +1,17 @@
+task_id: select_water_count_001
+category: selection
+bucket: lookup
+difficulty: easy
+dimensions: [semantic_grounding]
+initial_state:
+  files: [mini.pdb]
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+user_prompt: Load the structure (the gold water count is regenerated from the oracle).
+verify:
+  required:
+    - {kind: molecule_loaded, where: {}}
+    - {kind: selection_count, where: {selection: water, expect: 2}}
+    - {kind: selection_count, where: {selection: protein, min: 1}}
+  optional:
+    - {kind: no_runtime_errors, where: {}}
