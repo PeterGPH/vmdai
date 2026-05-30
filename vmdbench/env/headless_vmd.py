@@ -54,7 +54,24 @@ proc __vb_introspect {sels} {
 # back to the app bundle binary so that atomselect macros and other VMD
 # subsystems are available.
 _MACOS_VMD_APP = Path("/Applications/VMD.app/Contents/vmd")
-_MACOS_VMD_BIN = _MACOS_VMD_APP / "vmd_MACOSXARM64"
+
+
+def _has_scripts(d: Path) -> bool:
+    return (Path(d) / "scripts" / "vmd" / "atomselmacros.dat").exists()
+
+
+def _macos_app_binary() -> Path | None:
+    """Locate the VMD app-bundle binary for the current arch.
+
+    The binary name encodes the platform (vmd_MACOSXARM64 on Apple Silicon,
+    vmd_MACOSXX86_64 on Intel), so glob rather than hardcode a single arch.
+    """
+    if not _MACOS_VMD_APP.exists():
+        return None
+    for cand in sorted(_MACOS_VMD_APP.glob("vmd_MACOSX*")):
+        if os.access(cand, os.X_OK):
+            return cand
+    return None
 
 
 def _resolve_vmd(vmd_bin: str) -> tuple[str, str | None]:
@@ -65,16 +82,23 @@ def _resolve_vmd(vmd_bin: str) -> tuple[str, str | None]:
     symlink that lives in a directory without the VMD scripts (e.g. a ~/.local/bin
     symlink), VMDDIR points to the wrong place and atomselect macros are missing.
 
-    This function detects that case and, on macOS, falls back to the app-bundle
-    binary + injects the correct VMDDIR so that all VMD subsystems are available.
-    The second element is the VMDDIR to inject into the subprocess environment,
-    or None if no override is needed (env already has a valid VMDDIR or the binary
-    is alongside its scripts).
+    Resolution order: explicit VMDBENCH_VMD_BIN override → valid env VMDDIR →
+    PATH binary that has its scripts alongside → macOS app-bundle fallback (with
+    injected VMDDIR). The second element is the VMDDIR to inject into the
+    subprocess environment, or None when no override is needed.
     """
+    # Explicit escape hatch for any platform / non-standard install.
+    override = os.environ.get("VMDBENCH_VMD_BIN")
+    if override:
+        if not Path(override).exists():
+            raise RuntimeError(f"VMDBENCH_VMD_BIN={override!r} does not exist")
+        parent = Path(override).parent
+        return override, (str(parent) if _has_scripts(parent) else None)
+
     # If VMDDIR is already set in the environment and the scripts exist there,
     # trust it — the caller knows what they are doing.
     env_vmddir = os.environ.get("VMDDIR", "")
-    if env_vmddir and (Path(env_vmddir) / "scripts" / "vmd" / "atomselmacros.dat").exists():
+    if env_vmddir and _has_scripts(Path(env_vmddir)):
         path = shutil.which(vmd_bin)
         if path is None:
             raise RuntimeError(f"VMD binary '{vmd_bin}' not found on PATH")
@@ -86,13 +110,13 @@ def _resolve_vmd(vmd_bin: str) -> tuple[str, str | None]:
 
     # Check whether the scripts directory sits next to the *called* binary
     # (NOT the resolved symlink target — VMD uses the called path, not realpath).
-    called_dir = Path(path).parent
-    if (called_dir / "scripts" / "vmd" / "atomselmacros.dat").exists():
+    if _has_scripts(Path(path).parent):
         return path, None  # properly installed; no VMDDIR override needed
 
     # Scripts not found alongside the called binary — try the macOS app bundle.
-    if _MACOS_VMD_BIN.exists() and (_MACOS_VMD_APP / "scripts" / "vmd" / "atomselmacros.dat").exists():
-        return str(_MACOS_VMD_BIN), str(_MACOS_VMD_APP)
+    app_bin = _macos_app_binary()
+    if app_bin is not None and _has_scripts(_MACOS_VMD_APP):
+        return str(app_bin), str(_MACOS_VMD_APP)
 
     # Fall back to whatever is on PATH and hope for the best.
     return path, None
