@@ -56,6 +56,8 @@ def load_card(path: str | Path) -> TaskCard:
             raise CardError(f"{path}: missing required field '{f}'")
 
     verify = data["verify"] or {}
+    if not isinstance(verify, dict):
+        raise CardError(f"{path}: 'verify' must be a mapping")
     required = verify.get("required", []) or []
     optional = verify.get("optional", []) or []
     if not required:
