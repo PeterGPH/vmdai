@@ -7,6 +7,15 @@ _MOL = re.compile(r"^mol(?P<id>\d+)_(?P<attr>name|filename|filetype|numatoms|num
 _REP = re.compile(r"^rep(?P<mol>\d+)_(?P<rep>\d+)_(?P<attr>style|selection|color|material|visible)$")
 _SEL = re.compile(r"^sel(?P<idx>\d+)_(?P<attr>count|error)$")
 
+# ERROR) lines from VMD infrastructure that are benign and should not be counted
+# as user-script errors.  These arise from optional subsystems (STRIDE secondary-
+# structure assignment) that degrade gracefully when they fail.
+_BENIGN_ERROR = re.compile(
+    r"(Unable to find Stride output file"
+    r"|Stride::read_stride_record"
+    r"|Call to Stride program failed)"
+)
+
 _IDENTITY = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
 
 
@@ -97,7 +106,9 @@ def parse_probe_lines(stdout: str, selection_texts: list[str] | None = None) -> 
     for line in stdout.splitlines():
         line = line.rstrip()
         if line.startswith("ERROR)"):
-            scene.errors.append(line[len("ERROR)"):].strip())
+            msg = line[len("ERROR)"):].strip()
+            if not _BENIGN_ERROR.search(msg):
+                scene.errors.append(msg)
             continue
         m = _PROBE.match(line)
         if not m:
