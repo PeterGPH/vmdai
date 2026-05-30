@@ -64,14 +64,28 @@ class SceneState:
         return rot is not None and rot != _IDENTITY
 
 
+def _to_floats(tokens: list[str]) -> list[float]:
+    out = []
+    for x in tokens:
+        try:
+            out.append(float(x))
+        except ValueError:
+            out.append(float("nan"))  # tolerate malformed VMD output without crashing the parser
+    return out
+
+
 def _parse_tcl_matrix(s: str) -> list:
-    """Parse VMD brace nesting like '{{1 0 0 0} {0 1 0 0}}' or '{3.9 2.6 1.5}' into nested float lists."""
+    """Parse VMD brace nesting like '{{1 0 0 0} {0 1 0 0}}' or '{3.9 2.6 1.5}' into nested float lists.
+
+    Malformed numeric tokens degrade to NaN rather than raising, so one bad camera
+    value cannot crash an entire benchmark run.
+    """
     s = s.strip()
     if s.startswith("{{"):
         rows = re.findall(r"\{([^{}]*)\}", s)
-        return [[float(x) for x in row.split()] for row in rows]
+        return [_to_floats(row.split()) for row in rows]
     inner = s.strip("{}")
-    return [float(x) for x in inner.split()] if inner else []
+    return _to_floats(inner.split()) if inner else []
 
 
 def parse_probe_lines(stdout: str, selection_texts: list[str] | None = None) -> SceneState:
