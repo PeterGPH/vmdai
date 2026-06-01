@@ -1,0 +1,25 @@
+task_id: view_orient_001
+category: visualization
+bucket: synthesis
+difficulty: easy
+dimensions: [actionability, reproducibility]
+initial_state:
+  files: [mini.pdb]
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+user_prompt: >
+  Load the structure, show protein as NewCartoon and nucleic as Licorice,
+  orient the camera away from the default view, set a white background, and
+  render the oriented view to out.tga.
+verify:
+  required:
+    - {kind: molecule_loaded,      where: {}}
+    - {kind: representation_count, where: {expect: 2}}
+    - {kind: camera_changed,       where: {from_default: true}}
+    - {kind: display_property,     where: {bg_color: white}}
+    - {kind: file_rendered,        where: {path: out.tga, must_be_image: true, min_bytes: 1000}}
+  optional:
+    - {kind: no_runtime_errors,    where: {}}
+reproducibility:
+  exports: [tcl]
+  replay_clean: true

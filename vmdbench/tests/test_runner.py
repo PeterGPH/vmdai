@@ -32,6 +32,13 @@ class RunnerLiveTests(unittest.TestCase):
         res = self._verify("traj/traj_render_001.yaml", "traj_render_001.tcl")
         self.assertTrue(res.gate, [(r.kind, r.observed) for r in res.required])
 
+    def test_view_orient_oracle_passes_gate(self):
+        # Exercises representation_count + camera_changed (kinds the other cards don't use).
+        res = self._verify("viz/view_orient_001.yaml", "view_orient_001.tcl")
+        failed = [r.kind for r in res.required if not r.passed]
+        self.assertTrue(res.gate, f"oracle should satisfy verifier; failed: {failed}\nobserved: "
+                                  f"{[(r.kind, r.observed) for r in res.required]}")
+
     def test_empty_transcript_fails_gate(self):
         card = load_card(TASKS / "viz/viz_protein_dna_001.yaml")
         with tempfile.TemporaryDirectory() as d:
