@@ -133,6 +133,8 @@ def foreground_coverage(pixels, bg, tol):
 
 
 def dominant_colors(pixels, bg, tol, min_fraction, levels=4):
+    if levels < 2:
+        raise ValueError(f"levels must be >= 2, got {levels}")
     fg = [c for c in pixels if not colors_close(c, bg, tol)]
     if not fg:
         return []

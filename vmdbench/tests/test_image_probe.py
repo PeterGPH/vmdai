@@ -143,6 +143,14 @@ class PaletteTests(unittest.TestCase):
         self.assertTrue(color_matches(parse_color("blue"), B))
         self.assertFalse(color_matches(parse_color("blue"), G))
 
+    def test_levels_below_two_raises(self):
+        pixels, bg = self._load("lv.tga", [(255, 0, 0)] * 16)
+        self.assertRaises(ValueError, dominant_colors, pixels, bg, 0.06, 0.03, 1)
+
+    def test_empty_foreground_returns_empty(self):
+        pixels, bg = self._load("empty.tga", [(255, 255, 255)] * 16)
+        self.assertEqual(dominant_colors(pixels, bg, 0.06, 0.03), [])
+
 
 if __name__ == "__main__":
     unittest.main()
