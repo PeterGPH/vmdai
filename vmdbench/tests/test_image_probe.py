@@ -7,6 +7,7 @@ if str(ROOT) not in sys.path:
 from vmdbench.env.image_probe import (
     load_pixels, ImageDecodeError,
     parse_color, colors_close, detect_background, foreground_coverage,
+    dominant_colors, color_matches,
 )
 
 
@@ -103,6 +104,44 @@ class CoverageTests(unittest.TestCase):
         pixels, w, h = load_pixels(self.dir / "blank.tga")
         bg = detect_background(pixels, w, h)
         self.assertEqual(foreground_coverage(pixels, bg, 0.06), 0.0)
+
+
+class PaletteTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _load(self, name, px):
+        (self.dir / name).write_bytes(_make_tga(4, 4, px))
+        pixels, w, h = load_pixels(self.dir / name)
+        return pixels, detect_background(pixels, w, h)
+
+    def test_two_dominant_colors(self):
+        W, R, B = (255, 255, 255), (255, 0, 0), (0, 0, 255)
+        px = [W, W, W, W,  W, R, B, W,  W, R, B, W,  W, W, W, W]
+        pixels, bg = self._load("two.tga", px)
+        self.assertEqual(len(dominant_colors(pixels, bg, 0.06, 0.03)), 2)
+
+    def test_expect_colors_match_under_jitter(self):
+        W = (255, 255, 255)
+        R, B = (230, 20, 15), (15, 25, 235)  # shaded red / blue
+        px = [W, W, W, W,  W, R, B, W,  W, R, B, W,  W, W, W, W]
+        pixels, bg = self._load("jit.tga", px)
+        dom = dominant_colors(pixels, bg, 0.06, 0.03)
+        self.assertTrue(any(color_matches(parse_color("red"), c) for c, _ in dom))
+        self.assertTrue(any(color_matches(parse_color("blue"), c) for c, _ in dom))
+
+    def test_achromatic_distinct_from_chromatic(self):
+        W, G, B = (255, 255, 255), (128, 128, 128), (0, 0, 255)
+        px = [W, W, W, W,  W, G, B, W,  W, G, B, W,  W, W, W, W]
+        pixels, bg = self._load("achr.tga", px)
+        self.assertEqual(len(dominant_colors(pixels, bg, 0.06, 0.03)), 2)
+        self.assertTrue(color_matches(parse_color("gray"), G))
+        self.assertTrue(color_matches(parse_color("blue"), B))
+        self.assertFalse(color_matches(parse_color("blue"), G))
 
 
 if __name__ == "__main__":

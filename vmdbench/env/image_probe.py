@@ -130,3 +130,34 @@ def foreground_coverage(pixels, bg, tol):
         return 0.0
     fg = sum(1 for c in pixels if not colors_close(c, bg, tol))
     return fg / len(pixels)
+
+
+def dominant_colors(pixels, bg, tol, min_fraction, levels=4):
+    fg = [c for c in pixels if not colors_close(c, bg, tol)]
+    if not fg:
+        return []
+    step = 255.0 / (levels - 1)
+    buckets = {}
+    for (r, g, b) in fg:
+        key = (round(r / step), round(g / step), round(b / step))
+        acc = buckets.setdefault(key, [0, 0, 0, 0])
+        acc[0] += r; acc[1] += g; acc[2] += b; acc[3] += 1
+    n = len(fg)
+    out = []
+    for (sr, sg, sb, cnt) in buckets.values():
+        frac = cnt / n
+        if frac >= min_fraction:
+            out.append(((sr // cnt, sg // cnt, sb // cnt), frac))
+    out.sort(key=lambda t: -t[1])
+    return out
+
+
+def color_matches(target, color, hue_tol=25.0, sat_min=0.15, val_tol=0.25):
+    th, ts, tv = rgb_to_hsv(*target)
+    ch, cs, cv = rgb_to_hsv(*color)
+    if ts < sat_min:  # achromatic target (white/gray/black) — match by lightness
+        return cs < sat_min and abs(tv - cv) <= val_tol
+    if cs < sat_min:
+        return False
+    dh = abs(th - ch) % 360
+    return min(dh, 360 - dh) <= hue_tol
