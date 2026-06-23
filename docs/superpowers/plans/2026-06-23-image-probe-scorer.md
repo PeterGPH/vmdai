@@ -515,12 +515,12 @@ Expected: FAIL — `KeyError: "no evaluator for assertion kind 'image_foreground
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add the import near the top of `vmdbench/verify/checks.py` (after the existing imports, ~line 7):
+Add the import near the top of `vmdbench/verify/checks.py` (after the existing imports, ~line 7) — only the names this evaluator uses (Task 5 extends this line):
 
 ```python
 from vmdbench.env.image_probe import (
     ImageDecodeError, load_pixels, detect_background, foreground_coverage,
-    dominant_colors, parse_color, colors_close, color_matches,
+    parse_color, colors_close,
 )
 ```
 
@@ -569,7 +569,7 @@ git commit -m "feat(vmdbench): image_foreground evaluator"
 - Test: `vmdbench/tests/test_image_probe.py`
 
 **Interfaces:**
-- Consumes: `dominant_colors`, `color_matches`, `parse_color`, `detect_background`, `load_pixels`, `ImageDecodeError` (already imported in Task 4).
+- Consumes: `dominant_colors`, `color_matches`, `parse_color`, `detect_background`, `load_pixels`, `ImageDecodeError`. `parse_color`/`detect_background`/`load_pixels`/`ImageDecodeError` were imported in Task 4; this task extends the import line to add `dominant_colors`, `color_matches`.
 - Produces: a registered `image_palette` evaluator.
 
 - [ ] **Step 1: Write the failing test**
