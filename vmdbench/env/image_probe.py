@@ -64,7 +64,7 @@ def load_pixels(path):
         raise ImageDecodeError(f"image not found: {p}")
     raw = p.read_bytes()
     rows, w, h = _decode_png(raw) if raw[:8] == b"\x89PNG\r\n\x1a\n" else _decode_tga(raw)
-    stride = max(1, max(w, h) // DOWNSAMPLE_MAX)
+    stride = max(1, (max(w, h) + DOWNSAMPLE_MAX - 1) // DOWNSAMPLE_MAX)  # ceil → long edge always <= DOWNSAMPLE_MAX
     pixels, ys, xs = [], range(0, h, stride), range(0, w, stride)
     for ry in ys:
         for cx in xs:

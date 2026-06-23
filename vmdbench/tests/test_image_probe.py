@@ -60,6 +60,13 @@ class ImageDecodeTests(unittest.TestCase):
         with self.assertRaises(ImageDecodeError):
             load_pixels(self.dir / "d.tga")
 
+    def test_downsample_non_multiple(self):
+        px = [(1, 2, 3)] * 399
+        (self.dir / "nm.tga").write_bytes(_make_tga(399, 1, px))
+        _, w, h = load_pixels(self.dir / "nm.tga")
+        self.assertLessEqual(w, 200)
+        self.assertEqual((w, h), (200, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
