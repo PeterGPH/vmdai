@@ -70,3 +70,63 @@ def load_pixels(path):
         for cx in xs:
             pixels.append(rows[ry][cx])
     return pixels, len(xs), len(ys)
+
+
+_COLOR_NAMES = {
+    "red": (255, 0, 0), "green": (0, 255, 0), "blue": (0, 0, 255),
+    "cyan": (0, 255, 255), "magenta": (255, 0, 255), "yellow": (255, 255, 0),
+    "orange": (255, 128, 0), "purple": (160, 32, 240), "pink": (255, 105, 180),
+    "white": (255, 255, 255), "gray": (128, 128, 128), "grey": (128, 128, 128),
+    "black": (0, 0, 0), "silver": (192, 192, 192), "tan": (210, 180, 140),
+}
+
+
+def parse_color(name_or_hex):
+    s = str(name_or_hex).strip().lower()
+    if s.startswith("#") and len(s) == 7:
+        return (int(s[1:3], 16), int(s[3:5], 16), int(s[5:7], 16))
+    if s in _COLOR_NAMES:
+        return _COLOR_NAMES[s]
+    raise ValueError(f"unknown color {name_or_hex!r}")
+
+
+def colors_close(c1, c2, tol):
+    return max(abs(a - b) for a, b in zip(c1, c2)) <= tol * 255.0
+
+
+def rgb_to_hsv(r, g, b):
+    r, g, b = r / 255.0, g / 255.0, b / 255.0
+    mx, mn = max(r, g, b), min(r, g, b)
+    d = mx - mn
+    if d == 0:
+        h = 0.0
+    elif mx == r:
+        h = (60 * ((g - b) / d) + 360) % 360
+    elif mx == g:
+        h = (60 * ((b - r) / d) + 120) % 360
+    else:
+        h = (60 * ((r - g) / d) + 240) % 360
+    s = 0.0 if mx == 0 else d / mx
+    return (h, s, mx)
+
+
+def detect_background(pixels, w, h):
+    border = []
+    for cx in range(w):
+        border.append(pixels[cx])
+        border.append(pixels[(h - 1) * w + cx])
+    for ry in range(h):
+        border.append(pixels[ry * w])
+        border.append(pixels[ry * w + (w - 1)])
+    mid = len(border) // 2
+    rs = sorted(c[0] for c in border)
+    gs = sorted(c[1] for c in border)
+    bs = sorted(c[2] for c in border)
+    return (rs[mid], gs[mid], bs[mid])
+
+
+def foreground_coverage(pixels, bg, tol):
+    if not pixels:
+        return 0.0
+    fg = sum(1 for c in pixels if not colors_close(c, bg, tol))
+    return fg / len(pixels)
