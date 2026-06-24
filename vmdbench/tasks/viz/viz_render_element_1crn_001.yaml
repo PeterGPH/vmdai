@@ -1,0 +1,27 @@
+task_id: viz_render_element_1crn_001
+category: visualization
+bucket: synthesis
+difficulty: easy
+dimensions: [actionability, semantic_grounding]
+initial_state:
+  files: [1crn.pdb]
+  pdb: 1CRN
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# Verifies the PICTURE, not just the scene graph: the render is non-empty on a white
+# background (image_foreground) and the element colors actually appear — oxygen red,
+# nitrogen blue (image_palette). Bands calibrated from the oracle via score-oracle.
+user_prompt: >
+  Load 1CRN, color it by element, set a white background, and render the scene to out.tga.
+verify:
+  required:
+    - {kind: molecule_loaded,       where: {}}
+    - {kind: representation_exists, where: {color: Element}}
+    - {kind: file_rendered,         where: {path: out.tga, must_be_image: true, min_bytes: 1000}}
+    - {kind: image_foreground,      where: {path: out.tga, background: white, check_background: true, min_coverage: 0.02}}
+    - {kind: image_palette,         where: {path: out.tga, min_distinct: 2, expect_colors: [red, blue]}}
+  optional:
+    - {kind: no_runtime_errors,     where: {}}
+reproducibility:
+  exports: [tcl]
+  replay_clean: true

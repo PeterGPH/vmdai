@@ -11,7 +11,11 @@ from vmdbench.env.image_probe import (
 )
 from vmdbench.verify.checks import evaluate, CheckContext
 from vmdbench.env.scene_state import SceneState
+from vmdbench.spec.task_card import load_card
+from vmdbench.adapters.oracle_tcl import run_oracle
 
+_TASKS = ROOT / "vmdbench" / "tasks"
+_ORACLES = ROOT / "vmdbench" / "oracles"
 
 
 def _make_tga(w: int, h: int, pixels, top_to_bottom: bool = True) -> bytes:
@@ -215,6 +219,25 @@ class ImagePaletteEvalTests(unittest.TestCase):
         (self.ctx.workdir / "junk.tga").write_bytes(b"not a tga")
         r = self._ev({"path": "junk.tga", "min_distinct": 1})
         self.assertFalse(r.passed)
+
+
+class ImageProbeLiveTests(unittest.TestCase):
+    def test_image_probes_on_real_element_render(self):
+        card = load_card(_TASKS / "viz" / "viz_render_element_1crn_001.yaml")
+        with tempfile.TemporaryDirectory() as d:
+            run = run_oracle(card, _ORACLES / "viz_render_element_1crn_001.tcl", Path(d))
+            self.assertTrue((run.workdir / "out.tga").exists(), run.result.stderr)
+            ctx = CheckContext(workdir=run.workdir)
+            fg = evaluate({"kind": "image_foreground",
+                           "where": {"path": "out.tga", "background": "white",
+                                     "check_background": True, "min_coverage": 0.02}},
+                          run.result.scene, ctx)
+            self.assertTrue(fg.passed, fg.observed)
+            pal = evaluate({"kind": "image_palette",
+                            "where": {"path": "out.tga", "min_distinct": 2,
+                                      "expect_colors": ["red", "blue"]}},
+                           run.result.scene, ctx)
+            self.assertTrue(pal.passed, pal.observed)
 
 
 if __name__ == "__main__":
