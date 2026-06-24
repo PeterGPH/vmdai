@@ -22,6 +22,7 @@ _REQUIRED_WHERE: dict[str, list[str]] = {
     "selection_visible": ["selection"],
     "file_rendered": ["path"],
     "file_exists": ["path"],
+    "scalar_within": ["name"],
 }
 
 

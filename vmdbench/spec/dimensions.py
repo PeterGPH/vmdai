@@ -27,5 +27,6 @@ KIND_DIMENSIONS: dict[str, list[Dimension]] = {
     "selection_count":        [Dimension.SEMANTIC_GROUNDING],
     "selection_visible":      [Dimension.SEMANTIC_GROUNDING],
     "distinct_chain_colors":  [Dimension.SEMANTIC_GROUNDING],
+    "scalar_within":          [Dimension.SEMANTIC_GROUNDING],   # correct computed value (Rg, distance, SASA…)
     "no_runtime_errors":      [Dimension.VERIFICATION_RECOVERY],
 }

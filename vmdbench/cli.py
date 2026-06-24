@@ -28,7 +28,7 @@ def _replay_clean(card, tcl, env) -> bool:
 def cmd_score_oracle(args) -> int:
     card = load_card(args.card)
     tcl = Path(args.oracle).read_text()
-    env = HeadlessVMDEnv()
+    env = HeadlessVMDEnv(timeout_s=args.timeout)
     workdir = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp())
 
     verify = verify_card(card, tcl, workdir, env=env)
@@ -56,6 +56,9 @@ def main(argv=None) -> int:
     so.add_argument("card")
     so.add_argument("oracle")
     so.add_argument("--workdir", default=None)
+    so.add_argument("--timeout", type=int, default=180,
+                    help="VMD subprocess timeout in seconds (raise for real-protein renders; "
+                         "replay_clean runs the render up to 3x)")
     so.set_defaults(func=cmd_score_oracle)
     args = p.parse_args(argv)
     return args.func(args)

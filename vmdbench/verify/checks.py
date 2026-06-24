@@ -143,6 +143,26 @@ def _no_errors(where, scene, ctx, a):
     return CheckResult("no_runtime_errors", not scene.errors, observed=scene.errors, where=where)
 
 
+@_register("scalar_within")
+def _scalar_within(where, scene, ctx, a):
+    """Assert a named scalar the solution emitted (PROBE> measure_<name>=<val>)
+    falls in a tolerance band. This checks *correctness of a computed value*
+    (Rg, a distance, SASA), which outcome/LLM-judge benchmarks do not."""
+    name = where["name"]
+    if name not in scene.measures:
+        return CheckResult("scalar_within", False,
+                           observed=f"measure {name!r} not emitted by the solution", where=where)
+    val = scene.measures[name]
+    ok = (val == val)  # reject NaN
+    if "expect" in where:
+        ok = ok and abs(val - where["expect"]) <= where.get("tol", 0.0)
+    if "min" in where:
+        ok = ok and val >= where["min"]
+    if "max" in where:
+        ok = ok and val <= where["max"]
+    return CheckResult("scalar_within", bool(ok), observed=val, where=where)
+
+
 def _is_image(path: Path) -> bool:
     try:
         head = path.read_bytes()[:8]

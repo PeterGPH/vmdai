@@ -6,6 +6,7 @@ _PROBE = re.compile(r"^PROBE>\s*(?P<key>[^=]+)=(?P<val>.*)$")
 _MOL = re.compile(r"^mol(?P<id>\d+)_(?P<attr>name|filename|filetype|numatoms|numframes|frame|numreps)$")
 _REP = re.compile(r"^rep(?P<mol>\d+)_(?P<rep>\d+)_(?P<attr>style|selection|color|material|visible)$")
 _SEL = re.compile(r"^sel(?P<idx>\d+)_(?P<attr>count|error)$")
+_MEASURE = re.compile(r"^measure_(?P<name>[A-Za-z0-9_]+)$")
 
 # ERROR) lines from VMD infrastructure that are benign and should not be counted
 # as user-script errors.  These arise from optional subsystems (STRIDE secondary-
@@ -57,6 +58,7 @@ class SceneState:
     molecules: list[Molecule] = field(default_factory=list)
     representations: list[Representation] = field(default_factory=list)
     selections: dict[str, int] = field(default_factory=dict)
+    measures: dict[str, float] = field(default_factory=dict)   # named scalars: rgyr, sasa, distances…
     display: Display = field(default_factory=Display)
     camera: dict = field(default_factory=dict)   # {"center":[...], "rotate_matrix":[[...]], "scale_matrix":[[...]]}
     rendered_images: list[str] = field(default_factory=list)
@@ -148,6 +150,14 @@ def parse_probe_lines(stdout: str, selection_texts: list[str] | None = None) -> 
                 scene.selections[text] = int(val or 0)
             else:  # error
                 scene.errors.append(val)
+            continue
+        meas = _MEASURE.match(key)
+        if meas:
+            tok = val.split()[0] if val.split() else ""
+            try:
+                scene.measures[meas["name"]] = float(tok)
+            except ValueError:
+                scene.measures[meas["name"]] = float("nan")
             continue
         if key == "display_background": scene.display.background = val
         elif key == "display_projection": scene.display.projection = val
