@@ -9,6 +9,9 @@ from vmdbench.env.image_probe import (
     parse_color, colors_close, detect_background, foreground_coverage,
     dominant_colors, color_matches,
 )
+from vmdbench.verify.checks import evaluate, CheckContext
+from vmdbench.env.scene_state import SceneState
+
 
 
 def _make_tga(w: int, h: int, pixels, top_to_bottom: bool = True) -> bytes:
@@ -150,6 +153,68 @@ class PaletteTests(unittest.TestCase):
     def test_empty_foreground_returns_empty(self):
         pixels, bg = self._load("empty.tga", [(255, 255, 255)] * 16)
         self.assertEqual(dominant_colors(pixels, bg, 0.06, 0.03), [])
+
+
+class ImageForegroundEvalTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ctx = CheckContext(workdir=Path(self.tmp.name))
+        self.scene = SceneState()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pass_on_blob(self):
+        W, R = (255, 255, 255), (255, 0, 0)
+        px = [W, W, W, W,  W, R, R, W,  W, R, R, W,  W, W, W, W]
+        (self.ctx.workdir / "out.tga").write_bytes(_make_tga(4, 4, px))
+        r = evaluate({"kind": "image_foreground",
+                      "where": {"path": "out.tga", "background": "white",
+                                "check_background": True, "min_coverage": 0.1}},
+                     self.scene, self.ctx)
+        self.assertTrue(r.passed, r.observed)
+
+    def test_fail_on_blank(self):
+        (self.ctx.workdir / "blank.tga").write_bytes(_make_tga(4, 4, [(255, 255, 255)] * 16))
+        r = evaluate({"kind": "image_foreground", "where": {"path": "blank.tga", "min_coverage": 0.05}},
+                     self.scene, self.ctx)
+        self.assertFalse(r.passed, r.observed)
+
+    def test_fail_on_missing(self):
+        r = evaluate({"kind": "image_foreground", "where": {"path": "gone.tga"}}, self.scene, self.ctx)
+        self.assertFalse(r.passed)
+        self.assertIn("not found", str(r.observed))
+
+
+class ImagePaletteEvalTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ctx = CheckContext(workdir=Path(self.tmp.name))
+        self.scene = SceneState()
+        W, R, B = (255, 255, 255), (255, 0, 0), (0, 0, 255)
+        px = [W, W, W, W,  W, R, B, W,  W, R, B, W,  W, W, W, W]
+        (self.ctx.workdir / "pal.tga").write_bytes(_make_tga(4, 4, px))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _ev(self, where):
+        return evaluate({"kind": "image_palette", "where": where}, self.scene, self.ctx)
+
+    def test_min_distinct_and_expect_pass(self):
+        r = self._ev({"path": "pal.tga", "min_distinct": 2, "expect_colors": ["red", "blue"]})
+        self.assertTrue(r.passed, r.observed)
+
+    def test_min_distinct_too_high_fails(self):
+        self.assertFalse(self._ev({"path": "pal.tga", "min_distinct": 3}).passed)
+
+    def test_absent_expected_color_fails(self):
+        self.assertFalse(self._ev({"path": "pal.tga", "expect_colors": ["green"]}).passed)
+
+    def test_undecodable_fails_cleanly(self):
+        (self.ctx.workdir / "junk.tga").write_bytes(b"not a tga")
+        r = self._ev({"path": "junk.tga", "min_distinct": 1})
+        self.assertFalse(r.passed)
 
 
 if __name__ == "__main__":

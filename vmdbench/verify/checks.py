@@ -5,6 +5,10 @@ from typing import Any, Callable
 
 from vmdbench.env.scene_state import SceneState
 from vmdbench.spec.assertions import CUSTOM_CHECKS
+from vmdbench.env.image_probe import (
+    ImageDecodeError, load_pixels, detect_background, foreground_coverage,
+    parse_color, colors_close, dominant_colors, color_matches,
+)
 
 
 @dataclass
@@ -183,6 +187,51 @@ def _file_rendered(where, scene, ctx, a):
     if where.get("must_be_image"):
         ok = ok and _is_image(path)
     return CheckResult("file_rendered", ok, observed={"exists": exists, "size": size}, where=where)
+
+
+@_register("image_foreground")
+def _image_foreground(where, scene, ctx, a):
+    """Reference-free: is the rendered image non-empty (and the background correct)?
+    Catches the empty-scene-saved-as-a-valid-image failure."""
+    tol = float(where.get("tol", 0.06))
+    try:
+        pixels, w, h = load_pixels(ctx.workdir / where["path"])
+    except ImageDecodeError as exc:
+        return CheckResult("image_foreground", False, observed=str(exc), where=where)
+    declared = parse_color(where["background"]) if where.get("background") else None
+    border = detect_background(pixels, w, h)
+    bg = declared if declared is not None else border
+    cov = foreground_coverage(pixels, bg, tol)
+    ok = float(where.get("min_coverage", 0.02)) <= cov <= float(where.get("max_coverage", 1.0))
+    if where.get("check_background") and declared is not None:
+        ok = ok and colors_close(border, declared, tol)
+    observed = {"coverage": round(cov, 4), "background_rgb": list(border),
+                "width": w, "height": h}
+    return CheckResult("image_foreground", bool(ok), observed=observed, where=where)
+
+
+@_register("image_palette")
+def _image_palette(where, scene, ctx, a):
+    """Reference-free: did the requested colors actually render? Catches
+    'ran mol modcolor but the image came out one color'."""
+    tol = float(where.get("tol", 0.06))
+    min_fraction = float(where.get("min_fraction", 0.03))
+    try:
+        pixels, w, h = load_pixels(ctx.workdir / where["path"])
+    except ImageDecodeError as exc:
+        return CheckResult("image_palette", False, observed=str(exc), where=where)
+    bg = parse_color(where["background"]) if where.get("background") else detect_background(pixels, w, h)
+    dom = dominant_colors(pixels, bg, tol, min_fraction)
+    ok = True
+    if "min_distinct" in where:
+        ok = ok and len(dom) >= int(where["min_distinct"])
+    for cname in where.get("expect_colors", []) or []:
+        target = parse_color(cname)
+        ok = ok and any(color_matches(target, c) for c, _ in dom)
+    observed = {"distinct": len(dom),
+                "dominant": [[list(c), round(f, 3)] for c, f in dom[:6]],
+                "background_rgb": list(bg)}
+    return CheckResult("image_palette", bool(ok), observed=observed, where=where)
 
 
 @_register("file_exists")
