@@ -23,6 +23,8 @@ _REQUIRED_WHERE: dict[str, list[str]] = {
     "file_rendered": ["path"],
     "file_exists": ["path"],
     "scalar_within": ["name"],
+    "image_foreground": ["path"],
+    "image_palette": ["path"],
 }
 
 
@@ -47,3 +49,7 @@ def validate_assertion(a: dict) -> None:
             raise AssertionError(
                 f"custom_check ref {ref!r} not registered; register it via register_custom_check()"
             )
+    if kind == "image_palette" and not (
+        "min_distinct" in a["where"] or "expect_colors" in a["where"]
+    ):
+        raise AssertionError("image_palette requires where.min_distinct or where.expect_colors")

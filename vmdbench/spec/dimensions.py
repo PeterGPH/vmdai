@@ -28,5 +28,7 @@ KIND_DIMENSIONS: dict[str, list[Dimension]] = {
     "selection_visible":      [Dimension.SEMANTIC_GROUNDING],
     "distinct_chain_colors":  [Dimension.SEMANTIC_GROUNDING],
     "scalar_within":          [Dimension.SEMANTIC_GROUNDING],   # correct computed value (Rg, distance, SASA…)
+    "image_foreground":       [Dimension.ACTIONABILITY],        # rendered image is non-empty
+    "image_palette":          [Dimension.SEMANTIC_GROUNDING],   # requested colors actually rendered
     "no_runtime_errors":      [Dimension.VERIFICATION_RECOVERY],
 }

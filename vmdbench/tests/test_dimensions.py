@@ -26,5 +26,12 @@ class DimensionTests(unittest.TestCase):
         self.assertIn(Dimension.ACTIONABILITY, KIND_DIMENSIONS["representation_exists"])
 
 
+class ImageKindDimensionTests(unittest.TestCase):
+    def test_image_kinds_mapped(self):
+        from vmdbench.spec.dimensions import KIND_DIMENSIONS, Dimension
+        self.assertEqual(KIND_DIMENSIONS["image_foreground"], [Dimension.ACTIONABILITY])
+        self.assertEqual(KIND_DIMENSIONS["image_palette"], [Dimension.SEMANTIC_GROUNDING])
+
+
 if __name__ == "__main__":
     unittest.main()

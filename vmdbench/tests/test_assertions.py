@@ -61,6 +61,21 @@ class AssertionContractTests(unittest.TestCase):
         validate_assertion({"kind": "file_rendered", "where": {"path": "out.tga"}})
         validate_assertion({"kind": "file_exists", "where": {"path": "out.tga"}})
 
+    def test_image_kinds_known(self):
+        self.assertIn("image_foreground", KNOWN_KINDS)
+        self.assertIn("image_palette", KNOWN_KINDS)
+
+    def test_image_foreground_requires_path(self):
+        with self.assertRaises(VBAssertionError):
+            validate_assertion({"kind": "image_foreground", "where": {}})
+        validate_assertion({"kind": "image_foreground", "where": {"path": "out.tga"}})
+
+    def test_image_palette_requires_path_and_criterion(self):
+        with self.assertRaises(VBAssertionError):
+            validate_assertion({"kind": "image_palette", "where": {"path": "out.tga"}})
+        validate_assertion({"kind": "image_palette", "where": {"path": "out.tga", "min_distinct": 2}})
+        validate_assertion({"kind": "image_palette", "where": {"path": "out.tga", "expect_colors": ["red"]}})
+
 
 if __name__ == "__main__":
     unittest.main()
