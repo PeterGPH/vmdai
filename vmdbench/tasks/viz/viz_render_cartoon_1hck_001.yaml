@@ -1,0 +1,30 @@
+task_id: viz_render_cartoon_1hck_001
+category: visualization
+bucket: synthesis
+difficulty: easy
+dimensions: [actionability, semantic_grounding]
+initial_state:
+  files: [1hck.pdb]
+  pdb: 1HCK
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# Picture-level check on a publication-style cartoon: 1HCK (CDK2 kinase) protein shown
+# as NewCartoon colored by secondary structure on a white background. image_foreground
+# confirms a non-empty render; image_palette confirms the SS coloring actually produced
+# several distinct colors (helix/sheet/coil), not one flat color. Bands calibrated from
+# the oracle gold (coverage 0.057, 12 distinct) via score-oracle.
+user_prompt: >
+  Load 1HCK, show the protein as a cartoon colored by secondary structure, set a white
+  background, and render the scene to out.tga.
+verify:
+  required:
+    - {kind: molecule_loaded,       where: {}}
+    - {kind: representation_exists, where: {style: NewCartoon}}
+    - {kind: file_rendered,         where: {path: out.tga, must_be_image: true, min_bytes: 1000}}
+    - {kind: image_foreground,      where: {path: out.tga, background: white, check_background: true, min_coverage: 0.02}}
+    - {kind: image_palette,         where: {path: out.tga, min_distinct: 3}}
+  optional:
+    - {kind: no_runtime_errors,     where: {}}
+reproducibility:
+  exports: [tcl]
+  replay_clean: true

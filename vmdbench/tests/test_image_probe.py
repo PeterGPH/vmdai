@@ -240,6 +240,35 @@ class ImageProbeLiveTests(unittest.TestCase):
             self.assertTrue(pal.passed, pal.observed)
 
 
+class MoreRenderCardsLiveTests(unittest.TestCase):
+    """Each calibrated render card's gold oracle must pass its own image checks live.
+    Covers a cartoon+secondary-structure render and a QuickSurf+element surface — styles
+    and colorings distinct from the VDW/Element demo."""
+
+    CARDS = [
+        ("viz_render_cartoon_1hck_001", 3),   # NewCartoon + Structure
+        ("viz_render_surface_1ubq_001", 3),   # QuickSurf + Element
+    ]
+
+    def test_render_cards_gold_passes_image_checks(self):
+        for cid, min_distinct in self.CARDS:
+            with self.subTest(card=cid):
+                card = load_card(_TASKS / "viz" / f"{cid}.yaml")
+                with tempfile.TemporaryDirectory() as d:
+                    run = run_oracle(card, _ORACLES / f"{cid}.tcl", Path(d))
+                    self.assertTrue((run.workdir / "out.tga").exists(), run.result.stderr)
+                    ctx = CheckContext(workdir=run.workdir)
+                    fg = evaluate({"kind": "image_foreground",
+                                   "where": {"path": "out.tga", "background": "white",
+                                             "check_background": True, "min_coverage": 0.02}},
+                                  run.result.scene, ctx)
+                    self.assertTrue(fg.passed, (cid, fg.observed))
+                    pal = evaluate({"kind": "image_palette",
+                                    "where": {"path": "out.tga", "min_distinct": min_distinct}},
+                                   run.result.scene, ctx)
+                    self.assertTrue(pal.passed, (cid, pal.observed))
+
+
 class ImageDiscriminationLiveTests(unittest.TestCase):
     """Adversarial regression: the image checks must FAIL on bad renders, not only
     pass on the gold. Reuses the viz_render_element_1crn_001 card with anti-gold
