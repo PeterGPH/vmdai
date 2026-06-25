@@ -75,6 +75,27 @@ class ChecksTests(unittest.TestCase):
         self.assertFalse(self._ev({"kind": "file_rendered",
                                    "where": {"path": "missing.tga", "min_bytes": 1000}}).passed)
 
+    def test_scalar_within(self):
+        self.scene.measures["rgyr"] = 9.67
+        # min/max band
+        self.assertTrue(self._ev({"kind": "scalar_within",
+                                  "where": {"name": "rgyr", "min": 8, "max": 12}}).passed)
+        self.assertFalse(self._ev({"kind": "scalar_within",
+                                   "where": {"name": "rgyr", "min": 10, "max": 12}}).passed)
+        # expect +/- tol
+        self.assertTrue(self._ev({"kind": "scalar_within",
+                                  "where": {"name": "rgyr", "expect": 9.67, "tol": 0.05}}).passed)
+        self.assertFalse(self._ev({"kind": "scalar_within",
+                                   "where": {"name": "rgyr", "expect": 5.0, "tol": 0.05}}).passed)
+
+    def test_scalar_within_missing_and_nan(self):
+        r = self._ev({"kind": "scalar_within", "where": {"name": "sasa", "min": 0}})
+        self.assertFalse(r.passed)
+        self.assertIn("not emitted", str(r.observed))
+        self.scene.measures["bad"] = float("nan")  # NaN must never satisfy a band
+        self.assertFalse(self._ev({"kind": "scalar_within",
+                                   "where": {"name": "bad", "min": 0, "max": 1e9}}).passed)
+
 
 if __name__ == "__main__":
     unittest.main()
