@@ -240,5 +240,42 @@ class ImageProbeLiveTests(unittest.TestCase):
             self.assertTrue(pal.passed, pal.observed)
 
 
+class ImageDiscriminationLiveTests(unittest.TestCase):
+    """Adversarial regression: the image checks must FAIL on bad renders, not only
+    pass on the gold. Reuses the viz_render_element_1crn_001 card with anti-gold
+    oracles, asserting each check catches its own failure mode while the other and
+    the scene-state checks stay green (completion-vs-correctness, for visualization)."""
+
+    def setUp(self):
+        self.card = load_card(_TASKS / "viz" / "viz_render_element_1crn_001.yaml")
+        self._adv = _ORACLES / "adversarial"
+
+    def _run(self, oracle_name):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        run = run_oracle(self.card, self._adv / oracle_name, Path(d.name))
+        self.assertTrue((run.workdir / "out.tga").exists(), run.result.stderr)
+        return CheckContext(workdir=run.workdir), run.result.scene
+
+    def test_blank_render_fails_foreground(self):
+        # Element rep exists but hidden -> blank picture. image_foreground catches it.
+        ctx, scene = self._run("viz_blank_hidden_1crn.tcl")
+        fg = evaluate({"kind": "image_foreground",
+                       "where": {"path": "out.tga", "background": "white",
+                                 "check_background": True, "min_coverage": 0.02}}, scene, ctx)
+        self.assertFalse(fg.passed, fg.observed)
+        self.assertLess(fg.observed["coverage"], 0.02)
+
+    def test_monochrome_render_fails_palette_but_not_foreground(self):
+        # Flat single color (not by element) -> non-blank, but nitrogen-blue absent.
+        ctx, scene = self._run("viz_monochrome_1crn.tcl")
+        fg = evaluate({"kind": "image_foreground",
+                       "where": {"path": "out.tga", "min_coverage": 0.02}}, scene, ctx)
+        self.assertTrue(fg.passed, fg.observed)
+        pal = evaluate({"kind": "image_palette",
+                        "where": {"path": "out.tga", "expect_colors": ["red", "blue"]}}, scene, ctx)
+        self.assertFalse(pal.passed, pal.observed)
+
+
 if __name__ == "__main__":
     unittest.main()
