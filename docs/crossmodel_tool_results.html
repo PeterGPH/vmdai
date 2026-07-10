@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VMD-AI Semantic Tools — Cross-Model Results</title>
+<style>
+  :root{
+    --navy:#1f3a5f; --blue:#2e86ab; --teal:#1b998b; --orange:#e08a2b; --red:#c1432e;
+    --ink:#22272e; --muted:#5a6472; --line:#e2e7ee; --bg:#f6f8fb; --card:#ffffff;
+    --good:#137a52; --goodbg:#e7f5ee; --warnbg:#fdf4e3;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --ink:#e6e9ef; --muted:#9aa6b6; --line:#2b3340; --bg:#0f141b; --card:#161c25;
+           --navy:#22303f; --goodbg:#12271d; --warnbg:#2a2213; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:940px;margin:0 auto;padding:0 20px 80px;}
+  header{background:var(--navy);color:#fff;margin-bottom:28px;
+    border-bottom:5px solid var(--blue);}
+  header .wrap{padding-top:34px;padding-bottom:30px;}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:.2px;}
+  header p{margin:0;color:#c8d6e5;font-size:15px;}
+  h2{font-size:21px;margin:38px 0 12px;color:var(--navy);
+     border-left:4px solid var(--teal);padding-left:10px;}
+  @media (prefers-color-scheme: dark){ h2{color:#8fb7d6} }
+  h3{font-size:16px;margin:22px 0 8px;}
+  p{margin:10px 0;}
+  code{font-family:"SF Mono",Consolas,Menlo,monospace;font-size:.9em;
+    background:rgba(127,127,127,.14);padding:1px 5px;border-radius:4px;}
+  .tldr{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--teal);
+    border-radius:10px;padding:16px 20px;margin:0 0 8px;box-shadow:0 1px 3px rgba(0,0,0,.04);}
+  .tldr b{color:var(--teal)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:16px 0;}
+  .stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;text-align:center;}
+  .stat .n{font-size:30px;font-weight:700;color:var(--navy);font-variant-numeric:tabular-nums;}
+  @media (prefers-color-scheme: dark){ .stat .n{color:#8fb7d6} }
+  .stat .l{font-size:13px;color:var(--muted);margin-top:4px;}
+  .tblwrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;margin:14px 0;}
+  table{border-collapse:collapse;width:100%;font-size:14.5px;min-width:520px;}
+  th,td{padding:9px 12px;text-align:right;border-bottom:1px solid var(--line);
+    font-variant-numeric:tabular-nums;white-space:nowrap;}
+  th:first-child,td:first-child{text-align:left;font-weight:600;}
+  thead th{background:var(--navy);color:#fff;position:sticky;top:0;font-weight:600;}
+  tbody tr:hover{background:rgba(46,134,171,.06);}
+  .hi{background:var(--goodbg);color:var(--good);font-weight:700;border-radius:5px;}
+  .lo{color:var(--red);font-weight:600;}
+  .callout{border-radius:10px;padding:14px 18px;margin:16px 0;border:1px solid;}
+  .warn{background:var(--warnbg);border-color:var(--orange);}
+  .warn b{color:var(--orange)}
+  ul{margin:10px 0;padding-left:22px;} li{margin:6px 0;}
+  .tag{display:inline-block;font-size:12px;font-weight:600;padding:2px 8px;border-radius:20px;
+    background:rgba(46,134,171,.14);color:var(--blue);margin-left:6px;vertical-align:middle;}
+  .muted{color:var(--muted);font-size:13.5px;}
+  footer{margin-top:44px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:13px;}
+</style>
+</head>
+<body>
+<header><div class="wrap">
+  <h1>VMD-AI Semantic Tools — Cross-Model Benchmark</h1>
+  <p>Does a correct, brace-safe tool layer let a small local model drive VMD trajectory analysis? · ATLAS-traj benchmark · Qwen2.5 7B / 14B / 72B</p>
+</div></header>
+
+<div class="wrap">
+
+  <div class="tldr">
+    <b>Bottom line.</b> The semantic tool <code>vmd_traj_measure</code> <b>enables small models</b>:
+    a 7B jumps from <b>20% → 99%</b> and a 14B reaches 100% correctness — matching the 72B. The values are
+    tool-derived (exact-gold matches), so it is a <b>scaffolding / product</b> result (correct tools
+    make a cheap model reliable), <i>not</i> a claim that the model reasons about trajectories.
+    Surprise: tool adoption <b>inverts</b> with model size.
+  </div>
+
+  <div class="grid">
+    <div class="stat"><div class="n">20%&nbsp;→&nbsp;99%</div><div class="l">no-tool → tool (7B)</div></div>
+    <div class="stat"><div class="n">16%&nbsp;→&nbsp;100%</div><div class="l">no-tool → tool (72B)</div></div>
+    <div class="stat"><div class="n">100%</div><div class="l">14B correct (with tool)</div></div>
+    <div class="stat"><div class="n">465</div><div class="l">checks / cell (31×5×3)</div></div>
+  </div>
+
+  <h2>The benchmark</h2>
+  <p>Each task loads a protein structure + its MD trajectory and asks for one trajectory-averaged
+  observable, scored against a gold reference computed by <code>gold_oracle_traj.tcl</code>.
+  <b>31 chains × 5 metrics × 3 seeds = 465 checks</b> per cell. Metrics:
+  <code>nframes</code>, <code>meanrg</code>, <code>meanrmsd</code>, <code>mean_rmsf</code>,
+  <code>meansasa</code>. Grading is <b>programmatic</b> (computed value within a gold-derived band) —
+  no LLM judge. Models served locally via vLLM; two directive strengths compared:
+  <b>soft</b> ("prefer tools") vs <b>mandatory</b> ("you must use the tool").</p>
+
+  <h2>Cross-model results <span class="tag">gold-scored, reliable</span></h2>
+  <p><b>correct%</b> = value within the gold band. <b>tool-derived%</b> = value matches gold to 1e-9
+  (a signature the value came from the tool, not hand-computation).</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Model</th><th>Directive</th><th>correct%</th><th>tool-derived%</th></tr></thead>
+    <tbody>
+      <tr><td>72B <span class="muted">(AWQ)</span></td><td>soft</td><td>92.7</td><td>92.7</td></tr>
+      <tr><td>72B <span class="muted">(AWQ)</span></td><td>mandatory</td><td class="hi">100.0</td><td class="hi">100.0</td></tr>
+      <tr><td>14B</td><td>soft</td><td class="hi">100.0</td><td class="hi">100.0</td></tr>
+      <tr><td>14B</td><td>mandatory</td><td class="hi">100.0</td><td class="hi">100.0</td></tr>
+      <tr><td>7B</td><td>soft</td><td>99.1</td><td>96.3</td></tr>
+      <tr><td>7B</td><td>mandatory</td><td>99.6</td><td>97.6</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted"><code>tool-derived% ≈ correct%</code> in every cell → the correct answers really come from the tool.</p>
+
+  <h2>What the tool is worth: no-tool → tool <span class="tag">rescue</span></h2>
+  <p>The <code>none</code> arm gives the model <b>no semantic tools</b> — it must hand-write every
+  Tcl frame loop via <code>run_vmd_command</code>. Adding <code>vmd_traj_measure</code> is the entire
+  difference between "can't" and "can". <b>correct%</b> on the 465-check set:</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Model</th><th>no tools <span class="muted">(none)</span></th><th>+ tool (soft)</th><th>+ tool (mandatory)</th></tr></thead>
+    <tbody>
+      <tr><td>7B</td><td class="lo">20.4</td><td class="hi">99.1</td><td class="hi">99.6</td></tr>
+      <tr><td>14B</td><td class="muted">pending</td><td class="hi">100.0</td><td class="hi">100.0</td></tr>
+      <tr><td>72B <span class="muted">(AWQ)</span></td><td class="lo">16.3</td><td>92.7</td><td class="hi">100.0</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted">The 7B jumps <b>20% → 99%</b>. The tool, not the model, is doing the work —
+  the same brace-safe primitive rescues the 72B (16% → 100%) too.</p>
+
+  <h3>Why 20%? Without a tool, only the trivial metric survives</h3>
+  <p>The 7B <code>none</code> arm scores <b>100% on <code>nframes</code></b> (a one-line frame count)
+  and essentially <b>0% on every real trajectory-averaged observable</b>. The brace-heavy per-frame
+  loop that <code>rg</code>/<code>rmsd</code>/<code>rmsf</code>/<code>sasa</code> require is exactly
+  what a small model cannot hand-write — so the 20% overall <i>is</i> the nframes column. (Note the
+  symmetry: <code>nframes</code> is the one "easy" metric, which is why the 72B over-trusts itself
+  and <i>under</i>-adopts the tool there — see below.)</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>7B (none)</th><th>nframes</th><th>meanrg</th><th>meanrmsd</th><th>mean_rmsf</th><th>meansasa</th><th>overall</th></tr></thead>
+    <tbody>
+      <tr><td>correct%</td><td class="hi">100</td><td class="lo">1.1</td><td class="lo">0.0</td><td class="lo">1.1</td><td class="lo">0.0</td><td class="lo">20.4</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Where the 72B loses: per-metric correct% (soft directive)</h2>
+  <p>Under the soft nudge, the 72B's entire gap is two metrics it insists on hand-writing —
+  <code>nframes</code> (it uses the tool 0% of the time and hand-counts) and <code>meansasa</code>.
+  On the hard, brace-heavy metrics it <i>does</i> use the tool → 100%. The smaller models delegate
+  everything.</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>Model (soft)</th><th>nframes</th><th>meanrg</th><th>meanrmsd</th><th>mean_rmsf</th><th>meansasa</th><th>overall</th></tr></thead>
+    <tbody>
+      <tr><td>72B</td><td class="lo">78.5</td><td>100</td><td>100</td><td>100</td><td class="lo">84.9</td><td>92.7</td></tr>
+      <tr><td>14B</td><td class="hi">100</td><td>100</td><td>100</td><td>100</td><td class="hi">100</td><td class="hi">100</td></tr>
+      <tr><td>7B</td><td>98.9</td><td>96.8</td><td>100</td><td>100</td><td>100</td><td>99.1</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted">72B soft failures (34 total, all hand-written): knowingly-wrote-a-wrong-value 17,
+  brace-thrash 14, gratuitous −1 over-correction 3.</p>
+
+  <h2>Key findings</h2>
+  <ul>
+    <li><b>The tool enables small models.</b> 7B ≈ 99%, 14B = 100%, matching the 72B — and the values
+      are tool-derived. A cheap local model + correct tools = reliable trajectory analysis.</li>
+    <li><b>Adoption inverts with size.</b> The 14B adopts the tool 100% under the <i>soft</i> nudge —
+      more than the 72B's 77%. The big model is confident enough to DIY the "easy" metrics and botch
+      them; the smaller models defer. <b>Capability can hurt tool-adoption.</b></li>
+    <li><b>Enforcement matters most for the big model.</b> soft→mandatory lifts the 72B 77%→100%
+      adoption but does nothing for the 14B (already 100%).</li>
+  </ul>
+
+  <h2>Honest caveats</h2>
+  <div class="callout warn">
+    <p style="margin-top:0"><b>Read these before quoting the numbers.</b></p>
+    <ul style="margin-bottom:0">
+      <li><b>Tool = oracle.</b> <code>vmd_traj_measure</code>'s Tcl mirrors the gold reference, so it
+        measures <b>tool design + adoption, not the model's analysis reasoning</b>. The benchmark hands
+        over the <i>formulation</i> (it names the metric); it only tests <i>execution</i>.</li>
+      <li><b>Quantization confound.</b> The 72B here is <b>AWQ (4-bit)</b>; the 7B/14B are full precision.
+        The "capability under-adopts" claim needs a full-precision 72B to rule out quantization.</li>
+      <li><b>Code-path confound.</b> The 72B soft/mandatory cells were produced by older harness code
+        than the 7B/14B; a clean re-run through the identical path is pending.</li>
+      <li><b>Adoption% is inferred, not measured.</b> Read from transcripts, it under-counts tool-use
+        for small models (they interleave inspection/failed <code>run_vmd_command</code> calls). The
+        <b>tool-derived%</b> column is the reliable signal; direct per-case tool-call logging is the fix.</li>
+    </ul>
+  </div>
+
+  <h2>Status &amp; next</h2>
+  <ul>
+    <li><b>Done:</b> 7B <code>none</code> baseline (20.4%) → the 7B rescue row is complete.</li>
+    <li><b>Pending:</b> 14B <code>none</code> baseline (fills the last rescue cell); clean 72B re-run
+      (code-path-matched; optionally full-precision) → apples-to-apples cross-model table.</li>
+    <li><b>Recommended next:</b> direct tool-call logging (adoption measured exactly).</li>
+    <li><b>Parked design:</b> make the benchmark <i>harder</i> — underspecify the question so the model
+      must choose the analysis (formulation, not just execution), keeping a determinate gold. This
+      de-saturates the benchmark and finally tests reasoning.</li>
+  </ul>
+
+  <footer>
+    VMD-AI · <code>integrations/scivisagentbench</code> · ATLAS-traj cross-model sweep.
+    Numbers reflect the corrected adoption classifier. 72B cells are AWQ; a code-path-matched re-run is pending.
+  </footer>
+</div>
+</body>
+</html>
