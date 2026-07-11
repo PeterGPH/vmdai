@@ -128,6 +128,9 @@ async def run_arm(args):
 
     config = json.load(open(args.config))
     metrics, prompt_builder, oracle = select_mode(getattr(args, "hard", False))
+    skip_fn = None
+    if getattr(args, "hard", False):
+        from hard_metrics import skip_metric_for_chain as skip_fn
     pairs = pairs_in(args.fixtures_dir)
     if not pairs:
         print(f"No <chain>.pdb + <chain>_*.dcd pairs in {args.fixtures_dir}")
@@ -148,6 +151,8 @@ async def run_arm(args):
         for seed in range(1, seeds + 1):
             for name, pdb, dcd in pairs:
                 for mkey, (phrase, tol, scored) in metrics.items():
+                    if skip_fn and skip_fn(mkey, gold.get(name, {})):
+                        continue
                     ans_path = str(outdir / f"{name}__{mkey}__s{seed}.txt")
                     if os.path.exists(ans_path):
                         os.remove(ans_path)

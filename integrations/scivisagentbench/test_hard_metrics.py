@@ -45,6 +45,7 @@ def main():
 
     fails += test_select_mode()
     fails += test_recommend_tol()
+    fails += test_skip_metric_for_chain()
 
     print("ALL GOOD" if not fails else f"{fails} FAILED")
     return 1 if fails else 0
@@ -77,6 +78,20 @@ def test_recommend_tol():
     fails = check(recommend_tol([10.0, 11.0, 12.0], frac=0.0, floor=0.5) == 0.5,
                   "recommend_tol respects the floor", fails)
     fails = check(recommend_tol([], floor=0.7) == 0.7, "recommend_tol handles empty -> floor", fails)
+    return fails
+
+
+def test_skip_metric_for_chain():
+    from hard_metrics import skip_metric_for_chain
+    fails = 0
+    fails = check(skip_metric_for_chain("rg_argmin_frame", {"rg_min":10.0,"rg_second_min":10.02}) is True,
+                  "near-tie (0.2%) -> exclude", fails)
+    fails = check(skip_metric_for_chain("rg_argmin_frame", {"rg_min":10.0,"rg_second_min":10.10}) is False,
+                  "well-separated (1.0%) -> keep", fails)
+    fails = check(skip_metric_for_chain("rg_argmin_frame", {"rg_min":10.0}) is True,
+                  "missing rg_second_min -> exclude (conservative)", fails)
+    fails = check(skip_metric_for_chain("rmsd_max", {"rg_min":10.0,"rg_second_min":10.0}) is False,
+                  "non-argmin metric never excluded", fails)
     return fails
 
 

@@ -38,6 +38,22 @@ HARD_METRICS = {
         "Report a single dimensionless number (1.0 means no change).", 0.03, True),
 }
 
+# rg_argmin_frame is only well-posed where the minimum Rg is UNIQUELY separated; on near-tie
+# chains the frame index is arbitrary (spec §6), so it is excluded from scoring per chain.
+ARGMIN_MIN_MARGIN_PCT = 0.5
+
+def skip_metric_for_chain(mkey, gold_for_chain):
+    """Return True if this (metric, chain) pair should be EXCLUDED from hard-tier scoring.
+    Only rg_argmin_frame is gated: excluded when the min-Rg frame is a near-tie (or when the
+    margin can't be computed from gold — conservative)."""
+    if mkey != "rg_argmin_frame":
+        return False
+    g = gold_for_chain or {}
+    mn, m2 = g.get("rg_min"), g.get("rg_second_min")
+    if mn is None or m2 is None or mn <= 0:
+        return True
+    return (100.0 * (m2 - mn) / mn) < ARGMIN_MIN_MARGIN_PCT
+
 # intended_quantity per key — the spec-adequacy annotation (spec §8). Used by tests + calibration.
 HARD_INTENT = {
     "rmsd_max": "maximum over frames of aligned Calpha RMSD-to-frame-0, Angstrom",
