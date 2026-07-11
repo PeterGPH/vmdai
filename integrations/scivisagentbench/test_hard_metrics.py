@@ -21,7 +21,7 @@ def check(cond, label, fails):
 def main():
     fails = 0
     # 1. prompt strips every giveaway but keeps the plumbing
-    p = build_hard_prompt("/x/a.pdb", "/x/a.dcd", HARD_METRICS["rg_std"][0], "/x/o.txt")
+    p = build_hard_prompt("/x/a.pdb", "/x/a.dcd", HARD_METRICS["rmsd_max"][0], "/x/o.txt")
     low = p.lower()
     for tok in GIVEAWAYS:
         fails = check(tok not in low, f"prompt omits giveaway '{tok}'", fails)

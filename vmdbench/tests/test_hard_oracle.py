@@ -52,6 +52,8 @@ class HardOracleLiveTests(unittest.TestCase):
         self.assertAlmostEqual(g["rg_delta"], g["rg_last"] - g["rg_first"], places=4)
         self.assertAlmostEqual(g["rg_ratio"], g["rg_last"] / g["rg_first"], places=4)
         self.assertLessEqual(g["rg_min"], g["meanrg"] + 1e-6)
+        self.assertIn("rg_second_min", g)
+        self.assertGreaterEqual(g["rg_second_min"], g["rg_min"] - 1e-6)
 
     def test_rg_quantities_match_mdanalysis(self):
         try:

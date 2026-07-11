@@ -10,12 +10,11 @@ Tolerances below are oracle-derived: `calibrate_hard.py --fixtures-dir vmdbench/
 the 31 committed ATLAS chain pairs, tol = max(FLOORS[key], 0.03 * median(|gold value|))
 (rg_argmin_frame kept at 0.5 — it's an exact-integer match). Values are (question incl. unit,
 absolute tolerance, scored?) to match the 3-tuple the run_atlas_traj main loop unpacks.
+
+rg_std ("fluctuation") is deferred to v2 — it is ambiguous under the no-formula constraint (std
+vs variance vs range) and needs a relative tolerance; the oracle still computes it (unscored).
 """
 HARD_METRICS = {
-    "rg_std": (
-        "Proteins breathe: their overall size fluctuates as they move. How much does this "
-        "protein's overall size fluctuate over the whole trajectory? Report a single number in "
-        "Angstroms.", 0.02, True),
     "rmsd_max": (
         "Over the trajectory, how far does the backbone get from the starting structure at its "
         "most-deviated point? Report that largest deviation as a single number in Angstroms.",
@@ -41,7 +40,6 @@ HARD_METRICS = {
 
 # intended_quantity per key — the spec-adequacy annotation (spec §8). Used by tests + calibration.
 HARD_INTENT = {
-    "rg_std": "population standard deviation of per-frame radius of gyration (protein), Angstrom",
     "rmsd_max": "maximum over frames of aligned Calpha RMSD-to-frame-0, Angstrom",
     "sasa_range": "max(SASA) - min(SASA) over frames (protein, measure sasa 1.4), Angstrom^2",
     "rmsf_max": "maximum per-residue Calpha RMSF over the trajectory, Angstrom",
@@ -60,8 +58,8 @@ def build_hard_prompt(pdb, dcd, question, answer_path):
         f'    mol new "{pdb}" waitfor all\n'
         f'    mol addfile "{dcd}" waitfor all\n'
         f"{question}\n"
-        "Report a single number and write ONLY that value (digits only, no words) to this exact "
-        "file:\n"
+        "Report a single number and write ONLY that value (just the number itself, no words or "
+        "units) to this exact file:\n"
         f'    set f [open "{answer_path}" w]; puts $f $value; close $f\n'
         "Finish in as few commands as possible."
     )

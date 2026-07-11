@@ -19,7 +19,7 @@ from hard_metrics import HARD_METRICS  # noqa: E402
 
 # per-key floor: the smallest tolerance that still absorbs VMD jitter + definitional variants.
 # rg_argmin_frame is an exact integer (band 0.5); the rest floor at a physically negligible error.
-FLOORS = {"rg_std": 0.02, "rmsd_max": 0.05, "sasa_range": 30.0, "rmsf_max": 0.05,
+FLOORS = {"rmsd_max": 0.05, "sasa_range": 30.0, "rmsf_max": 0.05,
           "rg_argmin_frame": 0.5, "rg_delta": 0.05, "rg_ratio": 0.005}
 
 
@@ -42,10 +42,12 @@ def main():
     if not pairs:
         print(f"no fixture pairs in {args.fixtures_dir}"); return 1
     cols = {k: [] for k in HARD_METRICS}
+    per_chain = {}
     for name, pdb, dcd in pairs:
         g, err = compute_gold(os.path.expanduser(args.vmd), pdb, dcd, oracle=HARD_ORACLE)
         if not g:
             print(f"  {name}: FAILED {err}"); continue
+        per_chain[name] = g
         for k in cols:
             if k in g:
                 cols[k].append(g[k])
@@ -58,6 +60,16 @@ def main():
         print(f"{k:18}{len(vs):>4}{min(vs):>12.3f}{statistics.median(vs):>12.3f}"
               f"{max(vs):>12.3f}{tol:>16.3f}")
     print("\ncopy each recommend_tol into HARD_METRICS[...] tol, then re-run the oracle test.")
+
+    print(f"\n{'chain':16}{'argmin_frame':>14}{'rg_min':>10}{'margin%':>10}   keep?")
+    for name, pdb, dcd in pairs:
+        g = per_chain.get(name)
+        if not g or "rg_min" not in g or "rg_second_min" not in g:
+            continue
+        mn, m2 = g["rg_min"], g["rg_second_min"]
+        margin = 100.0 * (m2 - mn) / mn if mn else 0.0
+        keep = "keep" if margin >= 0.5 else "DROP (near-tie)"
+        print(f"{name:16}{int(g.get('rg_argmin_frame', -1)):>14}{mn:>10.3f}{margin:>10.3f}   {keep}")
     return 0
 
 

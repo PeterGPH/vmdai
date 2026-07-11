@@ -38,12 +38,17 @@ if {[catch {
     emit rg_last  $rgl
     emit rg_delta [expr {$rgl - $rgf}]
     emit rg_ratio [expr {$rgl / $rgf}]
-    set minv $rgf; set argmin 0
+    set minv $rgf; set min2 1e30; set argmin 0
     for {set i 1} {$i < $n} {incr i} {
         set v [lindex $rgs $i]
-        if {$v < $minv} { set minv $v; set argmin $i }
+        if {$v < $minv} {
+            set min2 $minv; set minv $v; set argmin $i
+        } elseif {$v < $min2} {
+            set min2 $v
+        }
     }
     emit rg_min $minv
+    emit rg_second_min $min2
     emit rg_argmin_frame $argmin
     set cnt 0; foreach x $rgs { if {$x > $mean} { incr cnt } }
     emit rg_frac_above_mean [expr {double($cnt) / $n}]
