@@ -59,10 +59,15 @@ class HardOracleLiveTests(unittest.TestCase):
             import MDAnalysis as mda
         except ImportError:
             self.skipTest("MDAnalysis not installed")
-        u = mda.Universe(str(PDB), str(DCD))
-        prot = u.select_atoms("protein")
-        rgs = np.array([prot.radius_of_gyration() for _ in u.trajectory])
         g = self.g
+        # VMD's `mol new <pdb>` + `mol addfile <dcd>` makes the PDB's coordinates frame 0,
+        # so nframes = 1 + len(DCD). Replicate that exact frame set so the cross-check is
+        # apples-to-apples (otherwise MDAnalysis is off-by-one vs VMD).
+        rg0 = mda.Universe(str(PDB)).select_atoms("protein").radius_of_gyration()
+        ut = mda.Universe(str(PDB), str(DCD))
+        rgt = [ut.select_atoms("protein").radius_of_gyration() for _ in ut.trajectory]
+        rgs = np.array([rg0] + rgt)
+        self.assertEqual(len(rgs), int(g["nframes"]))   # frame-set convention lock
         self.assertAlmostEqual(g["rg_std"], float(rgs.std()), delta=0.05)          # population std
         self.assertAlmostEqual(g["rg_delta"], float(rgs[-1] - rgs[0]), delta=0.05)
         self.assertAlmostEqual(g["rg_ratio"], float(rgs[-1] / rgs[0]), delta=0.01)
