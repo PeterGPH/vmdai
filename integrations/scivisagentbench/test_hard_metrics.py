@@ -43,8 +43,27 @@ def main():
     missing = set(HARD_METRICS) - emitted
     fails = check(not missing, f"oracle emits every scored key (missing {missing})", fails)
 
+    fails += test_select_mode()
+
     print("ALL GOOD" if not fails else f"{fails} FAILED")
     return 1 if fails else 0
+
+
+def test_select_mode():
+    import run_atlas_traj as R
+    fails = 0
+    m_e, b_e, o_e = R.select_mode(False)
+    fails = check(m_e is R.METRICS and b_e is R.build_prompt, "easy mode -> METRICS/build_prompt", fails)
+    fails = check(o_e == R.ORACLE, "easy mode -> easy oracle", fails)
+    m_h, b_h, o_h = R.select_mode(True)
+    fails = check(set(m_h) == set(R_hard_keys()), "hard mode -> HARD_METRICS", fails)
+    fails = check(str(o_h).endswith("gold_oracle_traj_hard.tcl"), "hard mode -> hard oracle", fails)
+    return fails
+
+
+def R_hard_keys():
+    from hard_metrics import HARD_METRICS
+    return set(HARD_METRICS)
 
 
 if __name__ == "__main__":
