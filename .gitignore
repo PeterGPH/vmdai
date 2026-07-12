@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+runtime/runtime.log
+
+# ATLAS raw download cache (commit only the small strided fixtures under vmdbench/fixtures)
+.atlas_cache/
+integrations/scivisagentbench/_gold_archive/

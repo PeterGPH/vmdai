@@ -67,9 +67,14 @@ if [ "${DRY:-0}" = "1" ]; then
   exit 0
 fi
 
-# --- clear any stale hard gold cache so gold recomputes WITH rg_second_min ---
-echo "== removing stale hard gold caches (force fresh precompute) =="
-ssh "$SRV" "rm -f '$RMT/$HARNESS_REL'/gold_cache_*_hard.json && echo '  cleared' || echo '  none'"
+# --- ARCHIVE (not delete) any stale hard gold cache so gold recomputes WITH rg_second_min ---
+# The cache is a derived artifact (deterministic from oracle + fixtures, both versioned), so we
+# never rm it — we move it aside timestamped. The runner then sees no cache and recomputes fresh;
+# the old values stay recoverable under _gold_archive/ for an additive-change diff.
+echo "== archiving stale hard gold caches (force fresh precompute; old values preserved) =="
+ssh "$SRV" "cd '$RMT/$HARNESS_REL' && mkdir -p _gold_archive && \
+  moved=0; for f in gold_cache_*_hard.json; do [ -e \"\$f\" ] && mv \"\$f\" \"_gold_archive/\$f.\$(date +%Y%m%d_%H%M%S)\" && moved=1; done; \
+  [ \$moved = 1 ] && echo '  archived -> _gold_archive/' || echo '  none to archive'"
 
 # --- server-side verification ---
 echo "== verify on server: pure tests =="
