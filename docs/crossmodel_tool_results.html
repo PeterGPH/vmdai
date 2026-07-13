@@ -70,13 +70,16 @@
     a 7B jumps from <b>20% → 99%</b> and a 14B reaches 100% correctness — matching the 72B. The values are
     tool-derived (exact-gold matches), so it is a <b>scaffolding / product</b> result (correct tools
     make a cheap model reliable), <i>not</i> a claim that the model reasons about trajectories.
-    Surprise: tool adoption <b>inverts</b> with model size.
+    Surprise: tool adoption <b>inverts</b> with model size. <b>But this holds only when the question
+    names the metric.</b> On a <b>hard tier</b> that hides the formulation, the same 14B collapses
+    from 100% to <b>5–8%</b> — and the tool turns <i>actively misleading</i>: it manufactures
+    confident wrong answers (returns the mean when asked for the max).
   </div>
 
   <div class="grid">
     <div class="stat"><div class="n">20%&nbsp;→&nbsp;99%</div><div class="l">no-tool → tool (7B)</div></div>
     <div class="stat"><div class="n">16%&nbsp;→&nbsp;100%</div><div class="l">no-tool → tool (72B)</div></div>
-    <div class="stat"><div class="n">100%</div><div class="l">14B correct (with tool)</div></div>
+    <div class="stat"><div class="n">100%&nbsp;→&nbsp;5%</div><div class="l">14B easy → hard tier (with tool)</div></div>
     <div class="stat"><div class="n">465</div><div class="l">checks / cell (31×5×3)</div></div>
   </div>
 
@@ -161,6 +164,49 @@
       adoption but does nothing for the 14B (already 100%).</li>
   </ul>
 
+  <h2>The hard tier: when the question hides the formulation <span class="tag">de-saturation</span></h2>
+  <p>The easy tier <i>names</i> the metric ("compute the mean radius of gyration…"), so a correct
+  tool solves it by transcription — that is why it saturates at 100%. The <b>hard tier</b> instead
+  describes a <b>composed</b> quantity in plain language — <i>"how far does the backbone get from the
+  starting structure at its most-deviated point?"</i> (a <code>max</code>, not a mean) — with no
+  metric name, formula, or VMD command. Same 14B, same fixtures; only the <b>formulation</b> is
+  withheld.</p>
+
+  <div class="tblwrap"><table>
+    <thead><tr><th>14B</th><th>none</th><th>tool (soft)</th><th>tool (mandatory)</th></tr></thead>
+    <tbody>
+      <tr><td>easy tier — correct%</td><td>~20</td><td class="hi">100</td><td class="hi">100</td></tr>
+      <tr><td>hard tier — correct%</td><td class="lo">5.8</td><td class="lo">8.0</td><td class="lo">5.4</td></tr>
+      <tr><td>hard tier — complete% <span class="muted">(produced any answer)</span></td><td>21</td><td>89</td><td>83</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted">The tool's rescue <b>collapses</b> (100% → 5–8%). Read the split carefully: on the
+  hard tier the tool raises <b>completion</b> 21%→~85% (the model can always call it and get <i>a</i>
+  number) but <b>not correctness</b> (5.4 vs none's 5.8 — within noise). It converts "can't answer"
+  into "confidently wrong": <b>done-but-wrong rises 76 → 388</b>.</p>
+
+  <h3>Why: the tool returns its one canned quantity — the mean</h3>
+  <p><code>vmd_traj_measure</code> mirrors the oracle, which computes <i>means</i>. When the hard
+  question asks for a <code>max</code> or a <code>range</code>, the model calls the tool, gets the
+  <i>mean</i> back — the wrong quantity — and reports it. The agent's answer is <b>exactly</b> the
+  mean, verbatim:</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>case</th><th>asked for</th><th>gold</th><th>agent = the mean</th></tr></thead>
+    <tbody>
+      <tr><td>1h02_B rmsd_max</td><td>max RMSD</td><td>6.64</td><td class="lo">4.86 = meanrmsd</td></tr>
+      <tr><td>1h02_B rmsf_max</td><td>max RMSF</td><td>9.64</td><td class="lo">2.64 = mean_rmsf</td></tr>
+      <tr><td>2erl_A sasa_range</td><td>SASA range</td><td>255</td><td class="lo">3042 = meansasa</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted">For <code>rmsd_max</code>/<code>rmsf_max</code>/<code>sasa_range</code> the tool arm
+  is <b>100% complete, 0% correct</b> — every case answered, every answer the mean. <b>A correct tool,
+  under an underspecified question, is actively misleading</b>: it doesn't raise correctness, it
+  manufactures confident wrong answers. <i>(Caveat: <code>rg_ratio</code> scores ~20–30% even in
+  <code>none</code> because most proteins keep ratio ≈ 1.0, inside the 3% band — the one partially
+  gameable metric. <code>rg_std</code> was dropped from v1 as ambiguous under the no-formula
+  constraint; <code>rg_argmin_frame</code> is scored on the 11 chains with a uniquely-separated
+  minimum.)</i></p>
+
   <h2>Honest caveats</h2>
   <div class="callout warn">
     <p style="margin-top:0"><b>Read these before quoting the numbers.</b></p>
@@ -181,8 +227,10 @@
   <h2>Status &amp; next</h2>
   <ul>
     <li><b>Done:</b> 7B <code>none</code> baseline (20.4%) → the 7B rescue row is complete.</li>
-    <li><b>Pending:</b> 14B <code>none</code> baseline (fills the last rescue cell); clean 72B re-run
-      (code-path-matched; optionally full-precision) → apples-to-apples cross-model table.</li>
+    <li><b>Done:</b> hard/reasoning tier built + first run (14B) → the formulation-gap result above.</li>
+    <li><b>Pending:</b> hard tier on 7B/72B (cross-model formulation gap — the mechanism is
+      model-agnostic, but the numbers complete the picture); 14B <code>none</code> baseline for the
+      easy-tier rescue cell; clean 72B re-run (code-path-matched) → apples-to-apples easy-tier table.</li>
     <li><b>Recommended next:</b> direct tool-call logging (adoption measured exactly).</li>
     <li><b>Parked design:</b> make the benchmark <i>harder</i> — underspecify the question so the model
       must choose the analysis (formulation, not just execution), keeping a determinate gold. This
