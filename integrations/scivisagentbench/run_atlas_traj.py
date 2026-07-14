@@ -207,11 +207,11 @@ async def run_arm(args):
     # ---- pool of `conc` isolated agents (each own bridge/VMD/_series) ----
     print(f"  [arm {args.tag}] {len(items)} tasks over {conc} concurrent agent(s)")
     agents = []
-    for _ in range(conc):
-        a = get_agent("vmd_ai")(config)
-        await a.setup()
-        agents.append(a)
     try:
+        for _ in range(conc):
+            a = get_agent("vmd_ai")(config)
+            agents.append(a)            # append BEFORE setup so a mid-pool setup failure still tears down
+            await a.setup()
         await _run_worklist(items, agents, run_one)
     finally:
         for a in agents:
