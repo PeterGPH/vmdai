@@ -207,28 +207,32 @@
   constraint; <code>rg_argmin_frame</code> is scored on the 11 chains with a uniquely-separated
   minimum.)</i></p>
 
-  <h2>The bigger twist: on a 72B, the tool <em>lowers</em> correctness <span class="tag">capability</span></h2>
-  <p>The same hard tier on a 72B (Int8) inverts the intuition that a stronger model uses the tool
-  better. The 72B scores <b>highest with no tool at all</b>, and being handed the tool <b>drops</b>
-  its correctness. Hard-tier correct% / complete%:</p>
+  <h2>The bigger twist: the tool's value <em>declines</em> with capability <span class="tag">gradient</span></h2>
+  <p>Running the identical hard tier across 7B / 14B / 72B reveals two things the saturated easy tier
+  hid. <b>(1)</b> With no tool, correctness ladders with model size — the benchmark now separates
+  reasoning. <b>(2)</b> Adding the tool helps the weakest model a little and <i>lowers</i> the
+  strongest's correctness. Hard-tier <b>correct%</b>:</p>
   <div class="tblwrap"><table>
-    <thead><tr><th>72B · hard tier</th><th>correct%</th><th>complete%</th><th>done-but-wrong</th></tr></thead>
+    <thead><tr><th>correct% · hard tier</th><th>no tool</th><th>+ tool (soft)</th><th>+ tool (mand)</th><th>Δ from tool</th></tr></thead>
     <tbody>
-      <tr><td>none <span class="muted">(no tool)</span></td><td class="hi">15.3</td><td>17.3</td><td>10</td></tr>
-      <tr><td>tool · soft</td><td class="lo">8.0</td><td>60.8</td><td>263</td></tr>
-      <tr><td>tool · mandatory</td><td class="lo">10.2</td><td>68.7</td><td>291</td></tr>
+      <tr><td>7B</td><td class="lo">0.8</td><td>2.0</td><td>2.0</td><td class="hi">+1.2</td></tr>
+      <tr><td>14B</td><td>5.8</td><td>8.0</td><td>5.4</td><td class="lo">−0.4</td></tr>
+      <tr><td>72B <span class="muted">(Int8)</span></td><td class="hi">15.3</td><td>8.0</td><td>10.2</td><td class="lo">−5.1</td></tr>
     </tbody>
   </table></div>
-  <p class="muted">Unaided, the 72B is <b>calibrated</b>: it answers only the composed quantities it can
-  reason (<code>rg_delta</code> 29%, <code>rg_ratio</code> 53% — end-vs-start Rg) and <b>abstains</b>
-  on the rest (10 errors in 498). The tool breaks both halves of that judgment — it reports the
-  <i>mean</i> instead of computing the comparison it knew, and fills the abstentions with confident
-  wrong answers. Correctness falls <b>15.3 → 10.2</b>; confident errors climb <b>10 → 291</b>. It
-  closes the loop with the easy tier: the 72B's tool <i>under</i>-adoption (77% vs the 14B's 100%) read
-  as a flaw there and as a virtue here — a model that doesn't blindly defer is the one that reasons
-  when the question is open. <i>(Caveat: on the pure <code>max</code>/<code>range</code> metrics even
-  the 72B abstains rather than hand-write a Tcl max-loop — a Tcl-fluency barrier, not pure reasoning;
-  a Python-substrate re-run would separate the two.)</i></p>
+  <p class="muted">The <b>none arm ladders 0.8 → 5.8 → 15.3</b> — de-saturation working: a
+  capability-separating reasoning benchmark, where the easy tier had all three at ~100% with the tool.
+  And the tool's Δ crosses zero: <b>+1.2 (7B) → −0.4 (14B) → −5.1 (72B)</b>. A correct-but-narrow tool
+  <b>helps who needs it and harms who doesn't</b>. Mechanism: unaided the 72B is <b>calibrated</b> —
+  it answers the quantities it can reason (<code>rg_delta</code> 29%, <code>rg_ratio</code> 53%) and
+  abstains on the rest (10 errors in 498); the tool overwrites that (reports the <i>mean</i>, fills
+  abstentions with confident-wrong: errors <b>10 → 291</b>). The 7B is too weak to reason or wield the
+  tool — near-floor either way. Universal: with the tool all three hit high completion but low
+  correctness — the "confidently wrong" wall spans the whole capability range. It closes the loop with
+  the easy tier: the 72B's tool <i>under</i>-adoption (77% vs 14B's 100%) was a flaw there, a virtue
+  here. <i>(Caveat: on pure <code>max</code>/<code>range</code> metrics even the 72B abstains rather
+  than hand-write a Tcl max-loop — a Tcl-fluency barrier; a Python-substrate re-run would separate it
+  from reasoning.)</i></p>
 
   <h2>Honest caveats</h2>
   <div class="callout warn">
