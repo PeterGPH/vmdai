@@ -157,47 +157,70 @@ async def run_arm(args):
 
     gold = load_gold(pairs, os.path.expanduser(args.vmd), args.gold_cache, oracle=oracle)
 
-    agent = get_agent("vmd_ai")(config)
-    await agent.setup()
     seeds = max(1, int(args.seeds))
-    results, detail, n_fail_saved = {}, {}, 0
+    conc = max(1, int(getattr(args, "concurrency", 1)))
     save_fails = os.environ.get("VMD_AI_SAVE_FAILURES", "1") != "0"
     if save_fails:
         (outdir / "failures.jsonl").unlink(missing_ok=True)
+
+    # ---- flat work-list (skip_fn applied once, up front) ----
+    items = []
+    for seed in range(1, seeds + 1):
+        for name, pdb, dcd in pairs:
+            for mkey, (phrase, tol, scored) in metrics.items():
+                if skip_fn and skip_fn(mkey, gold.get(name, {})):
+                    continue
+                items.append((seed, name, pdb, dcd, mkey, phrase, tol, scored))
+
+    results, detail = {}, {}
+    counters = {"fail_saved": 0}
+
+    async def run_one(agent, item):
+        seed, name, pdb, dcd, mkey, phrase, tol, scored = item
+        ans_path = str(outdir / f"{name}__{mkey}__s{seed}.txt")
+        if os.path.exists(ans_path):
+            os.remove(ans_path)
+        prompt = prompt_builder(pdb, dcd, phrase, ans_path)
+        case_name = f"{name}_{mkey}_s{seed}"
+        tcfg = {"working_dir": str(outdir), "case_dir": str(outdir),
+                "case_name": case_name, "timeout": args.timeout}
+        result = None
+        try:
+            result = await agent.run_task(prompt, tcfg)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [s{seed}] {name}/{mkey}: run error: {exc}")
+        g = gold.get(name, {}).get(mkey)
+        val = None
+        if os.path.exists(ans_path):
+            fs = [float(x) for x in FLOAT.findall(open(ans_path, errors="replace").read())]
+            if fs and g is not None:
+                val = min(fs, key=lambda x: abs(x - g))
+        ok = (val is not None and g is not None and abs(val - g) <= tol) if scored else None
+        results.setdefault((name, mkey), []).append(ok)
+        detail[f"{name}__{mkey}__s{seed}"] = {"gold": g, "agent": val, "ok": ok}
+        print(f"  [s{seed}] {name:8} {mkey:10} gold={g} agent={val} -> "
+              + ("PASS" if ok else ("FAIL" if ok is False else "-")))
+        if save_fails and scored and ok is False:
+            _save_failure(outdir, name, mkey, seed, phrase, tol, g, val, ans_path, result, args.tag)
+            counters["fail_saved"] += 1
+
+    # ---- pool of `conc` isolated agents (each own bridge/VMD/_series) ----
+    print(f"  [arm {args.tag}] {len(items)} tasks over {conc} concurrent agent(s)")
+    agents = []
+    for _ in range(conc):
+        a = get_agent("vmd_ai")(config)
+        await a.setup()
+        agents.append(a)
     try:
-        for seed in range(1, seeds + 1):
-            for name, pdb, dcd in pairs:
-                for mkey, (phrase, tol, scored) in metrics.items():
-                    if skip_fn and skip_fn(mkey, gold.get(name, {})):
-                        continue
-                    ans_path = str(outdir / f"{name}__{mkey}__s{seed}.txt")
-                    if os.path.exists(ans_path):
-                        os.remove(ans_path)
-                    prompt = prompt_builder(pdb, dcd, phrase, ans_path)
-                    case_name = f"{name}_{mkey}_s{seed}"
-                    tcfg = {"working_dir": str(outdir), "case_dir": str(outdir),
-                            "case_name": case_name, "timeout": args.timeout}
-                    result = None
-                    try:
-                        result = await agent.run_task(prompt, tcfg)
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"  [s{seed}] {name}/{mkey}: run error: {exc}")
-                    g = gold.get(name, {}).get(mkey)
-                    val = None
-                    if os.path.exists(ans_path):
-                        fs = [float(x) for x in FLOAT.findall(open(ans_path, errors="replace").read())]
-                        if fs and g is not None:
-                            val = min(fs, key=lambda x: abs(x - g))
-                    ok = (val is not None and g is not None and abs(val - g) <= tol) if scored else None
-                    results.setdefault((name, mkey), []).append(ok)
-                    detail[f"{name}__{mkey}__s{seed}"] = {"gold": g, "agent": val, "ok": ok}
-                    print(f"  [s{seed}] {name:8} {mkey:10} gold={g} agent={val} -> "
-                          + ("PASS" if ok else ("FAIL" if ok is False else "-")))
-                    if save_fails and scored and ok is False:
-                        _save_failure(outdir, name, mkey, seed, phrase, tol, g, val, ans_path, result, args.tag)
-                        n_fail_saved += 1
+        await _run_worklist(items, agents, run_one)
     finally:
-        await agent.teardown()
+        for a in agents:
+            try:
+                await a.teardown()
+            except Exception:  # noqa: BLE001
+                pass
+
+    n_fail_saved = counters["fail_saved"]
 
     names = [p[0] for p in pairs]
     print(f"\n=== ATLAS-TRAJ CORRECTNESS (pass-rate over {seeds} seed(s)) — arm: {args.tag} ===")
@@ -231,6 +254,9 @@ def main():
     ap.add_argument("--tag", default="none")
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--seeds", type=int, default=1, help="repeats per task; >1 de-noises no-answers")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="tasks run concurrently within the arm, each on its own agent+VMD "
+                         "(default 1 = sequential; try 8 to saturate vLLM's KV cache)")
     ap.add_argument("--gold-cache", default=None,
                     help="JSON gold cache (from precompute_gold_traj.py) — load it instead of "
                          "recomputing gold per run; misses are computed and appended")

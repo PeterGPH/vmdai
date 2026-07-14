@@ -9,7 +9,7 @@
 #   RUN=preval SEEDS=3 TIMEOUT=300 bash run_atlas_parallel.sh none wiki
 #   FIXDIR=$PWD/integrations/scivisagentbench/atlas_fix5 bash run_atlas_parallel.sh   # small subset
 #
-# Env knobs:  RUN (default: timestamp)  SEEDS(3)  TIMEOUT(300)  VMD_BIN  FIXDIR  GOLD_CACHE
+# Env knobs:  RUN (default: timestamp)  SEEDS(3)  TIMEOUT(300)  CONC(1)  VMD_BIN  FIXDIR  GOLD_CACHE
 # Prereq: OpenAI-compatible model endpoint at http://localhost:8000/v1.
 # Tip: launch under tmux (or `nohup … &`) so it survives disconnect.
 set -uo pipefail
@@ -20,6 +20,7 @@ VMD="${VMD_BIN:-/software/vmd-1.9.3/bin/vmd}"
 ENDPOINT="http://localhost:8000/v1/models"
 SEEDS="${SEEDS:-3}"
 TIMEOUT="${TIMEOUT:-300}"
+CONC="${CONC:-1}"                                  # tasks concurrent per arm (each own agent+VMD)
 RUN="${RUN:-$(date +%m%d_%H%M)}"                    # run label; default = timestamp
 FIXDIR="${FIXDIR:-$HARNESS/atlas_fixtures}"
 OUTBASE="$REPO/test_results/atlas_traj"
@@ -65,7 +66,7 @@ for arm in "${ARMS[@]}"; do
   env $extra PYTHONUNBUFFERED=1 python "$HARNESS/run_atlas_traj.py" \
     --config "$cfg" --tag "${arm}_${RUN}" --seeds "$SEEDS" \
     --vmd "$VMD" --timeout "$TIMEOUT" --fixtures-dir "$FIXDIR" \
-    --gold-cache "$GOLD_CACHE" ${HARD:+--hard} > "$log" 2>&1 &
+    --gold-cache "$GOLD_CACHE" ${HARD:+--hard} --concurrency "$CONC" > "$log" 2>&1 &
   pids+=($!)
 done
 echo "== ${#pids[@]} arms running in parallel (PIDs: ${pids[*]}); waiting... =="
