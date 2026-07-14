@@ -116,7 +116,7 @@ VMD_TRAJ_SERIES_SCHEMA = {
 VMD_COMPUTE_SCHEMA = {
     "name": "vmd_compute",
     "description": "Reduce the bound per-frame series to a single number with an expression you "
-                   "write, e.g. \"max(rmsd)\", \"std(rgyr)\", \"rgyr[-1]-rgyr[0]\", \"argmin(rgyr)\".",
+                   "write over its short name, e.g. \"median(rgyr)\" or \"std(sasa)\".",
     "input_schema": {
         "type": "object",
         "properties": {
