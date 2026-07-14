@@ -325,6 +325,8 @@ class VmdAiAgent(BaseAgent):
             self._loop.extra_tools = existing + [VMD_TRAJ_SERIES_SCHEMA, VMD_COMPUTE_SCHEMA]
             self._system_prompt += workbench_directive(self.config)
             print("[vmd_ai] workbench tools enabled (vmd_traj_series + vmd_compute)")
+            if bool(self.config.get("enable_semantic_tools", False)):
+                print("[vmd_ai] WARNING: both semantic + workbench tools enabled — confounded arm")
 
         print(f"[vmd_ai] ready: provider={provider_name} model={model} backend={backend}")
 

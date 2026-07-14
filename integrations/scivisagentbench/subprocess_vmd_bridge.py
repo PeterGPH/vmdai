@@ -412,7 +412,9 @@ class SubprocessVmdBridge:
         if not self._series:
             return {"ok": False, "output": "", "error": "no series bound yet; call vmd_traj_series first", "expr": expr}
         import sys as _sys, os.path as _op
-        _sys.path.insert(0, _op.dirname(_op.abspath(__file__)))
+        _d = _op.dirname(_op.abspath(__file__))
+        if _d not in _sys.path:
+            _sys.path.insert(0, _d)
         from safe_eval import safe_eval, ComputeError
         try:
             val = safe_eval(expr, self._series)

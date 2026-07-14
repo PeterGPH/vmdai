@@ -41,15 +41,16 @@ def tool_directive(config):
 # workbench (v2): the tool returns the RAW per-frame series; the model chooses the reduction. The
 # directive explains the loop but deliberately hands over NO metric name/formula — that is the test.
 WORKBENCH_DIRECTIVE = (
-    "\n\nTRAJECTORY WORKBENCH: you have two tools. vmd_traj_series(quantity, structure, trajectory) "
-    "returns the raw PER-FRAME series for one observable (quantity ∈ rgyr, sasa, rmsd_to_frame0, "
-    "rmsf_per_residue) and binds it to a short name (rgyr, sasa, rmsd, rmsf). vmd_compute(expression) "
-    "then reduces the bound series with an expression YOU write — e.g. vmd_compute(\"max(rmsd)\"), "
-    "\"rgyr[-1]-rgyr[0]\", \"argmin(rgyr)\", \"ptp(sasa)\". Available functions: max min var "
-    "median sum abs sqrt ptp argmin argmax len (plus the usual central-tendency/spread stats), "
-    "plus indexing (series[0], series[-1]) and comparisons. "
-    "Decide which quantity and which reduction the question calls for — the series is data, the "
-    "reduction is your judgment. Write the final number to the requested file with run_vmd_command."
+    "\n\nTRAJECTORY WORKBENCH: you have two tools. vmd_traj_series(quantity, structure, "
+    "trajectory) returns the raw PER-FRAME series for one observable (quantity is one of "
+    "rgyr, sasa, rmsd_to_frame0, rmsf_per_residue) and binds it to a short name (rgyr, sasa, "
+    "rmsd, rmsf). vmd_compute(expression) then reduces the bound series with an expression YOU "
+    "write over that name — for example vmd_compute(\"median(rgyr)\") or vmd_compute(\"std(sasa)\"). "
+    "Available functions: max min mean std var median sum abs sqrt ptp argmin argmax len; you can "
+    "index a series (series[0] is the first frame, series[-1] the last) and use comparisons. "
+    "Decide which quantity AND which reduction the question calls for — the series is data, "
+    "choosing the reduction is your judgment. Write the final number to the requested file with "
+    "run_vmd_command."
 )
 
 

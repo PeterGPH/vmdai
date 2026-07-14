@@ -82,6 +82,8 @@ def safe_eval(expression, namespace):
         tree = ast.parse(expression, mode="eval")
     except SyntaxError as exc:
         raise ComputeError(f"syntax error: {exc.msg}")
+    except RecursionError:
+        raise ComputeError("expression too deeply nested")
     try:
         names = {}
         for k, v in (namespace or {}).items():
