@@ -118,6 +118,23 @@ def load_gold(pairs, vmd, cache_path=None, oracle=ORACLE):
     return gold
 
 
+async def _run_worklist(items, agents, run_one):
+    """Drain `items` across len(agents) worker coroutines, one agent each. run_one(agent, item) is
+    awaited per task. Bounded concurrency = len(agents); each item runs exactly once on some agent.
+    Single-threaded asyncio: `cursor` read+increment has no await between it, so it is atomic."""
+    cursor = {"i": 0}
+
+    async def worker(agent):
+        while True:
+            i = cursor["i"]
+            if i >= len(items):
+                return
+            cursor["i"] = i + 1
+            await run_one(agent, items[i])
+
+    await asyncio.gather(*(worker(a) for a in agents))
+
+
 async def run_arm(args):
     bench = Path(os.path.expanduser(args.bench)).resolve()
     sys.path.insert(0, str(bench / "benchmark"))   # evaluation_framework
