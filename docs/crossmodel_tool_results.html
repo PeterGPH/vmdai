@@ -207,6 +207,29 @@
   constraint; <code>rg_argmin_frame</code> is scored on the 11 chains with a uniquely-separated
   minimum.)</i></p>
 
+  <h2>The bigger twist: on a 72B, the tool <em>lowers</em> correctness <span class="tag">capability</span></h2>
+  <p>The same hard tier on a 72B (Int8) inverts the intuition that a stronger model uses the tool
+  better. The 72B scores <b>highest with no tool at all</b>, and being handed the tool <b>drops</b>
+  its correctness. Hard-tier correct% / complete%:</p>
+  <div class="tblwrap"><table>
+    <thead><tr><th>72B · hard tier</th><th>correct%</th><th>complete%</th><th>done-but-wrong</th></tr></thead>
+    <tbody>
+      <tr><td>none <span class="muted">(no tool)</span></td><td class="hi">15.3</td><td>17.3</td><td>10</td></tr>
+      <tr><td>tool · soft</td><td class="lo">8.0</td><td>60.8</td><td>263</td></tr>
+      <tr><td>tool · mandatory</td><td class="lo">10.2</td><td>68.7</td><td>291</td></tr>
+    </tbody>
+  </table></div>
+  <p class="muted">Unaided, the 72B is <b>calibrated</b>: it answers only the composed quantities it can
+  reason (<code>rg_delta</code> 29%, <code>rg_ratio</code> 53% — end-vs-start Rg) and <b>abstains</b>
+  on the rest (10 errors in 498). The tool breaks both halves of that judgment — it reports the
+  <i>mean</i> instead of computing the comparison it knew, and fills the abstentions with confident
+  wrong answers. Correctness falls <b>15.3 → 10.2</b>; confident errors climb <b>10 → 291</b>. It
+  closes the loop with the easy tier: the 72B's tool <i>under</i>-adoption (77% vs the 14B's 100%) read
+  as a flaw there and as a virtue here — a model that doesn't blindly defer is the one that reasons
+  when the question is open. <i>(Caveat: on the pure <code>max</code>/<code>range</code> metrics even
+  the 72B abstains rather than hand-write a Tcl max-loop — a Tcl-fluency barrier, not pure reasoning;
+  a Python-substrate re-run would separate the two.)</i></p>
+
   <h2>Honest caveats</h2>
   <div class="callout warn">
     <p style="margin-top:0"><b>Read these before quoting the numbers.</b></p>
