@@ -347,22 +347,23 @@ class SubprocessVmdBridge:
     _SERIES_TCL = {
         "rgyr": ('set __p [atomselect top "protein"]; set __n [molinfo top get numframes]; '
                  'for {set __i 0} {$__i < $__n} {incr __i} { $__p frame $__i; '
-                 'puts "VMDAI_SERIES [measure rgyr $__p]" }; $__p delete'),
+                 'puts "VMDAI_SERIES [measure rgyr $__p]" }; $__p delete; puts "VMDAI_SERIES_N $__n"'),
         "sasa": ('set __p [atomselect top "protein"]; set __n [molinfo top get numframes]; '
                  'for {set __i 0} {$__i < $__n} {incr __i} { $__p frame $__i; '
-                 'puts "VMDAI_SERIES [measure sasa 1.4 $__p]" }; $__p delete'),
+                 'puts "VMDAI_SERIES [measure sasa 1.4 $__p]" }; $__p delete; puts "VMDAI_SERIES_N $__n"'),
         "rmsd_to_frame0": (
             'set __ca [atomselect top "protein and name CA"]; set __ref [atomselect top "protein and name CA" frame 0]; '
             'set __all [atomselect top all]; set __n [molinfo top get numframes]; '
             'for {set __i 0} {$__i < $__n} {incr __i} { $__ca frame $__i; $__all frame $__i; '
             '$__all move [measure fit $__ca $__ref]; puts "VMDAI_SERIES [measure rmsd $__ca $__ref]" }; '
-            '$__ca delete; $__ref delete; $__all delete'),
+            '$__ca delete; $__ref delete; $__all delete; puts "VMDAI_SERIES_N $__n"'),
         "rmsf_per_residue": (
             'set __ca [atomselect top "protein and name CA"]; set __ref [atomselect top "protein and name CA" frame 0]; '
             'set __all [atomselect top all]; set __n [molinfo top get numframes]; '
             'for {set __i 0} {$__i < $__n} {incr __i} { $__ca frame $__i; $__all frame $__i; '
             '$__all move [measure fit $__ca $__ref] }; '
-            'foreach __x [measure rmsf $__ca] { puts "VMDAI_SERIES $__x" }; $__ca delete; $__ref delete; $__all delete'),
+            'set __rf [measure rmsf $__ca]; foreach __x $__rf { puts "VMDAI_SERIES $__x" }; '
+            'puts "VMDAI_SERIES_N [llength $__rf]"; $__ca delete; $__ref delete; $__all delete'),
     }
     _SERIES_NAME = {"rgyr": "rgyr", "sasa": "sasa", "rmsd_to_frame0": "rmsd", "rmsf_per_residue": "rmsf"}
 
@@ -385,13 +386,21 @@ class SubprocessVmdBridge:
             return res
         import re as _re
         vals = []
+        expected = None
         for line in str(res.get("output") or "").splitlines():
+            mn = _re.search(r"VMDAI_SERIES_N\s+(\d+)", line)
+            if mn:
+                expected = int(mn.group(1)); continue
             m = _re.search(r"VMDAI_SERIES\s+([-+0-9.eE]+)", line)
             if m:
                 try: vals.append(float(m.group(1)))
                 except ValueError: pass
         if not vals:
             return {"ok": False, "output": res.get("output", ""), "error": "no series values emitted"}
+        if expected is None or len(vals) != expected:
+            return {"ok": False, "output": "",
+                     "error": f"series truncated/incomplete: got {len(vals)} values, expected {expected} "
+                              f"(VMD output may exceed the {_MAX_TOOL_OUTPUT_CHARS}-char cap for a large structure/trajectory)"}
         name = self._SERIES_NAME[quantity]
         self._series[name] = vals
         preview = [round(v, 3) for v in vals[:5]]
