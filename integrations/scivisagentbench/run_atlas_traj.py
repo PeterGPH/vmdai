@@ -241,6 +241,21 @@ async def run_arm(args):
     print(f"  saved -> {outdir / 'summary.json'}")
     if n_fail_saved:
         print(f"  saved {n_fail_saved} failure bundle(s) -> {outdir / 'failures'}")
+
+    # ---- concurrency-overload guard ----------------------------------------------------------
+    # A TOOL arm that rarely completes under CONC>1 is the silent signature of vLLM tool-calling
+    # overload (empty/degraded model responses under load — worse for bigger/slower models). It
+    # depresses completion with NO error/timeout, so a low number reads like a real result. Warn
+    # loudly. (The `none` arm legitimately completes little — it can't hand-write — so it's exempt.)
+    uses_tools = bool(config.get("enable_semantic_tools") or config.get("enable_workbench_tools"))
+    completed = sum(1 for v in detail.values() if v.get("agent") is not None)
+    comp_frac = completed / max(1, len(detail))
+    if conc > 1 and uses_tools and comp_frac < 0.30:
+        print(f"\n  ⚠️  LOW COMPLETION ({100*comp_frac:.0f}%) for a tool arm at CONC={conc} — this is the "
+              f"silent\n      signature of concurrency/serving overload (empty model responses under "
+              f"load, common\n      for bigger models). DO NOT trust these numbers — re-run this arm at "
+              f"a lower CONC\n      (or CONC=1) and confirm completion recovers before recording the "
+              f"result.")
     return 0
 
 
