@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""safe_eval.py — a strict allow-list evaluator for vmd_compute (the v2 workbench).
+"""safe_eval.py — a strict allow-list evaluator for vmd_compute (the workbench tool).
 
 The model writes a reduction expression over per-frame series it fetched with vmd_traj_series
 (e.g. "max(rmsd)", "std(rgyr)", "rgyr[-1]-rgyr[0]", "mean(rgyr > mean(rgyr))"). This evaluates it

@@ -38,7 +38,7 @@ def tool_directive(config):
     return TOOL_DIRECTIVE_SOFT if mode == "soft" else TOOL_DIRECTIVE_MANDATORY
 
 
-# workbench (v2): the tool returns the RAW per-frame series; the model chooses the reduction. The
+# workbench (v1): the tool returns the RAW per-frame series; the model chooses the reduction. The
 # directive explains the loop but deliberately hands over NO metric name/formula — that is the test.
 WORKBENCH_DIRECTIVE = (
     "\n\nTRAJECTORY WORKBENCH: you have two tools. vmd_traj_series(quantity, structure, "
@@ -55,5 +55,5 @@ WORKBENCH_DIRECTIVE = (
 
 
 def workbench_directive(config):
-    """Directive for the v2 workbench arm (config['enable_workbench_tools'])."""
+    """Directive for the workbench arm (config['enable_workbench_tools'])."""
     return WORKBENCH_DIRECTIVE
