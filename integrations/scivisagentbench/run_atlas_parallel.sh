@@ -46,6 +46,25 @@ for i in $(seq 1 60); do
 done
 [ "$up" = "1" ] || { echo "server never came up — start vLLM on :8000, then re-run."; exit 1; }
 
+# ---- provenance: record which CODE + SETTINGS produced this run ----
+# Results/logs are gitignored (large, derived), but this one-line-per-run manifest is TRACKED so
+# every RUN maps back to the exact commit, model, tier and knobs. Lives next to the harness.
+_sha=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo nogit)
+_desc=$(git -C "$REPO" describe --tags --always --dirty 2>/dev/null || echo -)
+_model=$(curl -s "$ENDPOINT" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || echo unknown)
+_tier=$([ -n "${HARD:-}" ] && echo hard || echo easy)
+_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo -)
+python3 - "$HARNESS/run_manifest.jsonl" "$_ts" "$RUN" "$_sha" "$_desc" "$_model" "$_tier" \
+         "$(basename "$FIXDIR")" "$SEEDS" "${CONC:-1}" "${ARMS[*]}" <<'PY'
+import sys, json
+path = sys.argv[1]
+rec = dict(zip(("ts","run","commit","describe","model","tier","fixtures","seeds","conc","arms"),
+               sys.argv[2:12]))
+with open(path, "a") as f:
+    f.write(json.dumps(rec) + "\n")
+print(f"== provenance -> {path}\n   {rec}")
+PY
+
 # ---- gold ONCE, shared by all arms (skip if cache already present) ----
 if [ -f "$GOLD_CACHE" ]; then
   echo "== gold cache exists -> $GOLD_CACHE (skipping precompute; delete it to force) =="

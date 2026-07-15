@@ -5,3 +5,12 @@ runtime/runtime.log
 # ATLAS raw download cache (commit only the small strided fixtures under vmdbench/fixtures)
 .atlas_cache/
 integrations/scivisagentbench/_gold_archive/
+
+# Run outputs are large, derived artifacts — do NOT track them; provenance lives in the
+# tracked run_manifest.jsonl (one line per RUN: commit, model, tier, knobs) instead.
+test_results/
+run_*.log
+integrations/scivisagentbench/atlas_fix*/           # throwaway chain subsets for quick runs
+integrations/scivisagentbench/gold_cache_*.json     # derived from oracle+fixtures, regenerable
+# ...but DO track the run manifest (the version-control record of every run):
+!integrations/scivisagentbench/run_manifest.jsonl
