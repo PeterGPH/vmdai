@@ -25,6 +25,7 @@ def main():
     # the directive explains the loop but must NOT hand over the answer (no scored formula giveaways)
     for tok in ("vmd_traj_series", "vmd_compute"):
         fails = check(tok in d, f"directive names {tok}", fails)
+    fails = check("save_path" in d, "directive tells the model to record via save_path", fails)
     nd = "".join(d.split())  # whitespace-insensitive comparison
     for formula in SCORED_FORMULAS:
         nf = "".join(formula.split())

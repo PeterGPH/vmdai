@@ -49,8 +49,11 @@ WORKBENCH_DIRECTIVE = (
     "Available functions: max min mean std var median sum abs sqrt ptp argmin argmax len; you can "
     "index a series (series[0] is the first frame, series[-1] the last) and use comparisons. "
     "Decide which quantity AND which reduction the question calls for — the series is data, "
-    "choosing the reduction is your judgment. Write the final number to the requested file with "
-    "run_vmd_command."
+    "choosing the reduction is your judgment. "
+    "To RECORD your final answer, call vmd_compute again with save_path set to the exact output "
+    "file named in the task (e.g. vmd_compute(\"median(rgyr)\", save_path=\"/…/answer.txt\")) — the "
+    "tool writes the computed value for you. Do NOT re-type the number or write the file yourself "
+    "with run_vmd_command; that is where wrong answers creep in."
 )
 
 

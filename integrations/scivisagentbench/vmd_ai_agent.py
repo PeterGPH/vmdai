@@ -123,6 +123,10 @@ VMD_COMPUTE_SCHEMA = {
             "expression": {"type": "string",
                            "description": "math over bound series; funcs: max min mean std var median "
                                           "sum abs sqrt ptp argmin argmax len; indexing and comparisons OK"},
+            "save_path": {"type": "string",
+                          "description": "absolute path of the task's output file — pass it to record "
+                                         "your FINAL answer; the tool writes the computed value exactly, "
+                                         "so do not re-type the number yourself"},
         },
         "required": ["expression"],
     },
