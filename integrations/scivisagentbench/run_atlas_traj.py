@@ -20,6 +20,23 @@ HARD_ORACLE = HERE / "gold_oracle_traj_hard.tcl"
 DEFAULT_VMD = "/Applications/VMD.app/Contents/vmd/vmd_MACOSXARM64"
 FLOAT = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 
+# a clean answer file is a SINGLE numeric value (the prompt asks for "digits only, no words", and
+# vmd_compute's save_path writes exactly one number). More than a handful of numbers means the model
+# dumped a script/save_state/series into the file — NOT an answer — so we reject it rather than let the
+# nearest-to-gold pick cherry-pick a gold-matching value out of the noise.
+_MAX_ANSWER_NUMBERS = 4
+
+
+def _parse_answer(text, gold):
+    """Return the model's numeric answer from `text` (nearest to `gold` among a clean answer's few
+    values), or None if there is no value / gold, or if the file is a many-number dump (not an answer)."""
+    if gold is None:
+        return None
+    fs = [float(x) for x in FLOAT.findall(text or "")]
+    if not fs or len(fs) > _MAX_ANSWER_NUMBERS:
+        return None
+    return min(fs, key=lambda x: abs(x - gold))
+
 # metric key -> (prompt phrase, absolute tolerance, scored?)
 METRICS = {
     "nframes":   ("the number of trajectory frames loaded into the molecule "
@@ -190,11 +207,7 @@ async def run_arm(args):
         except Exception as exc:  # noqa: BLE001
             print(f"  [s{seed}] {name}/{mkey}: run error: {exc}")
         g = gold.get(name, {}).get(mkey)
-        val = None
-        if os.path.exists(ans_path):
-            fs = [float(x) for x in FLOAT.findall(open(ans_path, errors="replace").read())]
-            if fs and g is not None:
-                val = min(fs, key=lambda x: abs(x - g))
+        val = _parse_answer(open(ans_path, errors="replace").read(), g) if os.path.exists(ans_path) else None
         ok = (val is not None and g is not None and abs(val - g) <= tol) if scored else None
         results.setdefault((name, mkey), []).append(ok)
         detail[f"{name}__{mkey}__s{seed}"] = {"gold": g, "agent": val, "ok": ok}
