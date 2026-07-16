@@ -366,6 +366,7 @@ class SubprocessVmdBridge:
             'puts "VMDAI_SERIES_N [llength $__rf]"; $__ca delete; $__ref delete; $__all delete'),
     }
     _SERIES_NAME = {"rgyr": "rgyr", "sasa": "sasa", "rmsd_to_frame0": "rmsd", "rmsf_per_residue": "rmsf"}
+    _NAME_QUANTITY = {v: k for k, v in _SERIES_NAME.items()}   # short name -> vmd_traj_series quantity
 
     def _traj_series(self, ti: Dict[str, Any]) -> Dict[str, Any]:
         quantity = str(ti.get("quantity") or "").strip()
@@ -409,8 +410,11 @@ class SubprocessVmdBridge:
 
     def _compute(self, ti: Dict[str, Any]) -> Dict[str, Any]:
         expr = str(ti.get("expression") or "").strip()
+        save_path = ti.get("save_path")
         if not self._series:
-            return {"ok": False, "output": "", "error": "no series bound yet; call vmd_traj_series first", "expr": expr}
+            return {"ok": False, "output": "",
+                    "error": "vmd_compute: no series bound yet — call vmd_traj_series(quantity=...) first",
+                    "expr": expr}
         import sys as _sys, os.path as _op
         _d = _op.dirname(_op.abspath(__file__))
         if _d not in _sys.path:
@@ -419,8 +423,26 @@ class SubprocessVmdBridge:
         try:
             val = safe_eval(expr, self._series)
         except ComputeError as exc:
-            return {"ok": False, "output": "", "error": f"vmd_compute: {exc}", "expr": expr}
-        return {"ok": True, "output": f"{expr} = {val}", "error": "", "value": val, "expr": expr}
+            import re as _re
+            msg = str(exc)
+            m = _re.search(r"unknown name '([^']+)'", msg)
+            if m and m.group(1) in self._NAME_QUANTITY:
+                nm = m.group(1)
+                msg = (f"series '{nm}' not bound — fetch it first with "
+                       f"vmd_traj_series(quantity='{self._NAME_QUANTITY[nm]}'). "
+                       f"Currently bound: {sorted(self._series)}")
+            return {"ok": False, "output": "", "error": f"vmd_compute: {msg}", "expr": expr}
+        note = f"{expr} = {val}"
+        if save_path:
+            try:
+                p = os.path.abspath(str(save_path))
+                os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+                with open(p, "w") as fh:
+                    fh.write(str(val) + "\n")
+                note += f"  (written to {p})"
+            except Exception as exc:  # noqa: BLE001
+                note += f"  (FAILED to write {save_path}: {exc})"
+        return {"ok": True, "output": note, "error": "", "value": val, "expr": expr}
 
     _STYLES = {"licorice", "newcartoon", "cartoon", "vdw", "cpk", "lines", "newribbons",
                "ribbons", "tube", "trace", "surf", "quicksurf", "points", "bonds", "dynamicbonds"}
