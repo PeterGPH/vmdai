@@ -52,6 +52,20 @@ done
 _sha=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo nogit)
 _desc=$(git -C "$REPO" describe --tags --always --dirty 2>/dev/null || echo -)
 _model=$(curl -s "$ENDPOINT" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || echo unknown)
+
+# ---- guard: served model must match the size token in RUN ----
+# Prevents the "wrong model loaded" misrun: models are hot-swapped on :8000 by hand while the RUN
+# label is typed manually, so a run named ...qwen14b... can be silently served by whatever is
+# loaded (this bit us — a qwen14b_wb2 run was served by the 72B). If RUN encodes a size (7b/14b/
+# 32b/72b) and the served model id doesn't contain it, abort before wasting a run.
+_want=$(printf '%s' "$RUN" | grep -oiE '(7b|14b|32b|72b)' | head -1)
+if [ -n "$_want" ] && ! printf '%s' "$_model" | grep -iq "$_want"; then
+  echo "‼️  MODEL MISMATCH: RUN='$RUN' expects a '$_want' model, but :8000 serves '$_model'."
+  echo "    Load the intended model (or fix the RUN label). Set ALLOW_MODEL_MISMATCH=1 to override."
+  [ -n "${ALLOW_MODEL_MISMATCH:-}" ] || exit 3
+  echo "    ALLOW_MODEL_MISMATCH=1 — proceeding despite mismatch."
+fi
+
 _tier=$([ -n "${HARD:-}" ] && echo hard || echo easy)
 _ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo -)
 python3 - "$HARNESS/run_manifest.jsonl" "$_ts" "$RUN" "$_sha" "$_desc" "$_model" "$_tier" \
