@@ -264,6 +264,12 @@
   <b>workbench v2 re-saturates the hard tier for the 72B</b> — an oracle-capable tool re-saturates once
   the model can drive it, motivating a harder tier.</p>
 
+  <p class="muted"><b>Reproduced (Jul 2026).</b> The 14B v2 = 81.3% was independently re-run on a
+  provenance-verified 14B (<code>405/498</code>, 100% completion) — a bit-for-bit match. An earlier
+  “14B”-labelled run had scored 100%, but the per-run live <code>/v1/models</code> query caught the server
+  still serving the <b>72B</b> (a mislabel, since corrected); the genuine 14B tops out at 81.3%. Every row
+  above is tied to the model the server actually served, not the run's filename.</p>
+
   <h2>Honest caveats</h2>
   <div class="callout warn">
     <p style="margin-top:0"><b>Read these before quoting the numbers.</b></p>
