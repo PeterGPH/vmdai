@@ -234,28 +234,35 @@
   than hand-write a Tcl max-loop — a Tcl-fluency barrier; a Python-substrate re-run would separate it
   from reasoning.)</i></p>
 
-  <h2>The fix: a composable workbench (v1) <span class="tag">give data, not answers</span></h2>
+  <h2>The fix: a composable workbench + faithful recording <span class="tag">give data, not answers</span></h2>
   <p>The canned tool fails because it returns a fixed <i>answer</i> (the mean). The <b>workbench</b>
   returns <i>data</i> — <code>vmd_traj_series</code> gives the raw per-frame series, and
   <code>vmd_compute</code> safe-evaluates a reduction the model writes itself (<code>max(rmsd)</code>,
-  <code>rgyr[-1]-rgyr[0]</code>, <code>ptp(sasa)</code>). Execution is handled; the model must still
-  choose the reduction. Hard-tier <b>correct%</b> (SEEDS=3; 7B CONC=8, 14B/72B CONC=2):</p>
+  <code>rgyr[-1]-rgyr[0]</code>, <code>ptp(sasa)</code>). <b>v2</b> adds <code>save_path</code>: the tool
+  writes its computed value straight to the answer file, so a correct reduction becomes a correctly
+  <i>recorded</i> answer. Hard-tier <b>correct%</b> (SEEDS=3; 7B CONC=8, 14B/72B CONC=2; models
+  provenance-verified):</p>
   <div class="tblwrap"><table>
     <thead><tr><th>hard tier · correct%</th><th>7B</th><th>14B</th><th>72B (Int8)</th></tr></thead>
     <tbody>
       <tr><td>none <span class="muted">(no tool)</span></td><td>0.2</td><td>4.4</td><td>13.3</td></tr>
       <tr><td>canned tool</td><td class="lo">2.4</td><td class="lo">5.2</td><td class="lo">9.8</td></tr>
-      <tr><td>workbench (v1)</td><td class="hi">30.9</td><td class="hi">39.6</td><td class="hi">44.6</td></tr>
+      <tr><td>workbench v1</td><td>30.9</td><td>39.6</td><td>44.6</td></tr>
+      <tr><td>workbench v2 <span class="muted">(+save_path)</span></td><td>36.7</td><td class="hi">81.3</td><td class="hi">100.0</td></tr>
+      <tr><td class="muted">v2 completion%</td><td class="muted-td">39</td><td class="muted-td">100</td><td class="muted-td">100</td></tr>
     </tbody>
   </table></div>
-  <p class="muted">The workbench <b>scales with capability</b> (30.9→39.6→44.6) and crushes the canned
-  tool at every size, while the canned tool barely moves (2.4→9.8 — still the wrong quantity).
-  <b>Completion and precision invert with size:</b> workbench completion 7B 32% / 14B 68% / 72B 99%,
-  but precision (right/attempted) 7B ~95% / 14B ~58% / 72B ~45% — the small model abstains-when-unsure
-  (calibrated), the large model answers-everything (eager); net correct climbs because completion
-  rises faster than precision falls. <i>(The workbench stays oracle-<b>capable</b>: <code>vmd_compute</code>
-  reproduces the gold exactly IF the model picks the right reduction — so it measures the reduction
-  CHOICE, not the arithmetic.)</i></p>
+  <p class="muted"><b>v2 exposes two capability barriers.</b> Fixing the write path lifts the 14B
+  (39.6→<b>81.3</b>) and 72B (44.6→<b>100</b>) enormously, but the 7B only inches up (30.9→36.7) — its
+  bottleneck is earlier: it <b>completes only 39%</b> (a tool-<i>orchestration</i> barrier — it can't
+  reliably sequence fetch→compute→record), while the 14B/72B complete 100%. With recording removed as a
+  factor, the residual gap is pure <i>reduction reasoning</i>: the 14B's ~19% remaining errors are
+  genuine wrong-quantity picks (e.g. reaching for RMSD on a size question), which the 72B doesn't make.
+  So capability grades cleanly — orchestration (7B fails), then reduction choice (14B occasionally
+  fails), then perfect (72B). <i>(An earlier "precision falls with size" read was a v1 write-fumble
+  artifact — v2 corrects it: the 72B's reasoning was already near-perfect.)</i> The flip side:
+  <b>workbench v2 re-saturates the hard tier for the 72B</b> — an oracle-capable tool re-saturates once
+  the model can drive it, motivating a harder tier.</p>
 
   <h2>Honest caveats</h2>
   <div class="callout warn">
