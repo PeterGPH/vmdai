@@ -4,7 +4,7 @@
   "agent_name": "vmd_ai",
   "eval_mode": "mcp",
   "experiment_number": "exp1",
-  "vmd_ai_runtime_path": "/Users/pinhaogu/Documents/GitHub/PyMolAI/vmd_ai/runtime",
+  "vmd_ai_runtime_path": "runtime",
   "loop_timeout": 120,
   "task_timeout": 900,
   "vmd_backend": "subprocess",

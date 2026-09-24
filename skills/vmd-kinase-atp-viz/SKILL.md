@@ -1,7 +1,7 @@
 ---
 name: vmd-kinase-atp-viz
 version: "0.1.0"
-author: PyMolAI
+author: vmdai
 tools:
   - run_vmd_command
   - capture_vmd_snapshot

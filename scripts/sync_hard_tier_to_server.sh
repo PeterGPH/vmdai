@@ -13,7 +13,7 @@
 #   SRV=pinhao2@tbgl-gpu-01  RMT=/data/server10/pinhao2/ML/PyMolAI/vmd_ai  SRV_VMD=/software/vmd-1.9.3/bin/vmd
 set -uo pipefail
 
-LOCAL="/Users/pinhaogu/Documents/GitHub/PyMolAI/vmd_ai"
+LOCAL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRV="${SRV:-pinhao2@tbgl-gpu-01}"
 RMT="${RMT:-/data/server10/pinhao2/ML/PyMolAI/vmd_ai}"
 SRV_VMD="${SRV_VMD:-/software/vmd-1.9.3/bin/vmd}"

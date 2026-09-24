@@ -10,7 +10,7 @@
   "enable_wiki": true,
   "wiki_root": "/Users/pinhaogu/.vmdai/bench_wiki/both",
   "wiki_raw_root": "/Users/pinhaogu/.vmdai/raw",
-  "vmd_ai_runtime_path": "/Users/pinhaogu/Documents/GitHub/PyMolAI/vmd_ai/runtime",
+  "vmd_ai_runtime_path": "runtime",
   "loop_timeout": 120,
   "task_timeout": 360,
   "vmd_backend": "subprocess",

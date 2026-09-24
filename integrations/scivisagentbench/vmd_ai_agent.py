@@ -172,6 +172,16 @@ def _resolve_provider(config: Dict[str, Any]):
     return "anthropic-direct", key, model
 
 
+# Repo root when this file runs in place (integrations/scivisagentbench/).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _resolve_repo_path(path: str) -> str:
+    """Absolute (or ~) paths pass through; relative ones resolve against the repo root."""
+    path = os.path.expanduser(str(path))
+    return path if os.path.isabs(path) else str(_REPO_ROOT / path)
+
+
 @register_agent("vmd_ai")
 class VmdAiAgent(BaseAgent):
     """Evaluates the vmd_ai/ChatVMD agent (ClaudeToolLoop) head­lessly."""
@@ -187,12 +197,14 @@ class VmdAiAgent(BaseAgent):
     # ----------------------------------------------------------------- setup
     async def setup(self):
         # Put the vmd_ai runtime on sys.path, then import its loop + prompt.
-        runtime_path = (self.config.get("vmd_ai_runtime_path")
-                        or os.environ.get("VMD_AI_RUNTIME_PATH"))
-        if not runtime_path:
+        # Relative paths resolve against this repo, and unset means this clone's runtime/.
+        runtime_path = _resolve_repo_path(self.config.get("vmd_ai_runtime_path")
+                                          or os.environ.get("VMD_AI_RUNTIME_PATH")
+                                          or "runtime")
+        if not os.path.isdir(os.path.join(runtime_path, "vmd_ai_runtime")):
             raise RuntimeError(
-                "Set 'vmd_ai_runtime_path' in the config (or VMD_AI_RUNTIME_PATH) "
-                "to <your repo>/vmd_ai/runtime so 'vmd_ai_runtime' is importable."
+                f"No vmd_ai_runtime package under {runtime_path!r}. Set 'vmd_ai_runtime_path' "
+                "in the config (or VMD_AI_RUNTIME_PATH) to <repo>/runtime."
             )
         if runtime_path not in sys.path:
             sys.path.insert(0, runtime_path)
@@ -278,7 +290,7 @@ class VmdAiAgent(BaseAgent):
         ref_path = self.config.get("inject_reference_path")
         if ref_path:
             try:
-                with open(os.path.expanduser(ref_path)) as fh:
+                with open(_resolve_repo_path(ref_path)) as fh:
                     ref = fh.read()
                 self._system_prompt += "\n\nVMD TCL REFERENCE — use these exact, correct idioms:\n" + ref
                 print(f"[vmd_ai] injected reference: {ref_path} ({len(ref)} chars)")

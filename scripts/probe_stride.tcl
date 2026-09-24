@@ -1,6 +1,6 @@
 # STRIDE / render hang locator for 1HCK.
-# Run from the vmd_ai repo root:
-#   /Applications/VMD.app/Contents/vmd/vmd_MACOSXARM64 -dispdev text -eofexit -e probe_stride.tcl
+# Run from the repo root:
+#   /Applications/VMD.app/Contents/vmd/vmd_MACOSXARM64 -dispdev text -eofexit -e scripts/probe_stride.tcl
 # The LAST ">>>" line printed before it stalls tells you the culprit:
 #   stalls after CKPT3 (no CKPT4) -> STRIDE deadlock on NewCartoon -> use the Tube task.
 #   stalls after CKPT1/CKPT2      -> render problem, not STRIDE (tell me).

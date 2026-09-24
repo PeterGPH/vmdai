@@ -121,7 +121,7 @@ Opt out with `VMD_AI_RECORDER=off` if you don't want disk artifacts.
 ### 1) Run runtime standalone
 
 ```bash
-cd vmd_ai
+cd vmdai
 ./scripts/run_runtime.sh
 ```
 
@@ -130,7 +130,7 @@ cd vmd_ai
 In VMD Tcl console:
 
 ```tcl
-source /absolute/path/to/PyMolAI/vmd_ai/plugin/init.tcl
+source /absolute/path/to/vmdai/plugin/init.tcl
 ::vmdai::start
 ```
 
@@ -161,7 +161,7 @@ export VMD_AI_PROVIDER="openrouter"
 3. Start VMD from that same shell and load plugin:
 
 ```tcl
-source /absolute/path/to/PyMolAI/vmd_ai/plugin/init.tcl
+source /absolute/path/to/vmdai/plugin/init.tcl
 ::vmdai::start
 ```
 
@@ -183,7 +183,7 @@ export ANTHROPIC_MODEL="claude-sonnet-4-5"
 Then start VMD from the same shell and load:
 
 ```tcl
-source /absolute/path/to/PyMolAI/vmd_ai/plugin/init.tcl
+source /absolute/path/to/vmdai/plugin/init.tcl
 ::vmdai::start
 ```
 
@@ -206,7 +206,7 @@ Provider selection behavior:
 Run from repo root:
 
 ```bash
-.venv/bin/python -m unittest discover -s vmd_ai/tests -p 'test_*.py' -v
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 ## Notes

@@ -1,7 +1,7 @@
 ---
 name: vmd-ligand-pore-viz
 version: "1.0.0"
-author: PyMolAI
+author: vmdai
 tools:
   - run_vmd_command
   - capture_vmd_snapshot

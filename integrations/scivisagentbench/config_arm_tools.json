@@ -8,7 +8,7 @@
   "experiment_number": "tools",
   "enable_rag": false,
   "enable_wiki": false,
-  "vmd_ai_runtime_path": "/Users/pinhaogu/Documents/GitHub/PyMolAI/vmd_ai/runtime",
+  "vmd_ai_runtime_path": "runtime",
   "loop_timeout": 120,
   "task_timeout": 360,
   "vmd_backend": "subprocess",

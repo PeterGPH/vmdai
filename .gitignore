@@ -1,5 +1,9 @@
 __pycache__/
 *.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+.DS_Store
 runtime/runtime.log
 
 # ATLAS raw download cache (commit only the small strided fixtures under vmdbench/fixtures)
@@ -10,7 +14,22 @@ integrations/scivisagentbench/_gold_archive/
 # tracked run_manifest.jsonl (one line per RUN: commit, model, tier, knobs) instead.
 test_results/
 run_*.log
-integrations/scivisagentbench/atlas_fix*/           # throwaway chain subsets for quick runs
-integrations/scivisagentbench/gold_cache_*.json     # derived from oracle+fixtures, regenerable
+# Throwaway chain subsets for quick runs (git has no trailing comments, so these live
+# on their own lines) — but the curated ATLAS fixture set IS tracked.
+integrations/scivisagentbench/atlas_fix*/
+!integrations/scivisagentbench/atlas_fixtures/
+# Derived from oracle+fixtures, regenerable
+integrations/scivisagentbench/gold_cache_*.json
 # ...but DO track the run manifest (the version-control record of every run):
 !integrations/scivisagentbench/run_manifest.jsonl
+
+# Local chat/run artifacts written by the panel into its working folder
+.vmdai_runs/
+
+# Third-party, not redistributable ("All rights reserved"): keep a local checkout here so the
+# harness finds SciVisAgentBench-main/benchmark (evaluation_framework), but never commit it.
+SciVisAgentBench-main/
+SciVisAgentBench-main.zip
+SciVisAgentSkills-main/
+# Paper drafts live outside this repo (audit_answer_parser.py still writes here by default).
+draft_iclr/

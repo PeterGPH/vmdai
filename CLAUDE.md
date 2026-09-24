@@ -4,8 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Scope & layout
 
-Covers **`vmd_ai/`**, the VMD-AI subtree of a PyMOL-open-source fork (the repo's top-level
-`pyproject.toml` is PyMOL's — ignore it for this work). Run all commands from `vmd_ai/` so
+`vmdai` is standalone. Its history before the "import" commit is the `vmd_ai/` subtree of a
+PyMOL-open-source fork (`PyMolAI`, branch `vmdbench-design`), split out on 2026-09-24; the
+copy left in `PyMolAI/vmd_ai` is legacy. Run all commands from the repo root so
 `python -m vmdbench…` resolves.
 
 Four largely-independent subsystems:
@@ -25,9 +26,12 @@ Four largely-independent subsystems:
 `file delete`, `socket`, …) — effectively shell-equivalent. Prompt-injection via loaded files
 (PDB REMARKs, trajectory metadata) is a real vector; don't point it at untrusted input.
 
-## Commands (run from `vmd_ai/`)
+## Commands (run from the repo root)
 
-- **Tests:** `python -m pytest vmdbench/tests -q`. Single test:
+- **Product tests:** `env -u VMD_AI_PROVIDER python -m pytest tests -q` (runtime + recorder;
+  an exported `VMD_AI_PROVIDER` leaks into the provider-selection tests). The Tcl panel
+  (`plugin/`) has no automated tests yet.
+- **Benchmark tests:** `python -m pytest vmdbench/tests -q`. Single test:
   `python -m pytest vmdbench/tests/test_checks.py -q -k scalar_within`. The "live" tests
   (`test_oracle.py`, `test_atlas.py`, the `*LiveTests` image classes) shell out to VMD and
   skip/error without it. Needs `pyyaml` (`pillow` only for the optional PNG image path).
@@ -87,14 +91,20 @@ bands → verify).
   references — the agent's `vmd_bin` *and* its own `DEFAULT_VMD` for the gold oracle — both must
   point at a real binary. Known paths: `/Applications/VMD.app/Contents/vmd/vmd_MACOSXARM64`
   (Mac dev; min 1.9.4a57), `/software/vmd-1.9.3/bin/vmd` (the `tbgl` GPU server).
-- **ATLAS data is CC-BY-NC 4.0** (non-commercial + attribution) — do not commit ATLAS-derived
-  `fixtures/*` without confirming that license is acceptable; provenance is in each
-  `*_gold.json`. Raw multi-GB downloads live in the gitignored `.atlas_cache/`.
+- **ATLAS data is CC-BY-NC 4.0** (non-commercial + attribution). The curated fixtures in
+  `vmdbench/fixtures/` and `integrations/scivisagentbench/atlas_fixtures/` are tracked with the
+  owner's approval because this repo is private — re-check before making it public; provenance
+  is in each `*_gold.json`. Raw multi-GB downloads live in the gitignored `.atlas_cache/`.
+- **Harness paths:** `vmd_ai_runtime_path` / `inject_reference_path` in the
+  `integrations/**/config_*.json` files are repo-relative (`runtime`, `docs/…`) and resolved by
+  `vmd_ai_agent._resolve_repo_path`; absolute paths still pass through.
+  `scripts/sync_hard_tier_to_server.sh` still defaults `RMT` to the server's old
+  `…/ML/PyMolAI/vmd_ai` clone.
 - **SciVisAgentBench harness** is designed to run agent+VMD locally and only call the *model*
   remotely (vLLM). Failed cases auto-save to `test_results/multistructure/<arm>/failures/`
   (`.tcl` + `.log`) with a `failures.jsonl` index.
 
 ## Git
 
-Feature work is on branch `vmdbench-design` (off `master`). End commit messages with a
+Default branch is `main` (remote: private `PeterGPH/vmdai`). End commit messages with a
 `Co-Authored-By: Claude …` trailer.
