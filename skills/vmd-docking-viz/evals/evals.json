@@ -1,0 +1,102 @@
+{
+  "skill_name": "vmd-docking-viz",
+  "schema_version": 1,
+  "description": "Eval prompts for the protein-ligand docking visualization skill. Each prompt simulates a real user request a docking-savvy researcher would type into the VMD AI panel. The grader checks for the presence of expected Tcl/matplotlib idioms and rendering steps in the agent transcript.",
+  "evals": [
+    {
+      "id": "single-pose-paper-figure",
+      "prompt": "I have a receptor.pdb and vina_out.pdb with 9 docked poses from AutoDock Vina. Render a publication-quality figure of the top pose: cartoon receptor in light gray, binding-pocket residues as licorice, ligand as licorice colored by atom type, white background, orthographic. Save the snapshot.",
+      "expected_assertions": [
+        "Loads receptor with mol new ... type pdbqt",
+        "Loads pose file with mol new and references numframes",
+        "Drops or resets existing representations before adding new ones",
+        "Sets display projection Orthographic",
+        "Sets background to white via color Display Background white",
+        "Adds NewCartoon representation for protein",
+        "Computes pocket residues using measure contacts (cross-molecule selection)",
+        "Adds Licorice rep with mol color Name for the ligand",
+        "Calls mol drawframes to limit to a specific pose",
+        "Calls render snapshot or render TachyonInternal",
+        "Calls capture_vmd_snapshot to verify"
+      ]
+    },
+    {
+      "id": "multi-pose-overlay",
+      "prompt": "Show the top Vina pose prominently and overlay the other 8 poses as faded thin sticks so I can see the spread. Same receptor and pose file as before. White background, orthographic.",
+      "expected_assertions": [
+        "Reads numframes to determine pose count",
+        "Adds a thick Licorice rep for pose 0",
+        "Adds a thinner Licorice rep with Transparent material for poses 1..N-1",
+        "Uses mol drawframes with frame list {0} for the top pose",
+        "Uses mol drawframes with the remaining frame list for alternates",
+        "Uses ColorID-based color for the alternate-pose rep (visual distinction from top pose)",
+        "Captures snapshot to verify overlay"
+      ]
+    },
+    {
+      "id": "score-colored-ensemble",
+      "prompt": "Color all 9 docked poses by their Vina affinity score and render as a single VMD scene. Use a perceptually uniform colormap (BWR or BlueRed). Annotate the color scale range with the actual min and max scores from the Vina output.",
+      "expected_assertions": [
+        "Parses Vina REMARK lines to extract per-pose affinities",
+        "Writes scores into the User column of every frame via $sel set user",
+        "Uses mol color User for the ensemble rep",
+        "Calls mol scaleminmax with the actual score range (negative numbers, e.g. -12 to -4)",
+        "Calls mol colupdate to refresh the per-frame color",
+        "Captures snapshot for verification",
+        "Reports the min/max scores back to the user in text"
+      ]
+    },
+    {
+      "id": "interaction-heatmap",
+      "prompt": "Make a heatmap showing which pocket residues each of the 9 docked poses contacts (within 4 A). Y-axis poses, X-axis residue IDs sorted, white-to-red colormap. Save as both PNG and SVG with publication formatting.",
+      "expected_assertions": [
+        "Iterates over poses calling measure contacts with cutoff 4.0",
+        "Maps contacted atom indices back to unique resids",
+        "Builds a binary contact matrix (poses x residues)",
+        "Writes matrix to a .dat or .npy file consumable by Python",
+        "Writes a matplotlib script using Agg backend",
+        "Uses imshow with YlOrRd or equivalent colormap",
+        "Sets x-tick labels to residue IDs (rotated)",
+        "Sets axis labels with units / clear names",
+        "Saves both PNG (300 DPI) and SVG outputs"
+      ]
+    },
+    {
+      "id": "pose-rmsd-matrix",
+      "prompt": "Compute the all-vs-all heavy-atom RMSD matrix across all 9 docked poses and plot it as a heatmap. I want to see if the poses cluster into distinct binding modes.",
+      "expected_assertions": [
+        "Uses an atomselect with 'noh' to ignore hydrogens",
+        "Iterates with nested frame loops to compute pairwise RMSD",
+        "Calls measure rmsd with two selections that differ only in the frame they reference",
+        "Writes the NxN matrix to a data file",
+        "Plots a heatmap with imshow using viridis or comparable colormap",
+        "Adds a colorbar labeled 'RMSD (\u00c5)'",
+        "Saves both PNG and SVG outputs"
+      ]
+    },
+    {
+      "id": "binding-site-with-surface",
+      "prompt": "Render the docked complex with a semi-transparent receptor surface so I can see the cavity around the ligand. Restrict the surface to residues within 8 A of the ligand to keep render times reasonable. Use TachyonInternal for the final image.",
+      "expected_assertions": [
+        "Computes pocket residues via measure contacts",
+        "Adds a Surf or QuickSurf rep restricted to pocket residues",
+        "Sets material to Transparent on the surface rep",
+        "Uses TachyonInternal renderer instead of plain render snapshot",
+        "Captures snapshot afterwards"
+      ]
+    },
+    {
+      "id": "score-vs-rank-bar-chart",
+      "prompt": "Plot Vina affinity vs pose rank as a bar chart. The top pose's score should be highlighted with a horizontal dashed line. Use the publication style: Arial, single column, colorblind-safe palette.",
+      "expected_assertions": [
+        "Parses Vina scores from the PDBQT REMARK lines",
+        "Writes a python script using matplotlib with Agg backend",
+        "Uses ax.bar(ranks, scores)",
+        "Adds ax.axhline for the top score with a dashed linestyle",
+        "Inverts y-axis or uses absolute values so 'better' reads upward",
+        "Sets axis labels with units (kcal/mol)",
+        "Saves both PNG and SVG with bbox_inches='tight'"
+      ]
+    }
+  ]
+}

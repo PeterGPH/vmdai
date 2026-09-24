@@ -1,0 +1,16 @@
+{
+  "chain": "6o2v_A",
+  "replica": 1,
+  "stride": 25,
+  "fixture_frames": "41",
+  "atlas_mean_rg": 16.601,
+  "atlas_mean_rmsf": 1.024,
+  "metadata_avg_gyration": 16.6,
+  "metadata_avg_RMSF": 1.02,
+  "length": 135,
+  "protein_name": "Store-operated calcium entry-associated regulatory factor",
+  "license": "CC-BY-NC-4.0",
+  "source": "https://www.dsimb.inserm.fr/ATLAS/api/ATLAS/analysis/6o2v_A",
+  "cite": "Vander Meersche et al., ATLAS, Nucleic Acids Research 2024 (52:D1 D384)",
+  "atlas_mean_rmsd": 2.331
+}

@@ -1,0 +1,23 @@
+task_id: rg_1ubq_001
+category: analysis
+bucket: operational
+difficulty: easy
+dimensions: [semantic_grounding]
+initial_state:
+  files: [1ubq.pdb]
+  pdb: 1UBQ                # ubiquitin, 76 residues / 602 atoms
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# Correctness, not completion. Folded ubiquitin's protein Rg ~= 11.8 A. The band below
+# is intentionally generous for the seed; run `score-oracle` (it prints the exact
+# measure_rgyr) and tighten min/max to value +/- 0.5 for a strict check.
+user_prompt: >
+  Load the structure and report the radius of gyration (Rg) of the 1UBQ protein in Angstroms.
+verify:
+  required:
+    - {kind: molecule_loaded, where: {}}
+    - {kind: scalar_within,   where: {name: rgyr, min: 10.0, max: 14.0}}
+  optional:
+    - {kind: no_runtime_errors, where: {}}
+reproducibility:
+  exports: [tcl]

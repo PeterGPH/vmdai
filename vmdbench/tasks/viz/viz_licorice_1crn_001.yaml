@@ -1,0 +1,24 @@
+task_id: viz_licorice_1crn_001
+category: visualization
+bucket: synthesis
+difficulty: easy
+dimensions: [actionability, semantic_grounding]
+initial_state:
+  files: [1crn.pdb]
+  pdb: 1CRN
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# Scene-state correctness for the SciVisAgentBench molecular_vis "licorice" task (case_1).
+# There the rubric only checks the agent wrote "yes"; this verifies a Licorice
+# representation actually exists in the built scene. Score the agent's transcript with:
+#   vmdbench score-oracle viz_licorice_1crn_001.yaml <agent>/case_1.tcl
+user_prompt: >
+  Load 1CRN and display the protein using a Licorice representation.
+verify:
+  required:
+    - {kind: molecule_loaded,       where: {}}
+    - {kind: representation_exists, where: {style: Licorice}}
+  optional:
+    - {kind: no_runtime_errors,     where: {}}
+reproducibility:
+  exports: [tcl]

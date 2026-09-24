@@ -1,0 +1,34 @@
+task_id: atlas_dynamics_5dbl_A_001
+category: trajectory
+bucket: synthesis
+difficulty: medium
+dimensions: [actionability, semantic_grounding]
+initial_state:
+  files: [5dbl_A.pdb, 5dbl_A_R1_s25.dcd]
+  pdb: 5DBL
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# Real all-atom MD from ATLAS (5dbl_A = Surface protein G, 132 res; replica 1, ~42 frames).
+# Trajectory CORRECTNESS: mean Rg + mean Calpha-RMSD-to-frame-0 + mean Calpha RMSF (ATLAS-published)
+# + mean SASA (1.4 A probe; VMD-computed, ATLAS does not pre-publish it). Bands calibrated from the
+# oracle (vmdbench gold); ATLAS cross-check Rg 33.212 / RMSD 4.741 / RMSF 3.671 A.
+# ATLAS data CC-BY-NC 4.0 — cite Vander Meersche et al., NAR 2024 (52:D1 D384).
+user_prompt: >
+  Load 5dbl_A.pdb and its MD trajectory 5dbl_A_R1_s25.dcd, then report (align the frames to frame 0 first):
+  "PROBE> measure_meanrg=<value>" (mean radius of gyration over all frames),
+  "PROBE> measure_meanrmsd=<value>" (mean alpha-carbon RMSD to the first frame),
+  "PROBE> measure_mean_rmsf=<value>" (mean per-residue alpha-carbon RMSF), and
+  "PROBE> measure_meansasa=<value>" (mean solvent-accessible surface area, measure sasa 1.4).
+verify:
+  required:
+    - {kind: molecule_loaded, where: {}}
+    - {kind: frames_loaded,   where: {min: 40}}
+    - {kind: scalar_within,   where: {name: meanrg,    expect: 33.01, tol: 2.64}}
+    - {kind: scalar_within,   where: {name: meanrmsd,  expect: 4.73, tol: 0.71}}
+    - {kind: scalar_within,   where: {name: mean_rmsf, min: 1.92, max: 6.52}}
+    - {kind: scalar_within,   where: {name: meansasa,  expect: 10432.2, tol: 834.6}}
+  optional:
+    - {kind: no_runtime_errors, where: {}}
+reproducibility:
+  exports: [tcl]
+  replay_clean: true

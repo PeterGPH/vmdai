@@ -1,0 +1,11 @@
+{
+  "_comment": "Seed prompt set for the wiki A/B bench. These are the kinds of questions where a compiled wiki page should outperform on-demand search. Add your own — the prompts where the wiki helps most are the ones where the answer is non-trivial synthesis of multiple sources.",
+  "prompts": [
+    "I have a membrane protein loaded. How do I select just the pore-lining residues and color them by hydrophobicity?",
+    "Walk me through making a publication-quality cartoon-plus-licorice figure for a protein-ligand complex.",
+    "What's the difference between NewCartoon and Tube representations, and when should I use each?",
+    "I want to compute the per-frame RMSD of a binding-site loop relative to frame 0. Give me the Tcl.",
+    "Set up a transparent surface representation that shows the underlying cartoon clearly. What materials work best?",
+    "How do I make a movie of a trajectory with a ligand highlighted, and export it as MP4?"
+  ]
+}

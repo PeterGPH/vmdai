@@ -1,0 +1,16 @@
+{
+  "chain": "2gkr_I",
+  "replica": 1,
+  "stride": 25,
+  "fixture_frames": "41",
+  "atlas_mean_rg": 10.429,
+  "atlas_mean_rmsf": 0.636,
+  "metadata_avg_gyration": 10.43,
+  "metadata_avg_RMSF": 0.64,
+  "length": 51,
+  "protein_name": "Ovomucoid",
+  "license": "CC-BY-NC-4.0",
+  "source": "https://www.dsimb.inserm.fr/ATLAS/api/ATLAS/analysis/2gkr_I",
+  "cite": "Vander Meersche et al., ATLAS, Nucleic Acids Research 2024 (52:D1 D384)",
+  "atlas_mean_rmsd": 0.934
+}

@@ -24,6 +24,7 @@ Then run, e.g.:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -401,8 +402,21 @@ class VmdAiAgent(BaseAgent):
         collected: list[str] = []
         cancel_event = __import__("threading").Event()
 
+        # optional FULL-CONVERSATION capture (config "record_transcripts": true):
+        # a chronological event log assembled from the loop's callbacks — every prose
+        # chunk, every tool call with its input, every tool result including the VMD
+        # output — plus the system and task prompts, written as <case>.convo.jsonl.
+        # Default off: zero behavior change for existing runs.
+        _record = bool(self.config.get("record_transcripts", False))
+        convo: list = []
+
+        def _rec(kind: str, **kw) -> None:
+            if _record:
+                convo.append({"t": round(time.time() - start, 3), "kind": kind, **kw})
+
         def on_chunk(text: str) -> None:
             collected.append(text)
+            _rec("text", text=text)
 
         # Visible tool I/O for debugging: set VMD_AI_DEBUG_TOOLS=1 to print every
         # run_vmd_command (the exact Tcl) + its result. Off by default so real runs
@@ -415,6 +429,7 @@ class VmdAiAgent(BaseAgent):
             return s if len(s) <= n else s[:n] + f" …(+{len(s) - n} chars)"
 
         def on_tool_start(name: str, tool_input: Dict[str, Any]) -> None:
+            _rec("tool_call", name=name, input=dict(tool_input or {}))
             if name == "run_vmd_command":
                 tcl_log.append({"cmd": str(tool_input.get("command", "")), "ok": None, "err": ""})
             if not _debug_tools:
@@ -427,6 +442,9 @@ class VmdAiAgent(BaseAgent):
                 print(f"\n  → {name}: {_short(tool_input)}", flush=True)
 
         def on_tool_result(tool_id: str, name: str, result: Dict[str, Any]) -> None:
+            _rec("tool_result", name=name, ok=bool((result or {}).get("ok")),
+                 output=str((result or {}).get("output") or ""),
+                 error=str((result or {}).get("error") or ""))
             if name == "run_vmd_command" and tcl_log:
                 tcl_log[-1]["ok"] = bool(result.get("ok"))
                 tcl_log[-1]["err"] = str(result.get("error") or "")
@@ -507,6 +525,15 @@ class VmdAiAgent(BaseAgent):
             _case = str(task_config.get("case_name") or "task")
             self._write_tcl_transcript(tcl_log, working_dir, _case, task_description)
             self._write_response(collected, working_dir, _case)   # full LLM text, every case
+            if _record and convo:
+                try:
+                    with open(os.path.join(working_dir, f"{_case}.convo.jsonl"), "w") as fh:
+                        fh.write(json.dumps({"kind": "system", "text": system_prompt}) + "\n")
+                        fh.write(json.dumps({"kind": "user", "text": task_description}) + "\n")
+                        for e in convo:
+                            fh.write(json.dumps(e) + "\n")
+                except OSError:
+                    pass
 
         response = final_text or "".join(collected)
         duration = time.time() - start

@@ -1,0 +1,34 @@
+task_id: atlas_dynamics_2erl_A_001
+category: trajectory
+bucket: synthesis
+difficulty: medium
+dimensions: [actionability, semantic_grounding]
+initial_state:
+  files: [2erl_A.pdb, 2erl_A_R1_s25.dcd]
+  pdb: 2ERL
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# Real all-atom MD from ATLAS (2erl_A = Mating pheromone Er-1/Er-3, 40 res; replica 1, ~42 frames).
+# Trajectory CORRECTNESS: mean Rg + mean Calpha-RMSD-to-frame-0 + mean Calpha RMSF (ATLAS-published)
+# + mean SASA (1.4 A probe; VMD-computed, ATLAS does not pre-publish it). Bands calibrated from the
+# oracle (vmdbench gold); ATLAS cross-check Rg 9.412 / RMSD 0.887 / RMSF 0.647 A.
+# ATLAS data CC-BY-NC 4.0 — cite Vander Meersche et al., NAR 2024 (52:D1 D384).
+user_prompt: >
+  Load 2erl_A.pdb and its MD trajectory 2erl_A_R1_s25.dcd, then report (align the frames to frame 0 first):
+  "PROBE> measure_meanrg=<value>" (mean radius of gyration over all frames),
+  "PROBE> measure_meanrmsd=<value>" (mean alpha-carbon RMSD to the first frame),
+  "PROBE> measure_mean_rmsf=<value>" (mean per-residue alpha-carbon RMSF), and
+  "PROBE> measure_meansasa=<value>" (mean solvent-accessible surface area, measure sasa 1.4).
+verify:
+  required:
+    - {kind: molecule_loaded, where: {}}
+    - {kind: frames_loaded,   where: {min: 40}}
+    - {kind: scalar_within,   where: {name: meanrg,    expect: 9.54, tol: 0.76}}
+    - {kind: scalar_within,   where: {name: meanrmsd,  expect: 0.92, tol: 0.3}}
+    - {kind: scalar_within,   where: {name: mean_rmsf, min: 0.33, max: 1.11}}
+    - {kind: scalar_within,   where: {name: meansasa,  expect: 3041.8, tol: 243.3}}
+  optional:
+    - {kind: no_runtime_errors, where: {}}
+reproducibility:
+  exports: [tcl]
+  replay_clean: true

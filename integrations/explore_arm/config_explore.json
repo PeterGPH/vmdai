@@ -1,0 +1,21 @@
+{
+  "_machine_notes": "Portable across the Mac dev box and the tbgl GPU server: vmd_bin and vmd_ai_runtime_path are auto-resolved by run_explore.py (env VMD_AI_VMD_BIN overrides; runtime defaults to this clone's vmd_ai/runtime). Set them here only to pin explicitly. `model` MUST exactly match the id vLLM is serving (curl localhost:8000/v1/models) — a mismatch is how the qwen14b_wb2 misrun happened.",
+  "provider": "vllm",
+  "model": "Qwen/Qwen2.5-72B-Instruct-AWQ",
+  "base_url": "http://localhost:8000/v1",
+  "api_key": "sk-local-anything",
+  "agent_name": "vmd_ai",
+  "eval_mode": "mcp",
+  "experiment_number": "explore",
+  "enable_rag": false,
+  "enable_wiki": false,
+  "enable_semantic_tools": false,
+  "enable_workbench_tools": false,
+  "explore_min_experiments": 3,
+  "explore_max_experiments": 15,
+  "loop_timeout": 120,
+  "task_timeout": 360,
+  "vmd_backend": "subprocess",
+  "vmd_timeout": 45,
+  "price": { "input_per_1m_tokens": "$0.00", "output_per_1m_tokens": "$0.00" }
+}

@@ -1,0 +1,23 @@
+{
+  "skill_name": "vmd-ligand-pore-viz",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I have a membrane protein with a ligand (resname LIG) loaded in VMD with a 500-frame DCD trajectory. Plot the ligand's z-position over time to see if it permeates through the pore. Make it publication quality.",
+      "expected_output": "A Tcl extraction loop computing ligand COM z-coordinate per frame, followed by a matplotlib script producing a publication-quality line plot with proper axis labels (Time in ns, z-position in angstroms), pore region shading, and both PNG/SVG output.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Generate a contact map showing which pore-lining residues interact with the ligand across the trajectory. I want a heatmap figure I can put in a paper.",
+      "expected_output": "A Tcl script computing per-frame residue contacts within a distance cutoff, writing a data file, then a matplotlib heatmap (imshow) with residue IDs on y-axis, frames/time on x-axis, colorblind-safe colormap, and publication formatting.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Make a composite 3-panel figure for my paper: top panel shows ligand-pore distance over time, middle panel shows number of hydrogen bonds per frame, bottom panel shows pore radius profile at the first and last frames. Save as SVG.",
+      "expected_output": "Multiple Tcl extraction steps (distance, hbonds, pore radius at two frames), then a single matplotlib script producing a 3-panel figure with shared x-axis where applicable, panel labels (A, B, C), proper units, and SVG output.",
+      "files": []
+    }
+  ]
+}

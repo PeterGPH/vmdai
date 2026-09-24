@@ -1,0 +1,16 @@
+{
+  "chain": "3bwu_D",
+  "replica": 1,
+  "stride": 25,
+  "fixture_frames": "41",
+  "atlas_mean_rg": 16.772,
+  "atlas_mean_rmsf": 3.106,
+  "metadata_avg_gyration": 16.78,
+  "metadata_avg_RMSF": 3.11,
+  "length": 125,
+  "protein_name": "Outer membrane usher protein FimD",
+  "license": "CC-BY-NC-4.0",
+  "source": "https://www.dsimb.inserm.fr/ATLAS/api/ATLAS/analysis/3bwu_D",
+  "cite": "Vander Meersche et al., ATLAS, Nucleic Acids Research 2024 (52:D1 D384)",
+  "atlas_mean_rmsd": 6.088
+}

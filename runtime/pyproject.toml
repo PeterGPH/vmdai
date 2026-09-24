@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vmd-ai-runtime"
+version = "0.2.0"
+description = "VMD AI runtime: Claude agent loop with run_vmd_command / capture_vmd_snapshot tools"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+# OS keychain support for API key storage
+keychain = ["keyring>=24"]
+
+# Better image conversion for snapshots (TGA/BMP/RGB → PNG)
+# Falls back to a pure-stdlib TGA parser when not installed.
+images = ["Pillow>=9.0"]
+
+# Install all optional extras
+full = ["keyring>=24", "Pillow>=9.0"]
+
+[project.scripts]
+vmd-ai-runtime = "main:main"
+vmd-ai-index   = "vmd_ai_runtime.scripts.build_docs_index:cli"

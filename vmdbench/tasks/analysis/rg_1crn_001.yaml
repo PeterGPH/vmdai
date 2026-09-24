@@ -1,0 +1,25 @@
+task_id: rg_1crn_001
+category: analysis
+bucket: operational
+difficulty: easy
+dimensions: [semantic_grounding]
+initial_state:
+  files: [1crn.pdb]
+  pdb: 1CRN                # crambin, 46 residues / 327 atoms
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# Correctness, not completion. The answer must be the *right* radius of gyration,
+# not merely "a number". Crambin Rg ~= 9.6 A. The ChatVMD agent reported 329 A on
+# SciVisAgentBench's molecular_vis case_8 and still scored 10/10 there (its rubric
+# only checks that a number was reported). This card FAILS that answer:
+# 329 is outside [8, 12].
+user_prompt: >
+  Load the structure and report the radius of gyration (Rg) of 1CRN in Angstroms.
+verify:
+  required:
+    - {kind: molecule_loaded, where: {}}
+    - {kind: scalar_within,   where: {name: rgyr, min: 8.0, max: 12.0}}
+  optional:
+    - {kind: no_runtime_errors, where: {}}
+reproducibility:
+  exports: [tcl]

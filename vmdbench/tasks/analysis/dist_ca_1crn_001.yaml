@@ -1,0 +1,25 @@
+task_id: dist_ca_1crn_001
+category: analysis
+bucket: operational
+difficulty: easy
+dimensions: [semantic_grounding]
+initial_state:
+  files: [1crn.pdb]
+  pdb: 1CRN
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# Gold: CA(resid 1) - CA(resid 10) = 12.60 A (hand-verified from coordinates).
+# The agent reported 12.603 A on case_9 -> this card PASSES it. Kept alongside the
+# Rg card to show the verifier gives credit when the value is right: vmdbench
+# discriminates correct from incorrect, where the LLM-judge gave both 100%.
+user_prompt: >
+  Load 1CRN and report the distance between the alpha carbons of residue 1 and
+  residue 10, in Angstroms.
+verify:
+  required:
+    - {kind: molecule_loaded, where: {}}
+    - {kind: scalar_within,   where: {name: ca1_ca10, expect: 12.60, tol: 0.5}}
+  optional:
+    - {kind: no_runtime_errors, where: {}}
+reproducibility:
+  exports: [tcl]

@@ -1,0 +1,28 @@
+task_id: viz_kinase_tube_001
+category: visualization
+bucket: synthesis
+difficulty: easy
+dimensions: [actionability, semantic_grounding, reproducibility]
+initial_state:
+  files: [1hck.pdb]
+  pdb: 1HCK            # CDK2 kinase + ATP (2510 atoms), real structure
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# STRIDE-free variant: Tube backbone needs no secondary-structure step, so it
+# avoids the STRIDE deadlock that hangs NewCartoon on real proteins headless.
+user_prompt: >
+  Load the CDK2 kinase structure (1HCK), show the protein backbone as a Tube
+  colored along the sequence, show the ATP ligand as Licorice, set a white
+  background, and render a publication image to out.tga.
+verify:
+  required:
+    - {kind: molecule_loaded,       where: {}}
+    - {kind: representation_exists, where: {selection: protein, style: Tube}}
+    - {kind: display_property,      where: {bg_color: white}}
+    - {kind: file_rendered,         where: {path: out.tga, must_be_image: true, min_bytes: 1000}}
+  optional:
+    - {kind: representation_exists, where: {selection: "resname ATP", style: Licorice}}
+    - {kind: no_runtime_errors,     where: {}}
+reproducibility:
+  exports: [tcl]
+  replay_clean: true

@@ -1,0 +1,31 @@
+PDB	length	avg_RMSF	avg_gyration	alpha%	beta%	coil%	protein_name	est_dl_MB
+3a1g_B	40	3.05	11.02	82	0	18	Polymerase basic protein 2	9.0
+2gkr_I	51	0.64	10.43	20	18	63	Ovomucoid	11.5
+6ro6_A	58	1.34	11.13	53	0	47	HTH-type transcriptional regulator DdrOC	13.1
+3pf6_A	62	3.04	12.62	52	0	48	Peptidase_M48 domain-containing protein	14.0
+2yzt_A	67	2.43	12.84	22	21	57	HicB family protein	15.1
+1h02_B	70	2.55	13.29	39	6	56	Insulin-like growth factor I	15.8
+3dso_A	74	1.97	13.08	16	41	43	Copper resistance protein K	16.7
+6jv8_A	76	1.77	13.84	64	0	36	Complement C5	17.1
+3a1g_A	80	2.14	14.32	75	0	25	RNA-directed RNA polymerase catalytic subunit	18.0
+3bzl_D	83	1.3	12.7	46	17	37	EscU	18.7
+1pch_A	88	0.62	11.97	38	25	38	Phosphocarrier protein HPr	19.8
+1x6j_A	91	1.54	12.81	66	0	34	FAD assembly factor SdhE	20.5
+3b4q_B	94	1.79	13.33	69	0	31	DUF3235 domain-containing protein	21.2
+4z8q_B	98	2.01	16.49	64	0	36	AvrRxo1-ORF2	22.1
+3po8_A	100	0.89	12.93	0	48	52	FHA domain-containing protein FhaA	22.6
+5w82_E	103	14.41	27.85	42	4	54	Protein delta	23.2
+4obi_A	106	3.62	15.58	5	44	51	NusG domain-containing protein	23.9
+5pal_A	109	0.71	12.96	57	2	41	Parvalbumin alpha	24.6
+4jmu_A	112	1.25	13.57	64	3	33	Gag-Pol polyprotein	25.3
+2es9_A	115	1.18	14.77	63	0	37	Putative cytoplasmic protein	25.9
+3kz7_A	119	1.07	14.66	10	34	55	Peptidyl-prolyl cis-trans isomerase FKBP3	26.8
+3t92_A	121	2.58	22.34	73	0	27	Histone acetyltransferase p300	27.3
+3bwu_D	125	3.11	16.78	22	30	48	Outer membrane usher protein FimD	28.2
+6j56_A	129	1.48	16.33	35	28	37	Unconventional myosin-VI	29.1
+5dbl_A	132	3.67	33.21	0	55	45	Surface protein G	29.8
+6o2v_A	135	1.02	16.6	5	44	51	Store-operated calcium entry-associated regulatory factor	30.4
+3m7a_A	140	2.45	14.97	11	43	46	DUF192 domain-containing protein	31.6
+6l4p_B	145	1.63	15.61	65	6	30	Dynein gamma chain, flagellar outer arm	32.7
+2w56_A	147	1.24	15.83	26	33	41	DUF2787 domain-containing protein	33.2
+4whe_A	150	1.66	28.27	90	0	10	Phage shock protein A	33.8

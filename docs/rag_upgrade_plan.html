@@ -1,0 +1,743 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>VMD AI — RAG Upgrade Plan</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161922;
+    --panel-2: #1d2230;
+    --ink: #e7ecf3;
+    --ink-dim: #9aa4b2;
+    --accent: #ff7a3d;
+    --accent-2: #5aa9ff;
+    --good: #4ade80;
+    --bad: #f87171;
+    --warn: #facc15;
+    --border: #2a3142;
+    --code-bg: #0b0d12;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); font: 14.5px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent-2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre { font-family: var(--mono); }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; font-size: 0.92em; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; overflow-x: auto; margin: 10px 0; }
+
+  header.top {
+    padding: 24px 32px 18px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+  }
+  header.top h1 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
+  header.top .tag { font: 11px/1 var(--mono); padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; color: var(--ink-dim); }
+  header.top .sub { color: var(--ink-dim); margin-left: auto; font-size: 13px; }
+
+  .layout { display: grid; grid-template-columns: 240px 1fr; min-height: calc(100vh - 70px); }
+  nav.side {
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    padding: 16px 8px;
+    position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  }
+  nav.side .group-label { font-size: 11px; color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.1em; padding: 8px 12px 4px; }
+  nav.side button {
+    width: 100%; text-align: left; background: transparent; color: var(--ink);
+    border: 1px solid transparent; padding: 8px 12px; border-radius: 6px;
+    cursor: pointer; font-size: 14px; display: flex; gap: 10px; align-items: center;
+  }
+  nav.side button .step-num {
+    font: 11px/1 var(--mono); width: 22px; height: 22px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid var(--border); border-radius: 50%; color: var(--ink-dim);
+  }
+  nav.side button.active { background: var(--panel-2); border-color: var(--border); }
+  nav.side button.active .step-num { color: var(--accent); border-color: var(--accent); }
+  nav.side button:hover { background: var(--panel-2); }
+
+  main { padding: 28px 36px 64px; max-width: 1000px; }
+  section.step { display: none; }
+  section.step.active { display: block; }
+  section.step h2 { margin: 0 0 4px; font-size: 22px; }
+  section.step .lede { color: var(--ink-dim); margin: 0 0 18px; }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px 18px; margin: 14px 0;
+  }
+  .card h3 { margin: 0 0 8px; font-size: 15px; }
+  .card .meta { font: 11px/1 var(--mono); color: var(--ink-dim); }
+
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font: 11px/1.6 var(--mono); border: 1px solid var(--border); }
+  .pill.good { color: var(--good); border-color: #2c5f3b; background: rgba(74,222,128,0.06); }
+  .pill.bad  { color: var(--bad);  border-color: #6b2a2a; background: rgba(248,113,113,0.06); }
+  .pill.warn { color: var(--warn); border-color: #6a5717; background: rgba(250,204,21,0.06); }
+  .pill.accent { color: var(--accent); border-color: #6a3a1c; background: rgba(255,122,61,0.08); }
+
+  button.run {
+    background: var(--accent); color: #1a0e06; border: 0;
+    padding: 8px 14px; border-radius: 6px; cursor: pointer;
+    font-weight: 600; font-size: 13px;
+  }
+  button.run:hover { filter: brightness(1.1); }
+  button.run:disabled { opacity: 0.5; cursor: progress; }
+  button.secondary {
+    background: transparent; color: var(--ink); border: 1px solid var(--border);
+    padding: 7px 12px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+
+  .test-out {
+    margin-top: 10px; background: var(--code-bg); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 6px;
+    padding: 10px 12px; font: 12.5px/1.5 var(--mono); white-space: pre-wrap;
+    min-height: 30px; color: var(--ink);
+  }
+  .test-out.empty { color: var(--ink-dim); font-style: italic; }
+
+  .checklist { list-style: none; padding: 0; margin: 8px 0; }
+  .checklist li { padding: 4px 0; padding-left: 22px; position: relative; }
+  .checklist li::before {
+    content: ""; position: absolute; left: 0; top: 8px;
+    width: 12px; height: 12px; border: 1.5px solid var(--ink-dim); border-radius: 3px;
+  }
+  .checklist li.done::before { background: var(--good); border-color: var(--good); }
+  .checklist li.now::before { border-color: var(--accent); background: var(--accent); }
+
+  table.kv { border-collapse: collapse; width: 100%; margin: 8px 0; }
+  table.kv th, table.kv td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 13.5px; }
+  table.kv th { color: var(--ink-dim); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+
+  .footer-nav { display: flex; justify-content: space-between; margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--border); }
+  .footer-nav .stub { opacity: 0.4; }
+
+  svg.diagram { width: 100%; height: auto; background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; }
+
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 14px; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <h1>VMD AI · RAG Upgrade Plan</h1>
+  <span class="tag">v0 · planning doc</span>
+  <span class="tag">target: <code style="background:transparent">runtime/vmd_ai_runtime/docs_search.py</code></span>
+  <span class="sub">Click any step → press <b>Run simulated test</b> to preview I/O.</span>
+</header>
+
+<div class="layout">
+
+  <nav class="side" id="sidenav">
+    <div class="group-label">Plan</div>
+    <button data-target="overview" class="active"><span class="step-num">·</span> Overview</button>
+    <button data-target="arch"><span class="step-num">·</span> Architecture</button>
+    <div class="group-label">Steps</div>
+    <button data-target="s1"><span class="step-num">1</span> Audit current BM25</button>
+    <button data-target="s2"><span class="step-num">2</span> Smarter chunking</button>
+    <button data-target="s3"><span class="step-num">3</span> Add dense embeddings</button>
+    <button data-target="s4"><span class="step-num">4</span> Hybrid fusion (RRF)</button>
+    <button data-target="s5"><span class="step-num">5</span> Cross-encoder rerank</button>
+    <button data-target="s6"><span class="step-num">6</span> Eval harness</button>
+    <button data-target="s7"><span class="step-num">7</span> Integrate &amp; ship</button>
+    <div class="group-label">Risks</div>
+    <button data-target="risks"><span class="step-num">·</span> Risks &amp; rollout</button>
+  </nav>
+
+  <main>
+
+    <!-- ============ OVERVIEW ============ -->
+    <section class="step active" id="overview">
+      <h2>Overview</h2>
+      <p class="lede">Take the existing pure-BM25 <code>search_docs</code> tool from "competitive on technical text" to "robust across natural-language questions, code identifiers, and partial recall."</p>
+
+      <div class="badges">
+        <span class="pill accent">scope: docs_search.py only</span>
+        <span class="pill">no SDK additions for hard requirement</span>
+        <span class="pill">optional dense model (lazy load)</span>
+        <span class="pill">backward-compatible tool surface</span>
+      </div>
+
+      <div class="card">
+        <h3>What stays the same</h3>
+        <ul class="checklist">
+          <li class="done">Tool name &amp; signature: <code>search_docs(query, k, scope)</code></li>
+          <li class="done">Index location: <code>~/.vmdai/docs_index/</code></li>
+          <li class="done">Scopes: <code>vmd_ref</code> / <code>user_guide</code> / <code>skills</code> / <code>all</code></li>
+          <li class="done">Lazy-load on first query (no cost when unused)</li>
+          <li class="done">Output shape: <code>{source, section, score, text}[]</code></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>What changes</h3>
+        <ul class="checklist">
+          <li class="now">Chunker: heading-aware + code-fence-preserving, with <code>chunk_type</code> metadata</li>
+          <li class="now">Retrieval: <code>BM25</code> &nbsp;<b>+</b>&nbsp; <code>dense embeddings</code> &nbsp;<b>→</b>&nbsp; <code>RRF fuse</code> &nbsp;<b>→</b>&nbsp; <code>cross-encoder rerank</code></li>
+          <li class="now">Eval: golden queries, <code>Recall@5</code> / <code>MRR</code> / <code>nDCG@10</code>, regression gate</li>
+          <li class="now">Index files grow: <code>vectors.npy</code>, <code>vector_meta.json</code> alongside <code>bm25.json</code></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>Success criteria</h3>
+        <table class="kv">
+          <tr><th>Metric</th><th>Today (est.)</th><th>Target</th></tr>
+          <tr><td>Recall@5 on golden set</td><td>~0.62</td><td>≥ 0.85</td></tr>
+          <tr><td>MRR@10</td><td>~0.41</td><td>≥ 0.65</td></tr>
+          <tr><td>p95 latency (cold)</td><td>~180 ms</td><td>≤ 600 ms</td></tr>
+          <tr><td>p95 latency (warm)</td><td>~45 ms</td><td>≤ 120 ms</td></tr>
+          <tr><td>Disk footprint</td><td>~3 MB</td><td>≤ 60 MB (incl. vectors)</td></tr>
+        </table>
+        <p class="meta">Numbers are placeholders until step 6 produces real measurements.</p>
+      </div>
+    </section>
+
+    <!-- ============ ARCHITECTURE ============ -->
+    <section class="step" id="arch">
+      <h2>Architecture: current → proposed</h2>
+      <p class="lede">Single retriever → multi-stage retriever. Each box is replaceable independently.</p>
+
+      <div class="card">
+        <h3>Current</h3>
+        <svg class="diagram" viewBox="0 0 800 160" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#9aa4b2"/>
+            </marker>
+          </defs>
+          <g font-family="ui-monospace, SF Mono, Menlo" font-size="13" fill="#e7ecf3">
+            <rect x="20" y="55" width="140" height="50" rx="8" fill="#1d2230" stroke="#2a3142"/>
+            <text x="90" y="84" text-anchor="middle">query</text>
+
+            <rect x="200" y="40" width="180" height="80" rx="8" fill="#1d2230" stroke="#2a3142"/>
+            <text x="290" y="68" text-anchor="middle">regex tokenize</text>
+            <text x="290" y="92" text-anchor="middle" fill="#9aa4b2" font-size="11">[a-z][a-z0-9_]+</text>
+
+            <rect x="420" y="40" width="180" height="80" rx="8" fill="#1d2230" stroke="#ff7a3d"/>
+            <text x="510" y="68" text-anchor="middle">BM25 score</text>
+            <text x="510" y="92" text-anchor="middle" fill="#9aa4b2" font-size="11">k1=1.2 b=0.75</text>
+
+            <rect x="640" y="55" width="140" height="50" rx="8" fill="#1d2230" stroke="#2a3142"/>
+            <text x="710" y="84" text-anchor="middle">top-k chunks</text>
+
+            <line x1="160" y1="80" x2="200" y2="80" stroke="#9aa4b2" marker-end="url(#ar)"/>
+            <line x1="380" y1="80" x2="420" y2="80" stroke="#9aa4b2" marker-end="url(#ar)"/>
+            <line x1="600" y1="80" x2="640" y2="80" stroke="#9aa4b2" marker-end="url(#ar)"/>
+          </g>
+        </svg>
+      </div>
+
+      <div class="card">
+        <h3>Proposed</h3>
+        <svg class="diagram" viewBox="0 0 800 360" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <marker id="ar2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#9aa4b2"/>
+            </marker>
+          </defs>
+          <g font-family="ui-monospace, SF Mono, Menlo" font-size="13" fill="#e7ecf3">
+
+            <rect x="20" y="155" width="120" height="50" rx="8" fill="#1d2230" stroke="#2a3142"/>
+            <text x="80" y="184" text-anchor="middle">query</text>
+
+            <!-- BM25 branch -->
+            <rect x="190" y="60" width="180" height="60" rx="8" fill="#1d2230" stroke="#2a3142"/>
+            <text x="280" y="84" text-anchor="middle">BM25</text>
+            <text x="280" y="104" text-anchor="middle" fill="#9aa4b2" font-size="11">sparse · exact identifiers</text>
+
+            <!-- Dense branch -->
+            <rect x="190" y="240" width="180" height="60" rx="8" fill="#1d2230" stroke="#2a3142"/>
+            <text x="280" y="264" text-anchor="middle">dense embed</text>
+            <text x="280" y="284" text-anchor="middle" fill="#9aa4b2" font-size="11">MiniLM-L6 · cosine</text>
+
+            <!-- RRF -->
+            <rect x="410" y="150" width="170" height="60" rx="8" fill="#1d2230" stroke="#ff7a3d"/>
+            <text x="495" y="174" text-anchor="middle">RRF fuse</text>
+            <text x="495" y="194" text-anchor="middle" fill="#9aa4b2" font-size="11">1/(60+rank) · top-30</text>
+
+            <!-- Rerank -->
+            <rect x="620" y="60" width="160" height="80" rx="8" fill="#1d2230" stroke="#5aa9ff"/>
+            <text x="700" y="92" text-anchor="middle">cross-encoder</text>
+            <text x="700" y="112" text-anchor="middle" fill="#9aa4b2" font-size="11">rerank top-30 → k</text>
+
+            <!-- output -->
+            <rect x="620" y="240" width="160" height="60" rx="8" fill="#1d2230" stroke="#2a3142"/>
+            <text x="700" y="264" text-anchor="middle">top-k</text>
+            <text x="700" y="284" text-anchor="middle" fill="#9aa4b2" font-size="11">{source,section,score,text}</text>
+
+            <!-- arrows -->
+            <line x1="140" y1="180" x2="190" y2="90" stroke="#9aa4b2" marker-end="url(#ar2)"/>
+            <line x1="140" y1="180" x2="190" y2="270" stroke="#9aa4b2" marker-end="url(#ar2)"/>
+            <line x1="370" y1="90"  x2="410" y2="170" stroke="#9aa4b2" marker-end="url(#ar2)"/>
+            <line x1="370" y1="270" x2="410" y2="190" stroke="#9aa4b2" marker-end="url(#ar2)"/>
+            <line x1="580" y1="170" x2="620" y2="100" stroke="#9aa4b2" marker-end="url(#ar2)"/>
+            <line x1="700" y1="140" x2="700" y2="240" stroke="#9aa4b2" marker-end="url(#ar2)"/>
+
+            <text x="400" y="340" text-anchor="middle" fill="#9aa4b2" font-size="11">all stages cancel-safe via cancel_event poll</text>
+          </g>
+        </svg>
+      </div>
+    </section>
+
+    <!-- ============ STEP 1 ============ -->
+    <section class="step" id="s1">
+      <h2>Step 1 · Audit current BM25</h2>
+      <p class="lede">Establish a baseline before touching code. Measure today's behavior on a frozen golden set.</p>
+
+      <div class="card">
+        <h3>What to inspect</h3>
+        <ul class="checklist">
+          <li>Chunk count, avg/median chunk length, longest chunk (read from <code>manifest.json</code>)</li>
+          <li>Token-vocabulary stats: <code>|V|</code>, top-50 tokens, hapax fraction</li>
+          <li>Latency distribution over 50 sample queries</li>
+          <li>Failure modes: queries with <code>Recall@5 = 0</code> on golden set</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>Test · run the audit</h3>
+        <p class="meta">Simulates reading <code>~/.vmdai/docs_index/manifest.json</code> + sampling queries.</p>
+        <button class="run" data-test="t1">Run simulated audit</button>
+        <div class="test-out empty" data-out="t1">No output yet — press the button.</div>
+      </div>
+    </section>
+
+    <!-- ============ STEP 2 ============ -->
+    <section class="step" id="s2">
+      <h2>Step 2 · Smarter chunking</h2>
+      <p class="lede">Current chunker splits on heading + size. Code blocks get clipped; Tcl proc-docs split mid-signature. Fix that.</p>
+
+      <div class="card">
+        <h3>New rules</h3>
+        <ul class="checklist">
+          <li>Markdown: never split inside a fenced <code>```code```</code> block</li>
+          <li>VMD Tcl reference: keep <code>proc name { args } { … }</code> as one chunk</li>
+          <li>HTML user-guide: split on <code>&lt;h1..h3&gt;</code>, strip nav, preserve <code>&lt;pre&gt;</code></li>
+          <li>Add metadata: <code>chunk_type ∈ {prose, code, proc-doc, table}</code> + <code>parent_heading_path</code></li>
+          <li>Soft cap 800 tokens, hard cap 1200, overlap 80 (was 0)</li>
+        </ul>
+
+        <pre>// chunks.jsonl after step 2
+{"id":"vmd_ref/atomselect#selection-syntax",
+ "source":"vmd_ref/atomselect.md",
+ "section":"Selection syntax",
+ "parent_heading_path":["atomselect","Selection syntax"],
+ "chunk_type":"prose",
+ "tokens":612,
+ "text":"…"}</pre>
+      </div>
+
+      <div class="card">
+        <h3>Test · chunk a sample doc</h3>
+        <button class="run" data-test="t2">Run simulated chunker</button>
+        <div class="test-out empty" data-out="t2">No output yet.</div>
+      </div>
+    </section>
+
+    <!-- ============ STEP 3 ============ -->
+    <section class="step" id="s3">
+      <h2>Step 3 · Add dense embeddings</h2>
+      <p class="lede">Sparse BM25 nails identifier queries (<code>NewCartoon</code>, <code>mol new</code>). Dense embeddings nail natural-language questions (<i>"how do I color by secondary structure?"</i>).</p>
+
+      <div class="card">
+        <h3>Choice: model + runtime</h3>
+        <table class="kv">
+          <tr><th>Option</th><th>Size</th><th>Install cost</th><th>Verdict</th></tr>
+          <tr><td><code>fastembed</code> + BGE-small (ONNX)</td><td>~33 MB</td><td>1 pip dep, no torch</td><td><span class="pill good">pick</span></td></tr>
+          <tr><td><code>sentence-transformers</code> + MiniLM</td><td>~80 MB + torch ~700 MB</td><td>heavy</td><td><span class="pill warn">no</span></td></tr>
+          <tr><td>hosted (Voyage / OpenAI)</td><td>0 local</td><td>API key, network</td><td><span class="pill bad">violates loopback model</span></td></tr>
+        </table>
+        <p class="meta"><code>fastembed</code> is import-gated and lazy; if absent, runtime falls back to BM25-only and emits a one-line warning.</p>
+      </div>
+
+      <div class="card">
+        <h3>Storage</h3>
+        <ul class="checklist">
+          <li><code>vectors.npy</code> — <code>float16</code>, shape <code>(N, 384)</code></li>
+          <li><code>vector_meta.json</code> — <code>{model, dim, dtype, normalized, built_at}</code></li>
+          <li>Built by <code>vmd-ai-index --rebuild --with-vectors</code></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>Test · embed a query, score top-3</h3>
+        <button class="run" data-test="t3">Run simulated embed + cosine</button>
+        <div class="test-out empty" data-out="t3">No output yet.</div>
+      </div>
+    </section>
+
+    <!-- ============ STEP 4 ============ -->
+    <section class="step" id="s4">
+      <h2>Step 4 · Hybrid fusion (RRF)</h2>
+      <p class="lede">Reciprocal Rank Fusion is parameter-light, score-scale-agnostic, and beats weighted-sum on most heterogeneous-retriever benchmarks.</p>
+
+      <div class="card">
+        <h3>Formula</h3>
+        <pre>RRF_score(d) = Σ over retrievers r:  1 / (k_rrf + rank_r(d))
+                                       (k_rrf = 60, standard)</pre>
+        <p>Take top-30 from each retriever; union; sort by RRF; keep top-30 to feed the reranker.</p>
+      </div>
+
+      <div class="card">
+        <h3>Test · fuse two rankings</h3>
+        <p class="meta">Simulates BM25 top-5 + dense top-5 for query <code>"color by secondary structure"</code>.</p>
+        <button class="run" data-test="t4">Run simulated RRF</button>
+        <div class="test-out empty" data-out="t4">No output yet.</div>
+      </div>
+    </section>
+
+    <!-- ============ STEP 5 ============ -->
+    <section class="step" id="s5">
+      <h2>Step 5 · Cross-encoder rerank</h2>
+      <p class="lede">Optional but high-impact. A small cross-encoder (MS-Marco MiniLM-L-6, ONNX, ~90 MB) re-scores the top-30 in one batch.</p>
+
+      <div class="card">
+        <h3>Trade-offs</h3>
+        <table class="kv">
+          <tr><th>With rerank</th><th>Without rerank</th></tr>
+          <tr><td>+0.10–0.15 nDCG@10 typical</td><td>simpler, fewer deps</td></tr>
+          <tr><td>+200–400ms cold-start</td><td>p95 stays &lt; 150ms</td></tr>
+          <tr><td>+90 MB on disk</td><td>—</td></tr>
+        </table>
+        <p class="meta">Gated by <code>VMD_AI_RERANK=1</code>. Off by default in v1; flip on once step 6 shows real lift.</p>
+      </div>
+
+      <div class="card">
+        <h3>Test · rerank simulated candidates</h3>
+        <button class="run" data-test="t5">Run simulated rerank</button>
+        <div class="test-out empty" data-out="t5">No output yet.</div>
+      </div>
+    </section>
+
+    <!-- ============ STEP 6 ============ -->
+    <section class="step" id="s6">
+      <h2>Step 6 · Eval harness</h2>
+      <p class="lede">Without numbers you can't tell improvement from vibes. Build the harness <b>before</b> step 3 ships.</p>
+
+      <div class="card">
+        <h3>Golden set</h3>
+        <ul class="checklist">
+          <li><code>tests/fixtures/rag_golden.jsonl</code> — 40–80 query/relevant-chunk-id pairs</li>
+          <li>Mix: 40% identifier lookups, 40% natural-language how-tos, 20% multi-hop</li>
+          <li>Authored from real VMD AI chat logs once available; for now, seeded from <code>tests/fixtures/docs/</code></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>Metrics</h3>
+        <table class="kv">
+          <tr><th>Metric</th><th>Why</th></tr>
+          <tr><td>Recall@5</td><td>Most LLM queries pull top-5; if it's not there, the tool failed</td></tr>
+          <tr><td>MRR@10</td><td>Position of first hit — matters for token budget</td></tr>
+          <tr><td>nDCG@10</td><td>Graded relevance, the rerank-sensitive headline number</td></tr>
+          <tr><td>p50 / p95 latency</td><td>Tool budget is ~1s before the user notices</td></tr>
+        </table>
+      </div>
+
+      <div class="card">
+        <h3>Test · run harness on 5 sample queries</h3>
+        <button class="run" data-test="t6">Run simulated eval</button>
+        <div class="test-out empty" data-out="t6">No output yet.</div>
+      </div>
+    </section>
+
+    <!-- ============ STEP 7 ============ -->
+    <section class="step" id="s7">
+      <h2>Step 7 · Integrate &amp; ship</h2>
+      <p class="lede">Land behind feature flags so we can revert any stage without touching the tool contract.</p>
+
+      <div class="card">
+        <h3>Feature flags</h3>
+        <table class="kv">
+          <tr><th>Env var</th><th>Default</th><th>Effect</th></tr>
+          <tr><td><code>VMD_AI_DENSE</code></td><td>auto</td><td>auto = on if <code>vectors.npy</code> present</td></tr>
+          <tr><td><code>VMD_AI_RERANK</code></td><td>0</td><td>1 enables cross-encoder stage</td></tr>
+          <tr><td><code>VMD_AI_RRF_K</code></td><td>60</td><td>tunable for ablation</td></tr>
+        </table>
+      </div>
+
+      <div class="card">
+        <h3>Public surface — unchanged</h3>
+        <pre>def search(self, query: str, k: int = 5,
+           scope: str = "all") -> list[Hit]:
+    # 1. BM25 top-30
+    # 2. dense top-30           (if enabled + index present)
+    # 3. RRF fuse → 30
+    # 4. cross-encoder rerank   (if VMD_AI_RERANK=1)
+    # 5. return top-k Hits, shape unchanged</pre>
+      </div>
+
+      <div class="card">
+        <h3>Rollout order</h3>
+        <ul class="checklist">
+          <li class="done">Land eval harness + golden set (step 6 deliverables)</li>
+          <li class="now">Land new chunker behind <code>--chunker=v2</code> flag, rebuild index</li>
+          <li>Land dense + RRF; require eval delta &gt; +0.10 MRR to enable by default</li>
+          <li>Land rerank gated off; flip on per-user via env</li>
+          <li>Delete v1 chunker after 2 weeks of clean eval runs</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>Test · end-to-end query path</h3>
+        <button class="run" data-test="t7">Run simulated end-to-end</button>
+        <div class="test-out empty" data-out="t7">No output yet.</div>
+      </div>
+    </section>
+
+    <!-- ============ RISKS ============ -->
+    <section class="step" id="risks">
+      <h2>Risks &amp; rollout</h2>
+
+      <div class="card">
+        <h3>Risk register</h3>
+        <table class="kv">
+          <tr><th>Risk</th><th>Mitigation</th></tr>
+          <tr><td>fastembed import fails in user envs</td><td>Lazy import + fallback to BM25-only with one-line warning to chat log</td></tr>
+          <tr><td>Vectors stale after corpus rebuild</td><td>Indexer writes <code>vector_meta.corpus_hash</code>; mismatch = ignore vectors</td></tr>
+          <tr><td>Cold load adds &gt;1s to first query</td><td>Pre-warm on <code>session.start</code> in a daemon thread; non-blocking</td></tr>
+          <tr><td>Rerank model OOM on small machines</td><td>Default off; document RAM cost in README; skip if &lt;1GB free</td></tr>
+          <tr><td>Eval regression from chunker churn</td><td>Pin <code>rag_golden.jsonl</code> to canonical chunk IDs that survive rechunking via <code>parent_heading_path</code></td></tr>
+        </table>
+      </div>
+
+      <div class="card">
+        <h3>Out of scope (deferred)</h3>
+        <ul class="checklist">
+          <li>Multi-turn query rewriting from chat history</li>
+          <li>Per-user feedback loop ("this result was wrong")</li>
+          <li>Distributed / shared index</li>
+          <li>GPU acceleration for dense / rerank</li>
+        </ul>
+      </div>
+    </section>
+
+    <div class="footer-nav">
+      <button class="secondary" id="prevBtn">← Prev</button>
+      <button class="secondary" id="nextBtn">Next →</button>
+    </div>
+
+  </main>
+</div>
+
+<script>
+(() => {
+  // ---------- tab navigation ----------
+  const navButtons = document.querySelectorAll('nav.side button');
+  const sections   = document.querySelectorAll('section.step');
+  const order      = Array.from(navButtons).map(b => b.dataset.target);
+
+  function show(id) {
+    sections.forEach(s => s.classList.toggle('active', s.id === id));
+    navButtons.forEach(b => b.classList.toggle('active', b.dataset.target === id));
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }
+  navButtons.forEach(b => b.addEventListener('click', () => show(b.dataset.target)));
+  document.getElementById('prevBtn').addEventListener('click', () => {
+    const cur = document.querySelector('section.step.active').id;
+    const i = order.indexOf(cur);
+    if (i > 0) show(order[i - 1]);
+  });
+  document.getElementById('nextBtn').addEventListener('click', () => {
+    const cur = document.querySelector('section.step.active').id;
+    const i = order.indexOf(cur);
+    if (i < order.length - 1) show(order[i + 1]);
+  });
+
+  // ---------- simulated tests ----------
+  const TESTS = {
+    t1: {
+      title: 'audit',
+      lines: [
+        '$ vmd-ai-index --stats',
+        'manifest.json      : built 2025-12-04T11:02Z',
+        'chunks.jsonl       : 1,847 chunks',
+        '  avg tokens       : 312   median 268   p95 891',
+        '  longest chunk    : 1,742 tokens (vmd_ref/render.md §Tachyon)',
+        'bm25.json          : |V|=18,412   hapax=43%   k1=1.2 b=0.75',
+        '',
+        'baseline on rag_golden.jsonl (n=52):',
+        '  Recall@5  = 0.615',
+        '  MRR@10    = 0.412',
+        '  nDCG@10   = 0.471',
+        '  p95 cold  = 184 ms     p95 warm = 47 ms',
+        '',
+        'top failure mode: natural-language queries with no exact-identifier overlap',
+        '  ex. "how do I color by secondary structure" → 0 hits in top-5'
+      ]
+    },
+    t2: {
+      title: 'chunker v2 on vmd_ref/atomselect.md',
+      lines: [
+        '$ vmd-ai-index --rebuild --chunker=v2 --dry-run --file vmd_ref/atomselect.md',
+        '',
+        'chunker v2 output:',
+        '  [1] §atomselect                          prose      198 tok',
+        '  [2] §atomselect > Selection syntax       prose      612 tok',
+        '  [3] §atomselect > Selection syntax > Examples',
+        '                                            code       284 tok   (preserved 3 ```tcl fences)',
+        '  [4] §atomselect > Available keywords     table      517 tok',
+        '  [5] §atomselect > See also               prose       64 tok',
+        '',
+        'vs v1: 5 chunks (was 8)   |   no fence splits (was 3)   |   added parent_heading_path on every chunk'
+      ]
+    },
+    t3: {
+      title: 'embed query → top-3 by cosine',
+      lines: [
+        '$ python -m vmd_ai_runtime.search --debug --dense "how do I color by secondary structure"',
+        '',
+        'fastembed loaded BAAI/bge-small-en-v1.5 (cold +312 ms)',
+        'query vector dim=384   norm=1.000',
+        '',
+        'top-3 by cosine similarity:',
+        '  0.812  user_guide/coloring.md   §Color by secondary structure',
+        '  0.741  user_guide/representations.md §NewCartoon coloring options',
+        '  0.689  vmd_ref/colorinfo.md     §Methods · ColorBy STR',
+        '',
+        '(BM25 baseline returned nothing in top-5 for this query — see step 1 audit.)'
+      ]
+    },
+    t4: {
+      title: 'RRF fuse',
+      lines: [
+        'query: "color by secondary structure"',
+        '',
+        'BM25 top-5:',
+        '  1. vmd_ref/colorinfo.md     §Methods · ColorBy STR     score=4.81',
+        '  2. user_guide/coloring.md   §Color scales              score=3.92',
+        '  3. vmd_ref/color.md         §Categories                score=3.40',
+        '  4. user_guide/coloring.md   §Color by secondary str.   score=3.18',
+        '  5. skills/docking/SKILL.md  §Highlights                score=2.74',
+        '',
+        'Dense top-5:',
+        '  1. user_guide/coloring.md   §Color by secondary str.   cos=0.812',
+        '  2. user_guide/repr.md       §NewCartoon coloring opts  cos=0.741',
+        '  3. vmd_ref/colorinfo.md     §Methods · ColorBy STR     cos=0.689',
+        '  4. user_guide/coloring.md   §Color scales              cos=0.612',
+        '  5. user_guide/repr.md       §Drawing methods           cos=0.581',
+        '',
+        'RRF (k=60):',
+        '  1. user_guide/coloring.md   §Color by secondary str.   rrf=0.0325  (B#4 + D#1)',
+        '  2. vmd_ref/colorinfo.md     §Methods · ColorBy STR     rrf=0.0322  (B#1 + D#3)',
+        '  3. user_guide/coloring.md   §Color scales              rrf=0.0317  (B#2 + D#4)',
+        '  4. user_guide/repr.md       §NewCartoon coloring opts  rrf=0.0159  (D#2 only)',
+        '  5. vmd_ref/color.md         §Categories                rrf=0.0159  (B#3 only)',
+        '',
+        '✓ correct answer surfaces to rank 1 (was rank 4 in BM25-only)'
+      ]
+    },
+    t5: {
+      title: 'cross-encoder rerank top-30 → top-5',
+      lines: [
+        'query: "show waters within 4 angstroms of the ligand"',
+        '',
+        'pre-rerank (RRF top-5):',
+        '  1. vmd_ref/atomselect.md   §Distance keywords         rrf=0.0325',
+        '  2. user_guide/sel.md       §within / exwithin         rrf=0.0322',
+        '  3. user_guide/sel.md       §residue / same            rrf=0.0317',
+        '  4. vmd_ref/measure.md      §contacts                  rrf=0.0159',
+        '  5. skills/docking/SKILL.md §Pocket waters             rrf=0.0159',
+        '',
+        'cross-encoder (ms-marco-MiniLM-L-6-v2) rescored top-30:',
+        '  9.41   user_guide/sel.md       §within / exwithin',
+        '  7.82   vmd_ref/atomselect.md   §Distance keywords',
+        '  6.55   skills/docking/SKILL.md §Pocket waters',
+        '  4.10   vmd_ref/measure.md      §contacts',
+        '  3.88   user_guide/sel.md       §residue / same',
+        '',
+        '✓ §within / exwithin promoted #2 → #1 (the answer doc)',
+        'latency: +271 ms cold, +38 ms warm'
+      ]
+    },
+    t6: {
+      title: 'eval on golden subset (n=5)',
+      lines: [
+        '$ python -m vmd_ai_runtime.eval.rag --variant bm25_only',
+        '  query                                            R@5   MRR    nDCG@10',
+        '  1. "atomselect within syntax"                    1.00  1.00   1.00',
+        '  2. "color by secondary structure"                0.00  0.00   0.00',
+        '  3. "render with tachyon high quality"            1.00  0.50   0.72',
+        '  4. "load multiple PDBs from a list"              0.00  0.00   0.00',
+        '  5. "newcartoon thickness"                        1.00  1.00   0.95',
+        '  ----                                              0.60  0.50   0.534',
+        '',
+        '$ python -m vmd_ai_runtime.eval.rag --variant hybrid_rrf',
+        '  1. "atomselect within syntax"                    1.00  1.00   1.00',
+        '  2. "color by secondary structure"                1.00  1.00   0.91',
+        '  3. "render with tachyon high quality"            1.00  1.00   0.95',
+        '  4. "load multiple PDBs from a list"              1.00  0.50   0.71',
+        '  5. "newcartoon thickness"                        1.00  1.00   0.95',
+        '  ----                                              1.00  0.90   0.904',
+        '',
+        'Δ vs baseline:  R@5 +0.40   MRR +0.40   nDCG +0.37  ← ship gate passed (≥+0.10 MRR)'
+      ]
+    },
+    t7: {
+      title: 'end-to-end search_docs("how do I render a high-quality cartoon snapshot", k=3)',
+      lines: [
+        '[t+000ms] tool_use  search_docs(query="...", k=3, scope="all")',
+        '[t+003ms] DocsSearch.search() — lazy load',
+        '[t+312ms]   fastembed model loaded                 (cold)',
+        '[t+318ms]   BM25 top-30 retrieved',
+        '[t+331ms]   dense top-30 retrieved',
+        '[t+334ms]   RRF fused → 38 unique',
+        '[t+335ms]   rerank disabled (VMD_AI_RERANK=0)',
+        '[t+335ms] tool_result · 3 hits:',
+        '  [1] vmd_ref/render.md  §Tachyon high-quality settings   score=0.0325',
+        '  [2] user_guide/repr.md §NewCartoon                       score=0.0317',
+        '  [3] user_guide/render.md §Snapshot workflow              score=0.0294',
+        '',
+        '✓ contract preserved · keys: {source, section, score, text}',
+        '✓ cancel_event polled 4× during run'
+      ]
+    }
+  };
+
+  function typewriter(el, lines, done) {
+    el.textContent = '';
+    el.classList.remove('empty');
+    let i = 0;
+    function step() {
+      if (i >= lines.length) { done && done(); return; }
+      el.textContent += (i ? '\n' : '') + lines[i];
+      i++;
+      // fast scroll
+      el.scrollTop = el.scrollHeight;
+      setTimeout(step, 22);
+    }
+    step();
+  }
+
+  document.querySelectorAll('button.run').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.test;
+      const out = document.querySelector(`[data-out="${key}"]`);
+      const spec = TESTS[key];
+      if (!spec || !out) return;
+      btn.disabled = true;
+      out.textContent = `> running: ${spec.title}\n`;
+      out.classList.remove('empty');
+      typewriter(out, spec.lines, () => {
+        out.textContent += `\n\n[done]`;
+        btn.disabled = false;
+      });
+    });
+  });
+
+  // keyboard: ← / → step nav
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.key === 'ArrowRight') document.getElementById('nextBtn').click();
+    if (e.key === 'ArrowLeft')  document.getElementById('prevBtn').click();
+  });
+})();
+</script>
+</body>
+</html>

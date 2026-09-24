@@ -1,0 +1,107 @@
+{
+  "_comment": "Suite v1 for the RAG x Wiki 2x2 benchmark. 14 prompts balanced across three buckets: LOOKUP (5; specific PDB + named technique — RAG should help most), SYNTHESIS (5; recipe composition across multiple concepts — wiki should help most), OPERATIONAL (4; procedural Tcl — mixed expectation). Every prompt pins a PDB ID so the resulting Tcl is replayable. `expects` lists IDIOM_PATTERNS keys from scripts/rag_ab_batch.py that a correct answer should hit. Keep this file under version control — changing prompts mid-experiment invalidates the comparison.",
+  "_idiom_reference": "scripts/rag_ab_batch.py:IDIOM_PATTERNS",
+  "version": "v1",
+  "prompts": [
+    {
+      "id": "cdk2_atp",
+      "bucket": "lookup",
+      "pdb": "1HCK",
+      "prompt": "Load 1HCK (CDK2 bound to the ATP analog AMPPNP). Render in publication style focused on the ATP-binding pocket. Show the ligand as Licorice, the protein as NewCartoon colored by secondary structure, and highlight residues within 4 Angstroms of the ligand.",
+      "expects": ["newcartoon", "licorice", "color_structure", "atp_selector", "within_select", "aochalky", "tachyon"]
+    },
+    {
+      "id": "abl_imatinib",
+      "bucket": "lookup",
+      "pdb": "1IEP",
+      "prompt": "Load 1IEP (ABL kinase bound to imatinib). Render in publication style with the DFG-out conformation visible. Cartoon by secondary structure, ligand as Licorice colored by name, ambient occlusion on, Tachyon render.",
+      "expects": ["newcartoon", "licorice", "color_structure", "imatinib_sel", "ao_on", "tachyon"]
+    },
+    {
+      "id": "hiv_protease",
+      "bucket": "lookup",
+      "pdb": "1HSG",
+      "prompt": "Load 1HSG (HIV protease with inhibitor MK1). Show the protein as cartoon, the ligand as Licorice, and add a transparent surface for the binding pocket. Use the Ghost material for the surface so the cartoon shows through.",
+      "expects": ["newcartoon", "licorice", "surf", "transparent", "ghost", "within_select"]
+    },
+    {
+      "id": "trpv1_pore",
+      "bucket": "lookup",
+      "pdb": "5IRX",
+      "prompt": "Load 5IRX (TRPV1 channel bound to capsaicin). Render the channel as a transparent surface and any bound ligand as Licorice. Color the cartoon by residue type.",
+      "expects": ["licorice", "surf", "transparent", "color_resname", "capsaicin_sel", "within_select"]
+    },
+    {
+      "id": "nucleosome_dna",
+      "bucket": "lookup",
+      "pdb": "1AOI",
+      "prompt": "Load 1AOI (nucleosome). Show the histone proteins as cartoon colored by chain (use Structure or ResName, whichever is more legible) and the DNA strands as Licorice colored by name.",
+      "expects": ["newcartoon", "licorice", "color_structure"]
+    },
+
+    {
+      "id": "pub_kinase_recipe",
+      "bucket": "synthesis",
+      "pdb": "1ATP",
+      "prompt": "I want a publication-quality figure of a kinase with its ligand. Load 1ATP and walk me through the full recipe: cartoon, ligand, materials, lighting, render settings, output.",
+      "expects": ["newcartoon", "licorice", "color_structure", "aochalky", "orthographic", "ao_on", "shadows_on", "tachyon", "white_bg"]
+    },
+    {
+      "id": "cartoon_vs_tube",
+      "bucket": "synthesis",
+      "pdb": "1UBQ",
+      "prompt": "Compare NewCartoon and Tube representations side by side. Load 1UBQ twice (as two molecules), apply NewCartoon to the first and Tube to the second, both colored by secondary structure. Position them so I can screenshot them next to each other.",
+      "expects": ["newcartoon", "color_structure"]
+    },
+    {
+      "id": "transparent_surf_recipe",
+      "bucket": "synthesis",
+      "pdb": "1UBQ",
+      "prompt": "Set up 1UBQ with a transparent surface on top of a cartoon so I can see both. Which material works best for the surface to keep the cartoon readable, and how do I tune the opacity?",
+      "expects": ["newcartoon", "surf", "transparent", "ghost"]
+    },
+    {
+      "id": "bfactor_render",
+      "bucket": "synthesis",
+      "pdb": "1AOI",
+      "prompt": "Load 1AOI and render the protein cartoon colored by B-factor (User column or beta), with ambient occlusion and shadows on, white background, Tachyon. Use a perceptually uniform color scale.",
+      "expects": ["newcartoon", "user_column", "ao_on", "shadows_on", "tachyon", "white_bg"]
+    },
+    {
+      "id": "docking_poses",
+      "bucket": "synthesis",
+      "pdb": "1HSG",
+      "prompt": "I ran AutoDock Vina with 1HSG as the receptor. Load receptor.pdbqt and vina_out.pdbqt and color the docked poses by binding affinity (Vina writes the score into the REMARK lines; map it onto the User field). Show contacts within 4 Angstroms of each pose.",
+      "expects": ["licorice", "pdbqt_load", "user_column", "within_select", "measure_contacts"]
+    },
+
+    {
+      "id": "rotation_movie",
+      "bucket": "operational",
+      "pdb": "1UBQ",
+      "prompt": "Load 1UBQ in NewCartoon. Make a 360-degree rotation movie around the Y axis, rendering each frame with TachyonInternal at high quality. Save the frames as TGA files named frame_NNNN.tga.",
+      "expects": ["newcartoon", "rotate", "tachyon", "movie_loop"]
+    },
+    {
+      "id": "rmsf_binding_site",
+      "bucket": "operational",
+      "pdb": "1HCK",
+      "prompt": "Load 1HCK. Give me the Tcl that selects residues within 5 Angstroms of the ligand (resname ANP or AMP) and computes the per-residue RMSF assuming a trajectory is already loaded. Output should be a list of residue id + RMSF value.",
+      "expects": ["within_select", "atp_selector"]
+    },
+    {
+      "id": "secondary_structure_render",
+      "bucket": "operational",
+      "pdb": "1UBQ",
+      "prompt": "Load 1UBQ and render it as NewCartoon colored by secondary structure, with ambient occlusion + shadows + white background + orthographic projection. Final render via Tachyon.",
+      "expects": ["newcartoon", "color_structure", "orthographic", "ao_on", "shadows_on", "tachyon", "white_bg"]
+    },
+    {
+      "id": "pocket_visualize",
+      "bucket": "operational",
+      "pdb": "1AKE",
+      "prompt": "Load 1AKE (adenylate kinase). Find the binding pocket using a standard VMD selection (residues within 5 Angstroms of any HETATM or near the cleft between domains). Render the protein as cartoon and the pocket surface as a transparent QuickSurf representation.",
+      "expects": ["newcartoon", "surf", "transparent", "within_select"]
+    }
+  ]
+}

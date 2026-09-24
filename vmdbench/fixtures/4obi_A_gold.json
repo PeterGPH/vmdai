@@ -1,0 +1,16 @@
+{
+  "chain": "4obi_A",
+  "replica": 1,
+  "stride": 25,
+  "fixture_frames": "41",
+  "atlas_mean_rg": 15.577,
+  "atlas_mean_rmsf": 3.619,
+  "metadata_avg_gyration": 15.58,
+  "metadata_avg_RMSF": 3.62,
+  "length": 106,
+  "protein_name": "NusG domain-containing protein",
+  "license": "CC-BY-NC-4.0",
+  "source": "https://www.dsimb.inserm.fr/ATLAS/api/ATLAS/analysis/4obi_A",
+  "cite": "Vander Meersche et al., ATLAS, Nucleic Acids Research 2024 (52:D1 D384)",
+  "atlas_mean_rmsd": 6.667
+}

@@ -1,0 +1,16 @@
+{
+  "chain": "4jmu_A",
+  "replica": 1,
+  "stride": 25,
+  "fixture_frames": "41",
+  "atlas_mean_rg": 13.564,
+  "atlas_mean_rmsf": 1.251,
+  "metadata_avg_gyration": 13.57,
+  "metadata_avg_RMSF": 1.25,
+  "length": 112,
+  "protein_name": "Gag-Pol polyprotein",
+  "license": "CC-BY-NC-4.0",
+  "source": "https://www.dsimb.inserm.fr/ATLAS/api/ATLAS/analysis/4jmu_A",
+  "cite": "Vander Meersche et al., ATLAS, Nucleic Acids Research 2024 (52:D1 D384)",
+  "atlas_mean_rmsd": 2.388
+}

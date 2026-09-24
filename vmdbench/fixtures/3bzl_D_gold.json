@@ -1,0 +1,16 @@
+{
+  "chain": "3bzl_D",
+  "replica": 1,
+  "stride": 25,
+  "fixture_frames": "41",
+  "atlas_mean_rg": 12.702,
+  "atlas_mean_rmsf": 1.305,
+  "metadata_avg_gyration": 12.7,
+  "metadata_avg_RMSF": 1.3,
+  "length": 83,
+  "protein_name": "EscU",
+  "license": "CC-BY-NC-4.0",
+  "source": "https://www.dsimb.inserm.fr/ATLAS/api/ATLAS/analysis/3bzl_D",
+  "cite": "Vander Meersche et al., ATLAS, Nucleic Acids Research 2024 (52:D1 D384)",
+  "atlas_mean_rmsd": 2.492
+}

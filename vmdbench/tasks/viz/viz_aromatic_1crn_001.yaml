@@ -1,0 +1,25 @@
+task_id: viz_aromatic_1crn_001
+category: visualization
+bucket: synthesis
+difficulty: easy
+dimensions: [actionability, semantic_grounding]
+initial_state:
+  files: [1crn.pdb]
+  pdb: 1CRN
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# SciVisAgentBench molecular_vis "aromatic residues" task (case_6). Verifies the agent
+# built a representation whose selection targets the aromatic residues. NOTE: the check is
+# an exact selection-string match, so "resname PHE TYR TRP" passes but an equivalent like
+# "aromatic" or a reordered list would not — selection-string sensitivity is itself a real
+# benchmark-design issue worth surfacing.
+user_prompt: >
+  Load 1CRN and add a representation selecting the aromatic residues (resname PHE TYR TRP).
+verify:
+  required:
+    - {kind: molecule_loaded,       where: {}}
+    - {kind: representation_exists, where: {selection: "resname PHE TYR TRP"}}
+  optional:
+    - {kind: no_runtime_errors,     where: {}}
+reproducibility:
+  exports: [tcl]

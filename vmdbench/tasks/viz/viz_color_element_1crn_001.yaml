@@ -1,0 +1,23 @@
+task_id: viz_color_element_1crn_001
+category: visualization
+bucket: synthesis
+difficulty: easy
+dimensions: [actionability, semantic_grounding]
+initial_state:
+  files: [1crn.pdb]
+  pdb: 1CRN
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# SciVisAgentBench molecular_vis "element coloring" task (case_2). The scene-state check
+# verifies the agent actually colored a representation BY ELEMENT — a common failure is
+# coloring by "Name" (a near-but-different method) while still reporting success.
+user_prompt: >
+  Load 1CRN and show it with a representation colored by element (VMD "Element" coloring).
+verify:
+  required:
+    - {kind: molecule_loaded,       where: {}}
+    - {kind: representation_exists, where: {color: Element}}
+  optional:
+    - {kind: no_runtime_errors,     where: {}}
+reproducibility:
+  exports: [tcl]

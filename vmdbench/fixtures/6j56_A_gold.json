@@ -1,0 +1,16 @@
+{
+  "chain": "6j56_A",
+  "replica": 1,
+  "stride": 25,
+  "fixture_frames": "41",
+  "atlas_mean_rg": 16.332,
+  "atlas_mean_rmsf": 1.479,
+  "metadata_avg_gyration": 16.33,
+  "metadata_avg_RMSF": 1.48,
+  "length": 129,
+  "protein_name": "Unconventional myosin-VI",
+  "license": "CC-BY-NC-4.0",
+  "source": "https://www.dsimb.inserm.fr/ATLAS/api/ATLAS/analysis/6j56_A",
+  "cite": "Vander Meersche et al., ATLAS, Nucleic Acids Research 2024 (52:D1 D384)",
+  "atlas_mean_rmsd": 2.283
+}

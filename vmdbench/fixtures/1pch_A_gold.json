@@ -1,0 +1,16 @@
+{
+  "chain": "1pch_A",
+  "replica": 1,
+  "stride": 25,
+  "fixture_frames": "41",
+  "atlas_mean_rg": 11.967,
+  "atlas_mean_rmsf": 0.621,
+  "metadata_avg_gyration": 11.97,
+  "metadata_avg_RMSF": 0.62,
+  "length": 88,
+  "protein_name": "Phosphocarrier protein HPr",
+  "license": "CC-BY-NC-4.0",
+  "source": "https://www.dsimb.inserm.fr/ATLAS/api/ATLAS/analysis/1pch_A",
+  "cite": "Vander Meersche et al., ATLAS, Nucleic Acids Research 2024 (52:D1 D384)",
+  "atlas_mean_rmsd": 0.819
+}

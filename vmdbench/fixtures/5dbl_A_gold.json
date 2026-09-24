@@ -1,0 +1,16 @@
+{
+  "chain": "5dbl_A",
+  "replica": 1,
+  "stride": 25,
+  "fixture_frames": "41",
+  "atlas_mean_rg": 33.212,
+  "atlas_mean_rmsf": 3.671,
+  "metadata_avg_gyration": 33.21,
+  "metadata_avg_RMSF": 3.67,
+  "length": 132,
+  "protein_name": "Surface protein G",
+  "license": "CC-BY-NC-4.0",
+  "source": "https://www.dsimb.inserm.fr/ATLAS/api/ATLAS/analysis/5dbl_A",
+  "cite": "Vander Meersche et al., ATLAS, Nucleic Acids Research 2024 (52:D1 D384)",
+  "atlas_mean_rmsd": 4.741
+}

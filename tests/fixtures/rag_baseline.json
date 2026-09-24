@@ -1,0 +1,404 @@
+{
+  "bm25_params": {
+    "b": 0.75,
+    "k1": 1.5
+  },
+  "chunker": "v1 (docs_search.chunk_markdown)",
+  "corpus": {
+    "avg_tokens": 41.392857142857146,
+    "chunk_count": 28,
+    "hapax_fraction": 0.6652631578947369,
+    "longest_chunk_id": "skill::loading-vina-docking-output::0",
+    "max_tokens": 83,
+    "median_tokens": 35.5,
+    "p95_tokens": 80.19999999999999,
+    "scope_counts": {
+      "skills": 4,
+      "user_guide": 4,
+      "vmd_ref": 20
+    },
+    "top_tokens": [
+      [
+        "the",
+        26
+      ],
+      [
+        "syntax",
+        18
+      ],
+      [
+        "mol",
+        13
+      ],
+      [
+        "for",
+        12
+      ],
+      [
+        "and",
+        11
+      ],
+      [
+        "to",
+        11
+      ],
+      [
+        "in",
+        10
+      ],
+      [
+        "set",
+        9
+      ],
+      [
+        "is",
+        8
+      ],
+      [
+        "molecule",
+        8
+      ]
+    ],
+    "vocab_size": 475
+  },
+  "corpus_root": "tests/fixtures/docs",
+  "elapsed_ms": 7.108207995770499,
+  "golden_path": "tests/fixtures/rag_golden.jsonl",
+  "golden_summary": {
+    "avg_relevant_per_query": 1.0909090909090908,
+    "tag_counts": {
+      "expected-bm25-fail": 1,
+      "identifier": 5,
+      "low-rank": 1,
+      "mixed": 1,
+      "paraphrase": 6,
+      "rare-token": 1
+    },
+    "total": 11
+  },
+  "k": 5,
+  "queries": [
+    {
+      "hit_rank": 1,
+      "latency_ms": 0.0118750031106174,
+      "mrr_at_k": 1.0,
+      "ndcg_at_k": 1.0,
+      "qid": "id-atomselect",
+      "query": "atomselect",
+      "recall_at_k": 1.0,
+      "tags": [
+        "identifier"
+      ],
+      "top_hits": [
+        [
+          "vmd_ref/atomselect.md",
+          "atomselect",
+          2.9052
+        ],
+        [
+          "skills/docking/SKILL.md",
+          "Pocket residue selection",
+          2.6894
+        ],
+        [
+          "vmd_ref/atomselect.md",
+          "atomselect frame",
+          2.1807
+        ]
+      ]
+    },
+    {
+      "hit_rank": 1,
+      "latency_ms": 0.014375007594935596,
+      "mrr_at_k": 1.0,
+      "ndcg_at_k": 1.0,
+      "qid": "id-mol-new",
+      "query": "mol new waitfor",
+      "recall_at_k": 1.0,
+      "tags": [
+        "identifier"
+      ],
+      "top_hits": [
+        [
+          "vmd_ref/mol.md",
+          "mol new",
+          7.5683
+        ],
+        [
+          "skills/docking/SKILL.md",
+          "Loading Vina docking output",
+          5.5946
+        ],
+        [
+          "vmd_ref/mol.md",
+          "mol addrep",
+          3.4926
+        ]
+      ]
+    },
+    {
+      "hit_rank": 1,
+      "latency_ms": 0.012917007552459836,
+      "mrr_at_k": 1.0,
+      "ndcg_at_k": 1.0,
+      "qid": "id-measure-rmsd",
+      "query": "measure rmsd between selections",
+      "recall_at_k": 1.0,
+      "tags": [
+        "identifier"
+      ],
+      "top_hits": [
+        [
+          "vmd_ref/atomselect.md",
+          "measure rmsd",
+          12.036
+        ],
+        [
+          "vmd_ref/atomselect.md",
+          "atomselect frame",
+          4.619
+        ],
+        [
+          "vmd_ref/atomselect.md",
+          "atomselect",
+          3.8721
+        ]
+      ]
+    },
+    {
+      "hit_rank": 1,
+      "latency_ms": 0.009499999578110874,
+      "mrr_at_k": 1.0,
+      "ndcg_at_k": 1.0,
+      "qid": "para-tachyon",
+      "query": "how do I take a high quality ray traced picture",
+      "recall_at_k": 1.0,
+      "tags": [
+        "paraphrase"
+      ],
+      "top_hits": [
+        [
+          "vmd_ref/render.md",
+          "render TachyonInternal",
+          9.662
+        ]
+      ]
+    },
+    {
+      "hit_rank": 1,
+      "latency_ms": 0.022624997654929757,
+      "mrr_at_k": 1.0,
+      "ndcg_at_k": 1.0,
+      "qid": "para-white-bg",
+      "query": "set my background to white for a paper figure",
+      "recall_at_k": 1.0,
+      "tags": [
+        "paraphrase"
+      ],
+      "top_hits": [
+        [
+          "vmd_ref/render.md",
+          "display backgroundcolor",
+          10.3553
+        ],
+        [
+          "vmd_ref/render.md",
+          "color Display Background",
+          7.0175
+        ],
+        [
+          "vmd_ref/render.md",
+          "display projection",
+          4.0875
+        ]
+      ]
+    },
+    {
+      "hit_rank": 1,
+      "latency_ms": 0.02154200046788901,
+      "mrr_at_k": 1.0,
+      "ndcg_at_k": 1.0,
+      "qid": "para-cross-mol",
+      "query": "find atoms close to each other across two different molecules",
+      "recall_at_k": 1.0,
+      "tags": [
+        "paraphrase"
+      ],
+      "top_hits": [
+        [
+          "vmd_ref/atomselect.md",
+          "measure contacts",
+          14.5171
+        ],
+        [
+          "vmd_ref/atomselect.md",
+          "measure rmsd",
+          5.6843
+        ],
+        [
+          "skills/docking/SKILL.md",
+          "Multi-pose rendering",
+          3.7021
+        ]
+      ]
+    },
+    {
+      "hit_rank": 1,
+      "latency_ms": 0.006667003617621958,
+      "mrr_at_k": 1.0,
+      "ndcg_at_k": 1.0,
+      "qid": "id-newcartoon",
+      "query": "NewCartoon thickness",
+      "recall_at_k": 1.0,
+      "tags": [
+        "identifier",
+        "rare-token"
+      ],
+      "top_hits": [
+        [
+          "vmd_ref/mol.md",
+          "mol representation",
+          5.2373
+        ]
+      ]
+    },
+    {
+      "hit_rank": 1,
+      "latency_ms": 0.015500001609325409,
+      "mrr_at_k": 1.0,
+      "ndcg_at_k": 1.0,
+      "qid": "para-orthographic",
+      "query": "switch to orthographic camera for a publication figure",
+      "recall_at_k": 1.0,
+      "tags": [
+        "paraphrase"
+      ],
+      "top_hits": [
+        [
+          "vmd_ref/render.md",
+          "display projection",
+          6.0391
+        ],
+        [
+          "vmd_ref/atomselect.md",
+          "atomselect frame",
+          3.4666
+        ],
+        [
+          "user_guide/intro.md",
+          "Animation controls",
+          1.7914
+        ]
+      ]
+    },
+    {
+      "hit_rank": 1,
+      "latency_ms": 0.013500000932253897,
+      "mrr_at_k": 1.0,
+      "ndcg_at_k": 1.0,
+      "qid": "id-delrep",
+      "query": "remove a representation by index",
+      "recall_at_k": 1.0,
+      "tags": [
+        "identifier",
+        "mixed"
+      ],
+      "top_hits": [
+        [
+          "vmd_ref/mol.md",
+          "mol delrep",
+          7.9371
+        ],
+        [
+          "vmd_ref/mol.md",
+          "mol addrep",
+          6.6738
+        ],
+        [
+          "vmd_ref/mol.md",
+          "mol color",
+          3.8121
+        ]
+      ]
+    },
+    {
+      "hit_rank": null,
+      "latency_ms": 0.011957992683164775,
+      "mrr_at_k": 0.0,
+      "ndcg_at_k": 0.0,
+      "qid": "para-docking-color",
+      "query": "show docking poses colored by binding affinity",
+      "recall_at_k": 0.0,
+      "tags": [
+        "paraphrase",
+        "expected-bm25-fail"
+      ],
+      "top_hits": [
+        [
+          "skills/docking/SKILL.md",
+          "Coloring poses by Vina score",
+          6.6777
+        ],
+        [
+          "skills/docking/SKILL.md",
+          "Loading Vina docking output",
+          4.3225
+        ],
+        [
+          "vmd_ref/atomselect.md",
+          "measure rmsd",
+          2.2206
+        ]
+      ]
+    },
+    {
+      "hit_rank": 4,
+      "latency_ms": 0.012666001566685736,
+      "mrr_at_k": 0.25,
+      "ndcg_at_k": 0.43067655807339306,
+      "qid": "para-save-image",
+      "query": "save my current view as an image",
+      "recall_at_k": 1.0,
+      "tags": [
+        "paraphrase",
+        "low-rank"
+      ],
+      "top_hits": [
+        [
+          "vmd_ref/render.md",
+          "render Tachyon",
+          5.4361
+        ],
+        [
+          "vmd_ref/mol.md",
+          "mol load",
+          4.5266
+        ],
+        [
+          "user_guide/intro.md",
+          "Animation controls",
+          2.8326
+        ]
+      ]
+    }
+  ],
+  "retriever": "BM25 (docs_search.fit_bm25)",
+  "summary": {
+    "failure_modes": [
+      {
+        "qid": "para-docking-color",
+        "query": "show docking poses colored by binding affinity",
+        "tags": [
+          "paraphrase",
+          "expected-bm25-fail"
+        ]
+      }
+    ],
+    "latency_p50_ms": 0.012917007552459836,
+    "latency_p95_ms": 0.022083499061409384,
+    "mean_mrr_at_k": 0.8409090909090909,
+    "mean_ndcg_at_k": 0.8573342325521267,
+    "mean_recall_at_k": 0.9090909090909091,
+    "miss_count": 1
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "chain": "1x6j_A",
+  "replica": 1,
+  "stride": 25,
+  "fixture_frames": "41",
+  "atlas_mean_rg": 12.81,
+  "atlas_mean_rmsf": 1.542,
+  "metadata_avg_gyration": 12.81,
+  "metadata_avg_RMSF": 1.54,
+  "length": 91,
+  "protein_name": "FAD assembly factor SdhE",
+  "license": "CC-BY-NC-4.0",
+  "source": "https://www.dsimb.inserm.fr/ATLAS/api/ATLAS/analysis/1x6j_A",
+  "cite": "Vander Meersche et al., ATLAS, Nucleic Acids Research 2024 (52:D1 D384)",
+  "atlas_mean_rmsd": 2.865
+}

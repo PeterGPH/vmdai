@@ -1,0 +1,22 @@
+task_id: viz_color_charge_1crn_001
+category: visualization
+bucket: synthesis
+difficulty: easy
+dimensions: [actionability, semantic_grounding]
+initial_state:
+  files: [1crn.pdb]
+  pdb: 1CRN
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# SciVisAgentBench molecular_vis "charge coloring" task (case_4). Verifies the scene has a
+# representation colored by Charge (unambiguous VMD coloring method).
+user_prompt: >
+  Load 1CRN and color a representation of the molecule by atomic charge (VMD "Charge").
+verify:
+  required:
+    - {kind: molecule_loaded,       where: {}}
+    - {kind: representation_exists, where: {color: Charge}}
+  optional:
+    - {kind: no_runtime_errors,     where: {}}
+reproducibility:
+  exports: [tcl]

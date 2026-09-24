@@ -1,0 +1,23 @@
+task_id: rg_1hck_001
+category: analysis
+bucket: operational
+difficulty: easy
+dimensions: [semantic_grounding]
+initial_state:
+  files: [1hck.pdb]
+  pdb: 1HCK                # CDK2 kinase, ~298 residues / 2370 atoms
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# Correctness, not completion. A ~34 kDa kinase's protein Rg ~= 20-21 A. The band below
+# is generous for the seed; run `score-oracle` (it prints the exact measure_rgyr) and
+# tighten min/max to value +/- 0.5 for a strict check.
+user_prompt: >
+  Load the structure and report the radius of gyration (Rg) of the 1HCK protein in Angstroms.
+verify:
+  required:
+    - {kind: molecule_loaded, where: {}}
+    - {kind: scalar_within,   where: {name: rgyr, min: 17.0, max: 24.0}}
+  optional:
+    - {kind: no_runtime_errors, where: {}}
+reproducibility:
+  exports: [tcl]

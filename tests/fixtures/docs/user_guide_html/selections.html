@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Atom selection language</title>
+<style>body { font-family: serif; }</style>
+<script>var noisy = "should not be indexed";</script>
+</head>
+<body>
+<nav>nav cruft we should ignore</nav>
+
+<h1>Chapter 5: Atom selection language</h1>
+<p>VMD's atom selection language is a small DSL evaluated against the
+current molecule. It supports keyword predicates, set operations, and
+distance-based filters.</p>
+
+<h2>Keyword selectors</h2>
+<p>Common keywords include <code>protein</code>, <code>nucleic</code>,
+<code>water</code>, and <code>resname LIG</code>.</p>
+<pre>
+mol selection "protein and chain A"
+mol selection "resname HOH or resname WAT"
+</pre>
+
+<h2>Distance selectors</h2>
+<p>Use <em>within</em> for proximity queries:</p>
+<pre>
+within 5 of resname LIG
+exwithin 5 of protein
+</pre>
+<p>Cross-molecule note: <code>within</code> only operates inside one
+molecule. For cross-molecule contacts use <code>measure contacts</code>.</p>
+
+<h2>Boolean combinators</h2>
+<p>Selections combine with <code>and</code>, <code>or</code>,
+<code>not</code>, and parentheses. Example:</p>
+<pre>protein and not (water or resname LIG)</pre>
+
+<footer>page 47 of the user guide</footer>
+</body>
+</html>

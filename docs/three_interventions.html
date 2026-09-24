@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VMD-AI — The Three Interventions</title>
+<style>
+  :root{
+    --ink:#1a2230; --muted:#5b6776; --line:#e4e8ef; --bg:#f6f8fb; --card:#fff;
+    --accent:#2563b6; --accent-soft:#eaf1fb;
+    --good:#1f9d6b; --good-soft:#e6f6ef; --bad:#d1495b; --bad-soft:#fbecee;
+    --warn:#b8860b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.62 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:880px;margin:0 auto;padding:48px 28px 80px;}
+  header.title{border-bottom:3px solid var(--accent);padding-bottom:22px;margin-bottom:30px;}
+  .kicker{font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);font-weight:700;margin:0 0 8px;}
+  h1{font-size:2.05rem;line-height:1.18;margin:.1em 0 .35em;letter-spacing:-.01em;}
+  .sub{font-size:1.12rem;color:var(--muted);margin:0;}
+  .meta{margin-top:16px;font-size:.86rem;color:var(--muted);}
+  .meta b{color:var(--ink);font-weight:600;}
+  h2{font-size:1.34rem;margin:46px 0 14px;padding-top:8px;letter-spacing:-.01em;}
+  h3{font-size:1.04rem;margin:26px 0 8px;}
+  p{margin:.6em 0;}
+  small,.note{color:var(--muted);font-size:.86rem;}
+  code{font:13.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    background:#eef1f6;padding:.08em .38em;border-radius:5px;}
+  pre{background:#0f1b2d;color:#dce6f2;border-radius:12px;padding:16px 18px;overflow:auto;
+    font:13px/1.62 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:14px 0;}
+  pre code{background:none;padding:0;border-radius:0;color:inherit;font-size:13px;}
+  pre .c{color:#7fa7c9;font-style:italic;}   /* comment  */
+  pre .s{color:#9ece6a;}                       /* string   */
+  pre .k{color:#e0af68;}                       /* keyword  */
+  .fil{font-size:.78rem;color:var(--muted);margin:2px 0 0;}
+  .fil code{background:#e9edf3;}
+  .summary{background:var(--accent-soft);border:1px solid #d3e2f7;border-radius:14px;padding:22px 26px;margin:8px 0 6px;}
+  .summary h2{margin:0 0 10px;font-size:1.1rem;color:var(--accent);padding:0;}
+  .summary p{margin:.5em 0;}
+  .stats{display:flex;flex-wrap:wrap;gap:14px;margin:26px 0 8px;}
+  .stat{flex:1 1 150px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;}
+  .stat .n{font-size:1.7rem;font-weight:700;letter-spacing:-.02em;}
+  .stat .l{font-size:.8rem;color:var(--muted);margin-top:2px;}
+  .stat.good .n{color:var(--good)} .stat.bad .n{color:var(--bad)} .stat.accent .n{color:var(--accent)}
+  table{width:100%;border-collapse:collapse;margin:16px 0;font-size:.92rem;}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top;}
+  th{font-size:.78rem;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);font-weight:700;}
+  tr:last-child td{border-bottom:none;}
+  .num{display:inline-block;width:1.5em;height:1.5em;line-height:1.5em;text-align:center;border-radius:50%;
+    background:var(--accent);color:#fff;font-weight:700;font-size:.82rem;margin-right:.1em;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 26px;margin:20px 0;}
+  .card.accent{border-left:4px solid var(--accent);}
+  .card.good{border-left:4px solid var(--good);}
+  .card.warn{border-left:4px solid var(--warn);}
+  .card h3{margin-top:0;display:flex;align-items:center;gap:.5em;}
+  .fixes{font-size:.9rem;color:var(--muted);margin:.2em 0 1em;}
+  .fixes b{color:var(--ink);}
+  .bars{margin:18px 0 6px;}
+  .bar-row{display:flex;align-items:center;gap:12px;margin:9px 0;}
+  .bar-label{width:118px;font-size:.84rem;font-weight:600;text-align:right;color:var(--muted);}
+  .bar-track{flex:1;background:#eef1f6;border-radius:7px;height:24px;overflow:hidden;}
+  .bar-fill{height:100%;border-radius:7px;display:flex;align-items:center;justify-content:flex-end;
+    padding-right:9px;color:#fff;font-size:.78rem;font-weight:700;}
+  .callout{background:#fff8e8;border:1px solid #f0e0b6;border-radius:12px;padding:14px 20px;margin:18px 0;font-size:.93rem;}
+  .callout b{color:var(--warn);}
+  ul.tight{margin:.5em 0;padding-left:1.2em;} ul.tight li{margin:.4em 0;}
+  footer{margin-top:54px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:.82rem;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="title">
+  <p class="kicker">VMD-AI · Method Note</p>
+  <h1>Closing the completion–correctness gap: three interventions</h1>
+  <p class="sub">How proactive reference injection, Tcl pre-validation, and semantic measurement tools take a baseline VMD agent from <b>56%</b> to <b>97%</b> correct.</p>
+  <p class="meta"><b>Author:</b> Peter &nbsp;·&nbsp; <b>Model:</b> Qwen2.5-72B-Instruct-AWQ (local vLLM) &nbsp;·&nbsp; <b>Arm:</b> <code>config_local.json</code> ("improved") &nbsp;·&nbsp; <b>Date:</b> June 23, 2026</p>
+</header>
+
+<section class="summary">
+  <h2>In one paragraph</h2>
+  <p>The baseline agent <em>completes</em> most tasks but is correct far less often — it confidently
+  reports wrong numbers, hangs on malformed Tcl, and mis-writes VMD's measurement syntax. Three
+  targeted interventions, each motivated by an observed failure mode, raise correctness to <b>97%</b>
+  on the analysis suite and collapse the completion–correctness gap to roughly zero. The decomposition
+  matters as much as the headline: only one of the three actually <em>generalizes</em>.</p>
+</section>
+
+<div class="stats">
+  <div class="stat bad"><div class="n">56%</div><div class="l">baseline correctness<br>(42/75, Qwen2.5-72B)</div></div>
+  <div class="stat accent"><div class="n">65%</div><div class="l">baseline completion<br>(49/75)</div></div>
+  <div class="stat good"><div class="n">97%</div><div class="l">improved correctness<br>(73/75, gap → 0)</div></div>
+  <div class="stat"><div class="n">58→67%</div><div class="l">held-out correctness<br>(the honest bound)</div></div>
+</div>
+
+<h2>Overview</h2>
+<table>
+  <thead><tr><th style="width:30px"></th><th>Intervention</th><th>Failure mode it targets</th><th>Where it lives</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><span class="num">1</span></td>
+      <td><b>Proactive reference injection</b></td>
+      <td>the model won't retrieve docs on its own, even when ordered to</td>
+      <td><code>vmd_ai_agent.py:217</code> + <code>docs/vmd_tcl_reference/vmd_tcl_pitfalls.md</code></td>
+    </tr>
+    <tr>
+      <td><span class="num">2</span></td>
+      <td><b>Tcl pre-validation</b></td>
+      <td>malformed Tcl <em>hangs</em> the interpreter until timeout (not an error)</td>
+      <td><code>subprocess_vmd_bridge.py:171,&nbsp;422,&nbsp;431</code></td>
+    </tr>
+    <tr>
+      <td><span class="num">3</span></td>
+      <td><b>Semantic measurement tools</b></td>
+      <td>the model authors the error-prone <code>measure</code>/<code>atomselect</code> syntax wrong</td>
+      <td><code>vmd_ai_agent.py:259</code> + <code>subprocess_vmd_bridge.py:212</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ================= 1 ================= -->
+<div class="card accent">
+  <h3><span class="num">1</span> Proactive reference injection</h3>
+  <p class="fixes"><b>Fixes:</b> idiom-level errors (self-RMSD recomputation, <code>mol load cif</code>, the contacts-is-not-a-number bug).</p>
+
+  <p><b>Mechanism.</b> At <code>setup()</code>, if the arm sets <code>inject_reference_path</code>, the file is read
+  and appended verbatim to the system prompt — no tool call, no retrieval, the knowledge is
+  <em>guaranteed</em> in context:</p>
+
+  <pre><code>ref_path = self.config.get(<span class="s">"inject_reference_path"</span>)
+<span class="k">if</span> ref_path:
+    <span class="k">with</span> open(os.path.expanduser(ref_path)) <span class="k">as</span> fh:
+        ref = fh.read()
+    self._system_prompt += <span class="s">"\n\nVMD TCL REFERENCE — use these exact, correct idioms:\n"</span> + ref</code></pre>
+  <p class="fil"><code>integrations/scivisagentbench/vmd_ai_agent.py:217–225</code></p>
+
+  <p><b>What gets injected.</b> A 54-line cheat-sheet where, in its own words,
+  <em>"each entry exists because an agent got it wrong; the right form is given first."</em>
+  The entries map directly onto the baseline's observed failures:</p>
+  <ul class="tight">
+    <li>Load with <code>mol new file.cif</code> — <b>not</b> <code>mol load cif</code> ("Cannot read file of type cif").</li>
+    <li>Self-RMSD is exactly <code>0.0</code> — <b>report 0.0, do not recompute or align.</b></li>
+    <li><code>measure contacts</code> returns <b>two parallel lists</b>; the count is
+        <code>[llength [lindex $result 0]]</code> — "the result itself is not a number."</li>
+    <li>Coordinates are <code>{x y z}</code>, <b>not</b> <code>{x y z]</code> (the unbalanced-brace hang).</li>
+  </ul>
+
+  <p><b>Why injection and not RAG.</b> The <code>rag</code> / <code>ragforce</code> ablation arms showed the
+  model won't call a <code>docs_search</code> tool even when explicitly instructed to. Injection
+  sidesteps that entirely, separating "won't retrieve" from "can't use it." This is the only one of
+  the three interventions that <em>generalizes</em> in the held-out test — and only on the idioms the
+  cheat-sheet actually teaches (3-atom angle 4→6, dihedral 3→6).</p>
+</div>
+
+<!-- ================= 2 ================= -->
+<div class="card accent">
+  <h3><span class="num">2</span> Tcl pre-validation</h3>
+  <p class="fixes"><b>Fixes:</b> silent interpreter hangs that burn the whole task's time budget.</p>
+
+  <p><b>Mechanism.</b> Before any command reaches VMD, the bridge checks that its braces and brackets
+  balance. If not, it is rejected instantly with a fix-hint instead of being sent:</p>
+
+  <pre><code><span class="k">if</span> <span class="k">not</span> _tcl_is_complete(command):
+    <span class="k">return</span> {<span class="s">"ok"</span>: <span class="k">False</span>, <span class="s">"output"</span>: <span class="s">""</span>,
+            <span class="s">"error"</span>: <span class="s">"incomplete Tcl: unbalanced braces/brackets/quotes — not "</span>
+                     <span class="s">"executed. Fix the brackets (e.g. `[list $i $j]`, coords as `{x y z}`)."</span>}</code></pre>
+  <p class="fil"><code>integrations/scivisagentbench/subprocess_vmd_bridge.py:171–174</code></p>
+
+  <p>The check itself is a pure-Python balance counter — no real Tcl interpreter (a tkinter Tcl interp
+  is thread-affine and would abort the agent's worker thread):</p>
+
+  <pre><code><span class="k">def</span> _balanced(s):
+    brace = brack = 0; esc = <span class="k">False</span>
+    <span class="k">for</span> ch <span class="k">in</span> s:
+        <span class="k">if</span> esc: esc = <span class="k">False</span>
+        <span class="k">elif</span> ch == <span class="s">"\\"</span>: esc = <span class="k">True</span>
+        <span class="k">elif</span> ch == <span class="s">"{"</span>: brace += 1
+        <span class="k">elif</span> ch == <span class="s">"}"</span>: brace -= 1
+        <span class="k">elif</span> ch == <span class="s">"["</span>: brack += 1
+        <span class="k">elif</span> ch == <span class="s">"]"</span>: brack -= 1
+        <span class="k">if</span> brace &lt; 0 <span class="k">or</span> brack &lt; 0: <span class="k">return</span> <span class="k">False</span>
+    <span class="k">return</span> brace == 0 <span class="k">and</span> brack == 0</code></pre>
+  <p class="fil"><code>subprocess_vmd_bridge.py:431–449</code></p>
+
+  <p><b>Why it matters.</b> An unbalanced command like <code>{x y z]</code> does <em>not</em> error — the Tcl
+  interpreter assumes the statement is unfinished and <b>waits for more input</b>, so the bridge blocks
+  until the per-command timeout. A single malformed line could stall the entire task. Rejecting it
+  immediately lets the model recover on the next turn; a companion timeout handler also restarts VMD
+  fresh so a hang can't poison the rest of the session. The "improved" arm additionally <b>doubles the
+  timeouts</b> (<code>vmd_timeout</code> 45→90&nbsp;s, <code>task_timeout</code> 360→600&nbsp;s).</p>
+</div>
+
+<!-- ================= 3 ================= -->
+<div class="card accent">
+  <h3><span class="num">3</span> Semantic measurement tools</h3>
+  <p class="fixes"><b>Fixes:</b> wrong measurement syntax — the model chooses the operation, the harness writes the Tcl.</p>
+
+  <p><b>Mechanism.</b> When <code>enable_semantic_tools</code> is on, the agent gains two typed tools —
+  <code>vmd_measure(metric, selection)</code> and <code>vmd_represent(style, color, selection)</code> — backed by a
+  fixed table of <em>correct</em> Tcl. The model supplies only the operation and selection; it never
+  writes the brittle syntax itself:</p>
+
+  <pre><code>_METRIC_TCL = {
+    <span class="s">"rgyr"</span>:      (<span class="s">'... [measure rgyr $__s] ...'</span>,                 <span class="k">True</span>),
+    <span class="s">"sasa"</span>:      (<span class="s">'... [measure sasa 1.4 $__s] ...'</span>,             <span class="k">True</span>),
+    <span class="s">"natoms"</span>:    (<span class="s">'set __v [molinfo top get numatoms]'</span>,          <span class="k">False</span>),
+    <span class="s">"nresidues"</span>: (<span class="s">'... [llength [lsort -unique [$__s get residue]]] ...'</span>, <span class="k">True</span>),
+    <span class="s">"ca_dist"</span>:   (<span class="s">'... [measure bond [list ...first... ...last...]]'</span>,   <span class="k">True</span>),
+    <span class="s">"rmsd_self"</span>: (<span class="s">'... [measure rmsd $__s $__s] ...'</span>,            <span class="k">True</span>),
+}</code></pre>
+  <p class="fil"><code>subprocess_vmd_bridge.py:212–220</code> &nbsp;·&nbsp; executed via <code>_measure()</code> / <code>_represent()</code>, which also pass through pre-validation (#2). <code>vmd_represent</code> validates <code>style</code>/<code>color</code> against allow-lists.</p>
+
+  <p><b>The catch — and why the held-out study exists.</b> This is the strongest correctness lever, but
+  <em>only</em> for the six operations in the table. Those six keys <b>are</b> the benchmark's analysis
+  metrics — so on covered tasks "the tool does the task by construction." Strip the covering tools and
+  correctness falls to 67%; off their coverage, the <code>inject</code> arm and the full <code>+tools</code> arm are
+  identical (the tools add nothing they don't cover).</p>
+</div>
+
+<!-- ================= decomposition ================= -->
+<h2>How they decompose</h2>
+<p>Mapping the code back to the numbers separates two effects the single "56→97" figure bundles together:</p>
+
+<div class="bars">
+  <div class="bar-row"><div class="bar-label">Completion · base</div><div class="bar-track"><div class="bar-fill" style="width:65%;background:var(--bad)">65%</div></div></div>
+  <div class="bar-row"><div class="bar-label">Completion · +fix</div><div class="bar-track"><div class="bar-fill" style="width:97%;background:var(--good)">97%</div></div></div>
+  <div class="bar-row"><div class="bar-label">Correctness · base</div><div class="bar-track"><div class="bar-fill" style="width:56%;background:var(--bad)">56%</div></div></div>
+  <div class="bar-row"><div class="bar-label">Correctness · +fix</div><div class="bar-track"><div class="bar-fill" style="width:97%;background:var(--good)">97%</div></div></div>
+</div>
+
+<ul class="tight">
+  <li><b>Completion 65→97</b> is mostly <b>#2</b> — pre-validation removes the timeout-hangs and the doubled
+      timeouts give the slow local GPU room. This is about <em>robust execution</em>, not getting answers right.</li>
+  <li><b>Correctness 56→97</b> is mostly <b>#3</b> (the tool is the task for covered metrics) plus a little
+      <b>#1</b> (injection fixes idiom bugs like self-RMSD). The held-out table proves it: drop #3 and
+      correctness falls to 67%, with #1 supplying the only genuine generalization.</li>
+</ul>
+
+<h2>Two flags for the writeup</h2>
+
+<div class="callout">
+  <b>#2 is baked in, not ablated.</b> <code>_tcl_is_complete</code> is <em>unconditional</em> in the subprocess
+  bridge — every arm uses it, including the "none" baseline. So the held-out table (<code>none</code> / <code>inject</code> /
+  <code>+tools</code>) does not actually isolate pre-validation, yet the paper lists it as one of three interventions.
+  Either add a <code>--no-prevalidate</code> ablation, or reframe #2 as a baseline-robustness fix rather than a measured arm.
+</div>
+
+<div class="callout">
+  <b>Report correctness given completion.</b> Because #2 lifts completion while #1/#3 lift correctness,
+  a single "56→97" hides the two mechanisms. Adding a <em>correct-given-completed</em> column cleanly
+  separates "answers more often" from "is right when it answers."
+</div>
+
+<footer>
+  vmd_ai · method note · generated from the live codebase (file:line references are exact). Companion to
+  <code>docs/vmd_ai_benchmark_report.html</code> and <code>docs/paper/vmdbench_workshop.tex</code>.
+</footer>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,34 @@
+task_id: atlas_dynamics_3bwu_D_001
+category: trajectory
+bucket: synthesis
+difficulty: medium
+dimensions: [actionability, semantic_grounding]
+initial_state:
+  files: [3bwu_D.pdb, 3bwu_D_R1_s25.dcd]
+  pdb: 3BWU
+  molecules_loaded: false
+allowed_interface: [raw_tcl]
+# Real all-atom MD from ATLAS (3bwu_D = Outer membrane usher protein FimD, 125 res; replica 1, ~42 frames).
+# Trajectory CORRECTNESS: mean Rg + mean Calpha-RMSD-to-frame-0 + mean Calpha RMSF (ATLAS-published)
+# + mean SASA (1.4 A probe; VMD-computed, ATLAS does not pre-publish it). Bands calibrated from the
+# oracle (vmdbench gold); ATLAS cross-check Rg 16.772 / RMSD 6.088 / RMSF 3.106 A.
+# ATLAS data CC-BY-NC 4.0 — cite Vander Meersche et al., NAR 2024 (52:D1 D384).
+user_prompt: >
+  Load 3bwu_D.pdb and its MD trajectory 3bwu_D_R1_s25.dcd, then report (align the frames to frame 0 first):
+  "PROBE> measure_meanrg=<value>" (mean radius of gyration over all frames),
+  "PROBE> measure_meanrmsd=<value>" (mean alpha-carbon RMSD to the first frame),
+  "PROBE> measure_mean_rmsf=<value>" (mean per-residue alpha-carbon RMSF), and
+  "PROBE> measure_meansasa=<value>" (mean solvent-accessible surface area, measure sasa 1.4).
+verify:
+  required:
+    - {kind: molecule_loaded, where: {}}
+    - {kind: frames_loaded,   where: {min: 40}}
+    - {kind: scalar_within,   where: {name: meanrg,    expect: 16.06, tol: 1.28}}
+    - {kind: scalar_within,   where: {name: meanrmsd,  expect: 7.45, tol: 1.12}}
+    - {kind: scalar_within,   where: {name: mean_rmsf, min: 1.93, max: 6.56}}
+    - {kind: scalar_within,   where: {name: meansasa,  expect: 8471.5, tol: 677.7}}
+  optional:
+    - {kind: no_runtime_errors, where: {}}
+reproducibility:
+  exports: [tcl]
+  replay_clean: true
