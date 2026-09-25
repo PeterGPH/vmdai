@@ -443,6 +443,7 @@ class StreamOllamaErrorTests(unittest.TestCase):
 
     @pytest.mark.xfail(
         strict=True,
+        raises=AssertionError,
         reason=(
             "known Ollama bug (spec §2a 'Unreachable test'): _stream_request retries "
             "URLError and raises a generic 'network error'. P04-T01 passes opts with "

@@ -85,5 +85,6 @@ def test_owner_shell_env_does_not_leak():
         VMD_AI_PROVIDER="anthropic-direct",
         ANTHROPIC_API_KEY="sk-ant-x",
     )
+    # returncode==0, not a "N passed" count: brittle if test_provider_selection.py
+    # gains or loses tests later.
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "5 passed" in proc.stdout
