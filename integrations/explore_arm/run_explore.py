@@ -170,6 +170,7 @@ def main():
                     help="elicitation level: enforced (gate+directive, default), "
                          "invited (advice, no gate), free (neutral tools only)")
     args = ap.parse_args()
+    original_config = args.config  # provenance logs this; _prepare_config rebinds args.config below
 
     # a fallback bench checkout shipped inside the repo (used by tests / fresh machines)
     if not (Path(os.path.expanduser(args.bench)) / "benchmark").exists():
@@ -204,7 +205,10 @@ def main():
 
     sys.path.insert(0, str(HERE.parent))  # integrations/ -> run_provenance
     from run_provenance import append_run_manifest
-    append_run_manifest(str(SCIVIS / "run_manifest.jsonl"), str(SCIVIS.parent.parent), runner="run_explore", run=args.tag, config=args.config, model=str(cfg.get("model") or ""), seeds=str(args.seeds))
+    # config= logs the user's original --config path, not the rebound explore_cfg_*.json
+    # temp file; vmd_ai_runtime_path= is passed explicitly (from the temp file's already
+    # machine-resolved value) so the manifest's derived path stays correct either way.
+    append_run_manifest(str(SCIVIS / "run_manifest.jsonl"), str(SCIVIS.parent.parent), runner="run_explore", run=args.tag, config=original_config, vmd_ai_runtime_path=str(cfg.get("vmd_ai_runtime_path") or ""), model=str(cfg.get("model") or ""), seeds=str(args.seeds))
     from run_atlas_traj import run_arm
     raise SystemExit(asyncio.run(run_arm(args)))
 
