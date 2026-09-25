@@ -10,6 +10,7 @@ the pinned behaviour, so parsed-dict equality is not enough.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import difflib
 import io
@@ -226,6 +227,39 @@ def scripted_responses(provider: str, *, rescue: bool = False) -> List[bytes]:
     return [build(text, calls) for text, calls in (_RESCUE_TURNS if rescue else _TURNS)]
 
 
+ARMS: Tuple[str, ...] = ("none", "rag", "wiki", "extra_tools")
+
+
+class StubDocsSearch:
+    """Replaces vmd_ai_runtime.docs_search.DocsSearch for the rag arm."""
+
+    is_available = True
+
+    def __init__(self, index_dir: Optional[str] = None) -> None:
+        self.index_dir = index_dir
+
+    def search(self, query: str, k: int = 5, scope: str = "all") -> Dict[str, Any]:
+        raise AssertionError("the golden script never calls search_docs")
+
+
+def benchmark_config(provider: str, arm: str, tmp_path: Path) -> Dict[str, Any]:
+    """The adapter config for one (provider, arm) cell of the S7 matrix."""
+    if provider not in PROVIDER_CONFIGS:
+        raise ValueError(f"unknown provider {provider!r}")
+    if arm not in ARMS:
+        raise ValueError(f"unknown arm {arm!r}")
+    config = dict(COMMON_CONFIG, **PROVIDER_CONFIGS[provider])
+    if arm == "rag":
+        config["enable_rag"] = True
+    elif arm == "wiki":
+        config.update(enable_wiki=True,
+                      wiki_root=str(tmp_path / "wiki"),
+                      wiki_raw_root=str(tmp_path / "raw"))
+    elif arm == "extra_tools":
+        config["enable_semantic_tools"] = True
+    return config
+
+
 def import_adapter() -> Any:
     install_fake_framework()
     if str(SCIVIS_DIR) not in sys.path:
@@ -241,7 +275,12 @@ def build_benchmark_agent(config: Dict[str, Any]) -> Any:
     cfg = dict(config)
     cfg["vmd_backend"] = "vmd_python"
     agent = adapter.VmdAiAgent(cfg)
-    asyncio.run(agent.setup())
+    with contextlib.ExitStack() as stack:
+        if cfg.get("enable_rag"):
+            stack.enter_context(
+                mock.patch("vmd_ai_runtime.docs_search.DocsSearch", StubDocsSearch)
+            )
+        asyncio.run(agent.setup())
     return agent
 
 

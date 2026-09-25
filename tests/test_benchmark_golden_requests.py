@@ -3,6 +3,7 @@
 Each case builds the real benchmark adapter (VmdAiAgent + setup()) and drives
 a scripted run: turn 1 plain; turn 2 after two run_vmd_command results (one
 ok, one error); turn 3 after a capture_vmd_snapshot result with image_b64.
+The rescue case is one Ollama turn whose tool call arrives as JSON text.
 """
 from __future__ import annotations
 
@@ -10,37 +11,74 @@ import json
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Dict, Iterator, List
 
 import pytest
 
 from helpers import fake_evaluation_framework as fake
 from helpers.golden import (
-    COMMON_CONFIG,
+    ARMS,
     GOLDEN_DIR,
-    PROVIDER_CONFIGS,
     assert_golden,
+    benchmark_config,
     build_benchmark_agent,
     drive_benchmark_run,
 )
 
-CASES = [("anthropic", "none"), ("openrouter_vllm", "none"), ("ollama", "none")]
+PROVIDERS = ("anthropic", "openrouter_vllm", "ollama")
+CASES = [(provider, arm) for provider in PROVIDERS for arm in ARMS]
 EXPECTED_URLS = {
     "anthropic": "https://api.anthropic.com/v1/messages",
     "openrouter_vllm": "http://localhost:8000/v1/chat/completions",
     "ollama": "http://127.0.0.1:11435/api/chat",
 }
+BASE_TOOLS = ["run_vmd_command", "capture_vmd_snapshot"]
+ARM_TOOLS = {
+    "none": BASE_TOOLS,
+    "rag": BASE_TOOLS + ["search_docs"],
+    "wiki": BASE_TOOLS + ["wiki_list", "wiki_read", "wiki_update", "wiki_verify_pins"],
+    "extra_tools": BASE_TOOLS + ["vmd_measure", "vmd_traj_measure", "vmd_represent"],
+}
+
+
+def _tool_names(body: Dict[str, Any]) -> List[str]:
+    return [t.get("name") or t["function"]["name"] for t in body["tools"]]
+
+
+def _system_prompt(body: Dict[str, Any]) -> str:
+    if "system" in body:
+        return body["system"]
+    return body["messages"][0]["content"]
 
 
 @pytest.mark.parametrize("provider,arm", CASES)
-def test_golden(provider, arm):
-    agent = build_benchmark_agent(dict(COMMON_CONFIG, **PROVIDER_CONFIGS[provider]))
+def test_golden(provider, arm, tmp_path):
+    from vmd_ai_runtime.claude_loop import WIKI_SYSTEM_PROMPT_ADDENDUM
+
+    agent = build_benchmark_agent(benchmark_config(provider, arm, tmp_path))
     requests = drive_benchmark_run(agent, provider)
     assert [r["url"] for r in requests] == [EXPECTED_URLS[provider]] * 3
+    first = json.loads(requests[0]["body_text"])
+    assert _tool_names(first) == ARM_TOOLS[arm]
+    assert _system_prompt(first).endswith(WIKI_SYSTEM_PROMPT_ADDENDUM) == (arm == "wiki")
     if provider == "ollama":
         assert all(json.loads(r["body_text"])["options"] == {"num_ctx": 8192}
                    for r in requests)
     assert_golden(f"{provider}_{arm}", requests)
+
+
+def test_golden_ollama_rescue(tmp_path):
+    agent = build_benchmark_agent(benchmark_config("ollama", "none", tmp_path))
+    requests = drive_benchmark_run(agent, "ollama", rescue=True)
+    assert len(requests) == 2
+    replayed = json.loads(requests[1]["body_text"])["messages"]
+    assistant = replayed[-2]
+    assert assistant["content"] == ""  # rescued JSON text is not kept in history
+    assert assistant["tool_calls"][0]["id"] == "otc_rescue_1"
+    assert assistant["tool_calls"][0]["function"]["arguments"] == {"command": "mol new 1ubq.pdb"}
+    assert replayed[-1] == {"role": "tool", "tool_call_id": "otc_rescue_1",
+                            "content": "Info) Using plugin pdb for structure file 1ubq.pdb\n0"}
+    assert_golden("ollama_rescue", requests)
 
 
 @contextmanager
