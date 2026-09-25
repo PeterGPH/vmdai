@@ -33,3 +33,6 @@ SciVisAgentBench-main.zip
 SciVisAgentSkills-main/
 # Paper drafts live outside this repo (audit_answer_parser.py still writes here by default).
 draft_iclr/
+
+# Local git worktrees (one per plan branch)
+.worktrees/
