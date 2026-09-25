@@ -10,9 +10,13 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       # tclsh sources files in the system encoding; from plan 08 on, plugin Tcl
       # files and op goldens carry UTF-8 literals, so pin a UTF-8 locale.
