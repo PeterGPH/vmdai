@@ -2838,7 +2838,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
   - class SettingsError(Exception) with .code in IN_USE|READ_ONLY|NOT_FOUND|INVALID
   - class SettingsStore(home: Optional[str] = None): .path, .exists(), .load(), .settings_source ('file'|'newer'|'invalid'|'default'), .active_profile() -> Tuple[Optional[str], Optional[Dict]], .get_profile(name), .list_profiles(), .save_profile(name, profile, activate=False), .delete_profile(name), .activate(name), .patch(patch) -> Dict, .update_profile(name, *, provider=None, model=None, base_url=None, options=None) -> Dict
   - settings_store.resolve_profile(store, cli_provider: Optional[str], env: Mapping[str, str]) -> Tuple[Optional[str], Optional[Dict], str]
-  - plan-local additions: `normalize_provider(name) -> str` ('' for unknown), `KNOWN_PROVIDERS`, `DEFAULT_BASE_URLS`, `DEFAULT_PROFILE_NAMES`, `DEFAULT_MODELS`, `DEFAULT_OLLAMA_NUM_CTX = 32768`, `default_settings() -> Dict`, `SettingsStore.root` (`<home>/.vmdai`); `resolve_profile` sources are `'cli' | 'profile' | 'env' | 'none'`; `save_profile` and `update_profile` return the stored profile; `patch` returns the top-level settings after the write
+  - plan-local additions: `normalize_provider(name) -> str` ('' for unknown), `KNOWN_PROVIDERS`, `DEFAULT_BASE_URLS`, `DEFAULT_PROFILE_NAMES`, `DEFAULT_MODELS`, `DEFAULT_OLLAMA_NUM_CTX = 32768`, `default_settings() -> Dict`, `SettingsStore.root` (`<home>/.vmdai`); `resolve_profile` sources are `'cli' | 'profile' | 'none'` (VMD_AI_PROVIDER is seed-only); `save_profile` and `update_profile` return the stored profile; `patch` returns the top-level settings after the write
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2997,8 +2997,8 @@ def test_patch_validates_top_level(tmp_path):
 def test_precedence_cli_profile_env(tmp_path):
     store = SettingsStore(home=str(tmp_path))
     env = {"VMD_AI_PROVIDER": "anthropic-direct", "ANTHROPIC_MODEL": "claude-sonnet-4-5"}
-    assert resolve_profile(store, None, env) == (
-        None, {"provider": "anthropic-direct", "model": "claude-sonnet-4-5", "options": {}}, "env")
+    # VMD_AI_PROVIDER is seed-only (§7): with no active profile it is ignored.
+    assert resolve_profile(store, None, env) == (None, None, "none")
     assert resolve_profile(store, None, {}) == (None, None, "none")
     store.save_profile("qwen", QWEN, activate=True)
     assert resolve_profile(store, None, env) == ("qwen", QWEN, "profile")
@@ -3037,7 +3037,7 @@ version is newer than SETTINGS_VERSION, is never overwritten: settings_source
 reports "invalid" or "newer" and writes raise SettingsError("READ_ONLY"). A
 file with no version (or version 0) is migrated in place. Profile options
 keep unknown keys; LoopOptions.product ignores them. The effective profile
-(resolve_profile) follows §7: CLI flag > active profile > VMD_AI_PROVIDER.
+(resolve_profile) follows §7: CLI flag > active profile; VMD_AI_PROVIDER is seed-only and never used live.
 Stdlib only; imports on Python 3.9.
 """
 from __future__ import annotations
@@ -3365,8 +3365,9 @@ def resolve_profile(store: SettingsStore, cli_provider: Optional[str],
     """(name, profile, source) of the effective profile (§7 Precedence).
 
     source is "cli" (--provider names a profile or a provider), "profile"
-    (the active profile), "env" (VMD_AI_PROVIDER, used only when there is
-    no active profile) or "none".
+    (the active profile) or "none". VMD_AI_PROVIDER is seed-only (§7) and is
+    never used live: with no CLI choice and no active profile the result is
+    "none", which a v2 chat.send reports as NO_MODEL.
     """
     cli = str(cli_provider or "").strip()
     if cli:
@@ -3379,9 +3380,6 @@ def resolve_profile(store: SettingsStore, cli_provider: Optional[str],
     name, profile = store.active_profile()
     if profile is not None:
         return name, profile, "profile"
-    provider = normalize_provider(env.get("VMD_AI_PROVIDER"))
-    if provider:
-        return None, _env_profile(provider, env), "env"
     return None, None, "none"
 ```
 
@@ -3409,7 +3407,7 @@ git commit -m "feat(runtime): settings_store profiles, migration and precedence 
 settings.json is written under the store lock, atomically and 0600; a newer
 or unparsable file is never overwritten. Options keep unknown keys, a model
 change keeps num_ctx (C7), and resolve_profile applies CLI > active
-profile > VMD_AI_PROVIDER.
+profile; VMD_AI_PROVIDER is seed-only and never used live (§7).
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
@@ -5113,7 +5111,8 @@ with:
         """The profile a request of ``state`` runs with (§7 Precedence).
 
         Token sessions of a runtime that owns settings.json use
-        resolve_profile (CLI flag > active profile > VMD_AI_PROVIDER); the
+        resolve_profile (CLI flag > active profile; VMD_AI_PROVIDER is
+        seed-only and never used live); the
         returned copy adds ``name`` and ``source``, and None means there is
         no usable profile (NO_MODEL). Everything else gets the legacy
         profile {provider, model}: the env/--provider choice and the model
@@ -6576,7 +6575,7 @@ Expected: the product suite reads `N+86 passed, 1 xfailed` (N from Task 0 Step 2
 4. **`context_tokens_for("ollama", LoopOptions())` is 8192**, not 32768: a `LoopOptions` without `num_ctx` sends today's 8192 (every field defaults to today's behaviour); `LoopOptions.product` always sets 32768 or the profile's value (C7).
 5. **P03-T03:** `ChatStore.lock_root` (the default store shares `~/.vmdai/.store.lock` with settings.json; a custom `root_dir` keeps its own lock file) and `append_events`/`get_manifest` ignore a falsy `chat_id`, because token sessions have `chat_id: null` until their first `chat.send`.
 6. **P03-T04 does not modify `protocol.py`.** The skeleton lists it, but the `chat.send` validator already checks `conversation_mode` against `CONVERSATION_MODES`, so adding `"full"` in constants.py is enough. P03-T04 also adds the private helpers listed in its Interfaces block, and it keeps plan 02's per-session model override in `_run_claude_loop_response` (plan 02's `test_per_request_loop_gets_wiki_store` depends on it); P03-T08 limits it to tokenless sessions. A token `chat.resume` still clears the queue (P07-T05 makes `seq` monotonic); its `last_seq` is taken after the clear and before the `chat_resumed` event, so polling from `last_seq` delivers that event.
-7. **P03-T05/T06 extra names.** `normalize_provider`, `KNOWN_PROVIDERS`, `DEFAULT_BASE_URLS`, `DEFAULT_PROFILE_NAMES`, `DEFAULT_MODELS`, `DEFAULT_OLLAMA_NUM_CTX`, `default_settings`, `LOCAL_OLLAMA_PORTS`, `SHOW_TIMEOUT_S` and `context_length_from_show`. `context_length_from_show` lives in settings_store because P03-T06 needs it before provider_catalog exists; P03-T07 imports it. `update_profile` with a different provider resets `base_url` to that provider's default and clears `options` and `key_ref` (a stale tunnel URL must not follow a switch to anthropic-direct). `resolve_profile`'s third element is `cli | profile | env | none`; `VMD_AI_PROVIDER` is used only when there is no active profile and is never written to settings.json.
+7. **P03-T05/T06 extra names.** `normalize_provider`, `KNOWN_PROVIDERS`, `DEFAULT_BASE_URLS`, `DEFAULT_PROFILE_NAMES`, `DEFAULT_MODELS`, `DEFAULT_OLLAMA_NUM_CTX`, `default_settings`, `LOCAL_OLLAMA_PORTS`, `SHOW_TIMEOUT_S` and `context_length_from_show`. `context_length_from_show` lives in settings_store because P03-T06 needs it before provider_catalog exists; P03-T07 imports it. `update_profile` with a different provider resets `base_url` to that provider's default and clears `options` and `key_ref` (a stale tunnel URL must not follow a switch to anthropic-direct). `resolve_profile`'s third element is `cli | profile | none`; per the owner's decision (2026-09-25) `VMD_AI_PROVIDER` follows §7 "seed only": it is never used live and never written to settings.json, so a token session with no active profile gets NO_MODEL.
 8. **P03-T07 extra names.** `classify_unreachable`, `NO_TOOLS_HINT`, `ANTHROPIC_STATIC_MODELS`, `CATALOG_TTL_S`, `VERSION_TTL_S`. `list_models` for openai-compatible/openrouter uses `GET <base>/models`; anthropic-direct returns a static two-model list (source `static`); an unreachable Ollama adds a `hint` next to `error`. `provider.test` puts the no-tools warning in `hint`.
 9. **P03-T08.** Adds `provider.resolve_openai_compatible_api_key` with key env var `VMD_AI_OPENAI_API_KEY` (the hermetic conftest clears `VMD_AI_*`, but not `OPENAI_API_KEY`), `RuntimeApp.first_run_servers`, and a router that becomes plan 02's `_base_loop_factory` (only when a settings store is passed and no explicit `loop_factory` was given), so plan 02's `provider.set` reset keeps routing token sessions to the product loop (`test_provider_set_keeps_profile_routing`); the `claude_loop` setter still overrides it for tests. Only `profile_for_session` is replaced; plan 02's `has_agent_loop` already asks the factory about that profile. The per-session model override is limited to tokenless sessions, so a token request always runs its profile's model (`test_token_send_ignores_model` checks the model the loop really used). The first run happens synchronously in `RuntimeApp.__init__`; to keep plan 02's subprocess lifecycle tests off the real ports 11435/11434, P03-T08 edits their `_env` helper in `tests/test_main_lifecycle.py` (a file the skeleton does not list) to write an empty settings.json into the temp HOME. `main.py` also passes `provider_mode=normalize_provider(args.provider)` so tokenless dev sessions honour `--provider`. Interim until P04-T04: an `openai-compatible` profile's requests still take their URL from `VMD_AI_OPENAI_BASE_URL` (the `options=None` streamer path reads it); P04-T04 switches them to `opts.base_url`.
 10. **P03-T09.** `runtime.info` requires a session (any session, no launch token). A token-authenticated runtime without a settings store keeps plan 02's `provider.set`. `reasoning_visible` from a tokenless `settings.set` stays per-session and needs no token, because it is one of today's per-session keys; the other persisted keys return `AUTH_REQUIRED`. A settings write against a `newer`/`invalid` file returns `INVALID_PARAMS` with `data {reason: "read_only", settings_source}`, since the RPC catalogue has no READ_ONLY code. `_turn_tracker` is the v1 `on_event` that keeps `RequestState.turn` current; P07-T01's `_make_on_event` must keep doing that.
