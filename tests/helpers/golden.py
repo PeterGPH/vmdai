@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import copy
 import difflib
+import hashlib
 import io
 import json
 import os
@@ -28,6 +29,32 @@ REPO = Path(__file__).resolve().parents[2]
 SCIVIS_DIR = REPO / "integrations" / "scivisagentbench"
 GOLDEN_DIR = REPO / "tests" / "fixtures" / "golden_requests"
 UPDATE_ENV = "CHATVMD_UPDATE_GOLDENS"
+
+# S7 (spec §2a): "goldens never regenerated" -- the plan (P01-T04/T05) pins these 13
+# files' SHA-256 up front, taken from the files this repo actually ships. A test built
+# on this dict (tests/test_benchmark_golden_requests.py::test_golden_files_pinned)
+# fails loudly if a golden is ever silently edited, added or removed, closing the gap
+# `assert_golden` leaves: it happily accepts *any* existing golden's bytes.
+GOLDEN_SHA256: Dict[str, str] = {
+    "anthropic_extra_tools": "d19ea22cbacf9f103d8c30f7609f37bea9574eb6fe4c1d3954206266e0cb2de3",
+    "anthropic_none": "10231c03bd7a487d4d6329f0955a39aa75bb3f4fa7e50094636b465750720f9b",
+    "anthropic_rag": "0229f194ccbfe8685919c06bb69bf0a5559fb892b3c1c204957954598d9b86fc",
+    "anthropic_wiki": "7c46e3fae4117760d67140ec834e70537d098b08c333ad69b389c1e60b7b8135",
+    "ollama_extra_tools": "68c633a11f6d094263e33250eb38fe34d7163b5d03f5f38ef8614a31af97b3bf",
+    "ollama_none": "4281275674c78b95afc991d14c765ce53f78f67792addb9409a306b9ef2905bf",
+    "ollama_rag": "dfeef7056c9270c6b0f1ad25c1ec22bc04189c0ab4f9b6c5a061e98afb859365",
+    "ollama_rescue": "72ee3a874f45fd689dfe3e42816605e51b74f5d24339a88e8223b243b8e7cf39",
+    "ollama_wiki": "8e148565149946b9a52d3eadbc42356c24c22a8b971cfe17b329b14c65289c89",
+    "openrouter_vllm_extra_tools": "451c42066875289ffafeb702b9d7593f4bf0c5a8b7dd72eb8262673192ff851a",
+    "openrouter_vllm_none": "ecfaee2bded1d5eb2e8f9b4c272c55cbf86e4e93dd37bd53c9e1e23a68813af1",
+    "openrouter_vllm_rag": "da74e77f6ab3c5ee7d1ce5dde258c52e3000ebae8f9e6b44f09d4087cdcaed53",
+    "openrouter_vllm_wiki": "cc1db9c3dd573c5c4bc8cadbd0019f7af473b51ca82e67d288c66f507fab3e28",
+}
+
+
+def golden_file_sha256(name: str) -> str:
+    return hashlib.sha256((GOLDEN_DIR / f"{name}.json").read_bytes()).hexdigest()
+
 
 TASK_PROMPT = "Load 1ubq.pdb, show it as NewCartoon, and take a snapshot to check the view."
 RESCUE_PROMPT = "Load 1ubq.pdb."
@@ -284,6 +311,19 @@ def build_benchmark_agent(config: Dict[str, Any]) -> Any:
     return agent
 
 
+# S7: the benchmark's SCORED outputs, not just the wire requests -- result.response
+# feeds the answer scorer and metadata["tcl_log"] becomes the scored <case>.tcl. Values
+# verified by running the scripted 3-turn script for every (provider, arm) cell in
+# ARMS x PROVIDERS: identical across all of them, since only the tool schema on offer
+# (not the scripted conversation) varies by arm.
+NONE_ARM_RESPONSE = "1ubq is loaded and shown as NewCartoon."
+NONE_ARM_TCL_LOG: List[Dict[str, Any]] = [
+    {"cmd": "mol new 1ubq.pdb", "ok": True, "err": ""},
+    {"cmd": "mol modstyle 0 0 NewCartoonX", "ok": False,
+     "err": "Unknown representation style 'NewCartoonX'"},
+]
+
+
 def drive_benchmark_run(agent: Any, provider: str, *, rescue: bool = False) -> List[Dict[str, Any]]:
     """Run one scripted task through ``agent.run_task``; return the recorded requests."""
     recorder = RecordingUrlopen(scripted_responses(provider, rescue=rescue))
@@ -297,6 +337,13 @@ def drive_benchmark_run(agent: Any, provider: str, *, rescue: bool = False) -> L
     assert result.success, result.error
     assert recorder.unconsumed == 0, f"{recorder.unconsumed} scripted responses unused"
     assert agent._bridge._results == [], "scripted tool results left unused"
+    if not rescue:
+        assert result.response == NONE_ARM_RESPONSE, (
+            f"scored response changed for {provider}: {result.response!r}"
+        )
+        assert result.metadata["tcl_log"] == NONE_ARM_TCL_LOG, (
+            f"scored tcl_log changed for {provider}: {result.metadata['tcl_log']!r}"
+        )
     return recorder.requests
 
 

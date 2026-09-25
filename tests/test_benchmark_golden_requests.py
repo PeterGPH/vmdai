@@ -19,10 +19,12 @@ from helpers import fake_evaluation_framework as fake
 from helpers.golden import (
     ARMS,
     GOLDEN_DIR,
+    GOLDEN_SHA256,
     assert_golden,
     benchmark_config,
     build_benchmark_agent,
     drive_benchmark_run,
+    golden_file_sha256,
 )
 
 PROVIDERS = ("anthropic", "openrouter_vllm", "ollama")
@@ -81,6 +83,27 @@ def test_golden_ollama_rescue(tmp_path):
     assert_golden("ollama_rescue", requests)
 
 
+def test_golden_dir_holds_exactly_the_pinned_files():
+    on_disk = {p.stem for p in GOLDEN_DIR.glob("*.json")}
+    assert on_disk == set(GOLDEN_SHA256), (
+        f"tests/fixtures/golden_requests must hold exactly the 13 plan-listed goldens; "
+        f"extra={sorted(on_disk - set(GOLDEN_SHA256))} "
+        f"missing={sorted(set(GOLDEN_SHA256) - on_disk)}"
+    )
+
+
+@pytest.mark.parametrize("name", sorted(GOLDEN_SHA256))
+def test_golden_file_hash_pinned(name):
+    # S7 "goldens never regenerated": assert_golden happily accepts any bytes an
+    # existing golden already has, so this is the only check that notices a golden
+    # was silently edited (or replaced) without the CHATVMD_UPDATE_GOLDENS=1 gate.
+    assert (GOLDEN_DIR / f"{name}.json").exists(), f"missing golden: {name}.json"
+    assert golden_file_sha256(name) == GOLDEN_SHA256[name], (
+        f"{name}.json hash changed -- a golden must never be hand-edited or "
+        f"regenerated silently (capture once with CHATVMD_UPDATE_GOLDENS=1)"
+    )
+
+
 @contextmanager
 def _isolated_framework_modules() -> Iterator[None]:
     saved = {name: mod for name, mod in sys.modules.items()
@@ -98,7 +121,17 @@ def _isolated_framework_modules() -> Iterator[None]:
 
 def test_fake_framework_only_when_missing(tmp_path, monkeypatch):
     with _isolated_framework_modules():
-        assert fake.install() is True
+        # Force the "missing" branch even when the real evaluation_framework is
+        # already importable in this process -- e.g. running `pytest tests
+        # integrations/explore_arm/tests integrations/scivisagentbench` together,
+        # where integrations/explore_arm/conftest.py has already put
+        # SciVisAgentBench-main/benchmark on sys.path. Scoped to this one call: the
+        # later `fake.install() is False` below must still see the real
+        # `_real_importable` (it now finds the fake module this call just
+        # registered, regardless of any real package on sys.path).
+        with monkeypatch.context() as scoped:
+            scoped.setattr(fake, "_real_importable", lambda: False)
+            assert fake.install() is True
         module = sys.modules["evaluation_framework.base_agent"]
         assert getattr(module, fake.FAKE_MARKER) is True
         from evaluation_framework.agent_registry import register_agent
