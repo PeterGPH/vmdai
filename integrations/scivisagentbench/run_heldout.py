@@ -135,7 +135,11 @@ def main():
     ap.add_argument("--tag", default="heldout")
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--seeds", type=int, default=1)
-    raise SystemExit(asyncio.run(run_arm(ap.parse_args())))
+    args = ap.parse_args()
+    sys.path.insert(0, str(HERE.parent))  # integrations/ -> run_provenance
+    from run_provenance import append_run_manifest
+    append_run_manifest(str(HERE / "run_manifest.jsonl"), str(HERE.parent.parent), runner="run_heldout", run=args.tag, config=args.config, seeds=str(args.seeds))
+    raise SystemExit(asyncio.run(run_arm(args)))
 
 
 if __name__ == "__main__":

@@ -260,6 +260,9 @@ def main():
                     help="JSON gold cache (from precompute_gold_multi.py) — load it instead of "
                          "recomputing gold per run; misses are computed and appended")
     args = ap.parse_args()
+    sys.path.insert(0, str(HERE.parent))  # integrations/ -> run_provenance
+    from run_provenance import append_run_manifest
+    append_run_manifest(str(HERE / "run_manifest.jsonl"), str(HERE.parent.parent), runner="run_multistructure", run=args.tag, config=args.config, seeds=str(args.seeds))
     raise SystemExit(asyncio.run(run_arm(args)))
 
 

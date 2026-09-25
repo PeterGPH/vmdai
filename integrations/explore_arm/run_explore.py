@@ -202,6 +202,9 @@ def main():
         assert_model_served(cfg.get("model"), served)
         print(f"[explore] served-model check OK: {cfg.get('model')}")
 
+    sys.path.insert(0, str(HERE.parent))  # integrations/ -> run_provenance
+    from run_provenance import append_run_manifest
+    append_run_manifest(str(SCIVIS / "run_manifest.jsonl"), str(SCIVIS.parent.parent), runner="run_explore", run=args.tag, config=args.config, model=str(cfg.get("model") or ""), seeds=str(args.seeds))
     from run_atlas_traj import run_arm
     raise SystemExit(asyncio.run(run_arm(args)))
 
