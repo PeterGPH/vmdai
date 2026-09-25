@@ -38,7 +38,6 @@ caught during manual replay sessions:
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,10 +50,10 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import rag_ab_extract  # noqa: E402
+from helpers.tcl import find_tclsh, tcl_skip_reason  # noqa: E402
 
-
-def _tclsh_available() -> bool:
-    return shutil.which("tclsh") is not None
+TCLSH = find_tclsh()
+_TCL_SKIP = tcl_skip_reason()
 
 
 # ----------------------------------------------------------------------
@@ -349,7 +348,7 @@ class CommandTranslationTests(unittest.TestCase):
 # Real-tclsh parse check — the integration test
 # ----------------------------------------------------------------------
 
-@unittest.skipUnless(_tclsh_available(), "tclsh not installed")
+@unittest.skipIf(_TCL_SKIP is not None, _TCL_SKIP or "")
 class TclParseTests(unittest.TestCase):
 
     def _stubbed_run(self, script_path: Path) -> tuple[int, str]:
@@ -381,7 +380,7 @@ class TclParseTests(unittest.TestCase):
             f"source {script_path.as_posix()}\n"
         )
         proc = subprocess.run(
-            ["tclsh"], input=harness, capture_output=True,
+            [TCLSH], input=harness, capture_output=True,
             text=True, timeout=10,
         )
         return proc.returncode, proc.stderr

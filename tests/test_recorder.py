@@ -18,7 +18,6 @@ Pure stdlib + tclsh (8.6+). Each test uses a fresh tempdir.
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,10 +31,10 @@ if str(RUNTIME_DIR) not in sys.path:
     sys.path.insert(0, str(RUNTIME_DIR))
 
 from vmd_ai_runtime.recorder import RunRecorder, RunRecorderError  # noqa: E402
+from helpers.tcl import find_tclsh, tcl_skip_reason  # noqa: E402
 
-
-def _tclsh_available() -> bool:
-    return shutil.which("tclsh") is not None
+TCLSH = find_tclsh()
+_TCL_SKIP = tcl_skip_reason()
 
 
 # ----------------------------------------------------------------------
@@ -342,7 +341,7 @@ class ManifestTests(unittest.TestCase):
 # Tcl syntax validation (real tclsh)
 # ----------------------------------------------------------------------
 
-@unittest.skipUnless(_tclsh_available(), "tclsh not installed")
+@unittest.skipIf(_TCL_SKIP is not None, _TCL_SKIP or "")
 class TclValidityTests(unittest.TestCase):
 
     def _tcl_parse(self, transcript: Path) -> tuple[int, str]:
@@ -360,7 +359,7 @@ class TclValidityTests(unittest.TestCase):
         # Run as `tclsh -c "stub; source transcript"` — tclsh has no
         # -c flag in 8.6, so feed via stdin and source the file.
         proc = subprocess.run(
-            ["tclsh"],
+            [TCLSH],
             input=stub + f"source {transcript.as_posix()}\n",
             capture_output=True,
             text=True,
@@ -412,7 +411,7 @@ class TclValidityTests(unittest.TestCase):
 # End-to-end replay smoke
 # ----------------------------------------------------------------------
 
-@unittest.skipUnless(_tclsh_available(), "tclsh not installed")
+@unittest.skipIf(_TCL_SKIP is not None, _TCL_SKIP or "")
 class ReplaySmokeTests(unittest.TestCase):
     """The point of this whole subpackage is reproducibility — so the
     last test simulates the full happy path: record a docking-like
@@ -466,7 +465,7 @@ class ReplaySmokeTests(unittest.TestCase):
                 "foreach c $CALLS { puts $c }\n"
             )
             proc = subprocess.run(
-                ["tclsh"],
+                [TCLSH],
                 input=harness,
                 capture_output=True,
                 text=True,
