@@ -13,7 +13,7 @@ import os
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from unittest import mock
 
 import pytest
@@ -32,6 +32,7 @@ class HermeticState:
         self.home = home
         self.keyring = keyring_module
         self.keyring_store: Dict[Tuple[str, str], str] = keyring_module._store
+        self.sleep_calls: List[float] = []
 
 
 def _optional_module(name: str) -> Optional[ModuleType]:
@@ -85,6 +86,13 @@ def _hermetic(tmp_path: Path) -> Iterator[HermeticState]:
         _install_keyring(stack, stub)
         state = HermeticState(home, stub)
 
+        # Backoff sleeps are recorded, never slept (spec §6: patch only _sleep).
+        from vmd_ai_runtime import claude_loop
+
+        stack.enter_context(
+            mock.patch.object(claude_loop, "_sleep", state.sleep_calls.append)
+        )
+
         settings_store = _optional_module("vmd_ai_runtime.settings_store")
         if settings_store is not None and hasattr(settings_store, "probe_local_ollama"):
             _ORIGINALS.setdefault("probe_local_ollama", settings_store.probe_local_ollama)
@@ -102,6 +110,12 @@ def _hermetic(tmp_path: Path) -> Iterator[HermeticState]:
 def fake_keyring_store(_hermetic: HermeticState) -> Dict[Tuple[str, str], str]:
     """The in-memory keyring for this test: {(service, account): secret}."""
     return _hermetic.keyring_store
+
+
+@pytest.fixture
+def sleep_calls(_hermetic: HermeticState) -> List[float]:
+    """Every wait passed to claude_loop._sleep during this test, in order."""
+    return _hermetic.sleep_calls
 
 
 @pytest.fixture

@@ -43,6 +43,10 @@ from .wiki_store import (
 
 logger = logging.getLogger("vmdai.claude_loop")
 
+# Backoff sleeps in _stream_request go through this hook (spec §2a). It is
+# the only thing tests patch; production behaviour is exactly time.sleep.
+_sleep = time.sleep
+
 # ---------------------------------------------------------------------------
 # VMD tool definitions (Anthropic tool_use format)
 # ---------------------------------------------------------------------------
@@ -494,7 +498,7 @@ def _stream_request(req: urllib.request.Request, timeout: int, max_retries: int 
                     "API HTTP %s; backing off %.1fs then retrying (%d/%d)",
                     exc.code, wait, attempt, max_retries,
                 )
-                time.sleep(wait)
+                _sleep(wait)
                 continue
             body_bytes = b""
             try:
@@ -525,7 +529,7 @@ def _stream_request(req: urllib.request.Request, timeout: int, max_retries: int 
                 wait = min(30.0, 2.0 ** attempt)
                 logger.warning("network error (%s); retry %d/%d in %.1fs",
                                exc, attempt, max_retries, wait)
-                time.sleep(wait)
+                _sleep(wait)
                 continue
             raise ClaudeLoopError(f"network error: {exc}") from exc
 
