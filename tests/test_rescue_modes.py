@@ -83,10 +83,23 @@ def test_off_mode(monkeypatch):
     assert bridge.calls == []
 
 
-def test_all_mode_unchanged():
+def test_all_mode_unchanged(monkeypatch):
     default = _rescue_json_tool_calls(TCL_PROSE, ALLOWED)
     assert default == _rescue_json_tool_calls(TCL_PROSE, ALLOWED, mode="all")
     assert default == [{"type": "tool_use", "id": "", "name": "run_vmd_command",
                         "input": {"command": "mol new 1hck.pdb\nmol modstyle 0 top NewCartoon"}}]
     assert (_rescue_json_tool_calls(JSON_CALL, ALLOWED)
             == _rescue_json_tool_calls(JSON_CALL, ALLOWED, mode="all"))
+
+    # Plan-01 carry-forward (S7): with options=None and ctx=None (the
+    # benchmark path) the fenced ```tcl rescue (pass 2) still fires end to
+    # end through run() and reaches the bridge.
+    fake = FakeUrlopen([ollama_text(TCL_PROSE), ollama_text("Done.")])
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    bridge = SpyBridge()
+    legacy = ClaudeToolLoop("ollama", "http://ollama.test", "qwen3.8:27b")
+    assert legacy.options is None
+    assert run_loop(legacy, prompt="how do I load 1hck?", bridge=bridge) == "Done."
+    assert [(c["tool_name"], c["tool_input"]) for c in bridge.calls] == [
+        ("run_vmd_command", {"command": "mol new 1hck.pdb\nmol modstyle 0 top NewCartoon"})]
+    assert len(fake.chat_requests) == 2
