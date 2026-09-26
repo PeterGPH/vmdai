@@ -15,6 +15,7 @@ No external SDK is required — all API calls use stdlib urllib.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .provider import (
@@ -42,6 +44,137 @@ from .wiki_store import (
 )
 
 logger = logging.getLogger("vmdai.claude_loop")
+
+# ---------------------------------------------------------------------------
+# Loop options (per profile) and run context (per request): §2a
+# ---------------------------------------------------------------------------
+# options=None and ctx=None keep today's behaviour byte-for-byte (S7). Every
+# behaviour change sits behind a LoopOptions field whose default is today's
+# behaviour; LoopOptions.product(profile) is the ChatVMD preset.
+
+_OLLAMA_PROVIDER_NAMES = ("ollama", "local-ollama", "local_ollama")
+_ANTHROPIC_IMAGE_PROVIDERS = (
+    "anthropic-direct", "anthropic_api", "anthropic-direct-api", "openrouter",
+)
+PRODUCT_OLLAMA_NUM_CTX = 32768        # C7: used when an Ollama profile sets none
+PRODUCT_FIRST_BYTE_TIMEOUT_S = 120.0
+LOCAL_IMAGE_MAX_EDGE = 1024
+ANTHROPIC_IMAGE_MAX_EDGE = 1568
+
+
+@dataclass
+class LoopOptions:
+    """Behaviour flags for one ClaudeToolLoop.
+
+    ``LoopOptions()`` is today's behaviour. The field names are also the
+    keys of a profile's ``options`` in ~/.vmdai/settings.json (§2f), and
+    every field is JSON-serialisable (C6 records ``to_dict()``).
+    """
+
+    num_ctx: Optional[int] = None
+    think: Optional[Any] = None
+    keep_alive: Optional[Any] = None
+    extra_body: Optional[Dict[str, Any]] = None
+    include_usage: bool = False
+    base_url: Optional[str] = None
+    temperature: Optional[float] = None
+    seed: Optional[int] = None
+    context_length: Optional[int] = None
+    connect_retries: Optional[int] = None
+    classify_unreachable: bool = False
+    classify_errors: bool = False
+    preflight: bool = False
+    first_byte_timeout_s: Optional[float] = None
+    cancellable_backoff: bool = False
+    report_cancelled: bool = False
+    turn_retry: int = 0
+    raise_stream_errors: bool = False
+    guard_truncation: bool = False
+    compact_in_run: bool = False
+    rescue: str = "all"
+    tool_overrides: Optional[Dict[str, str]] = None
+    supports_vision: Optional[Any] = None
+    image_max_edge: Optional[int] = None
+    ollama_tool_name: bool = False
+    max_turns: int = 28
+    loop_guard: bool = False
+    result_format: str = "legacy"
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> "LoopOptions":
+        """Build from a dict; unknown keys (a newer settings.json) are ignored."""
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in dict(d or {}).items() if k in known})
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def product(cls, profile: Dict[str, Any], *, max_turns: int = 28) -> "LoopOptions":
+        """The ChatVMD preset for ``profile`` ({provider, model, base_url?, options?}).
+
+        The profile's ``options`` override the preset key by key (unknown
+        keys are ignored). ``max_turns`` always comes from the setting.
+        """
+        profile = dict(profile or {})
+        provider = str(profile.get("provider") or "").strip().lower()
+        is_ollama = provider in _OLLAMA_PROVIDER_NAMES
+        preset: Dict[str, Any] = {
+            "connect_retries": 0 if is_ollama else 1,
+            "classify_unreachable": True,
+            "classify_errors": True,
+            "cancellable_backoff": True,
+            "report_cancelled": True,
+            "turn_retry": 1,
+            "raise_stream_errors": True,
+            "guard_truncation": True,
+            "compact_in_run": True,
+            "rescue": "json",
+            "supports_vision": False if provider == "openai-compatible" else "auto",
+            "image_max_edge": (
+                ANTHROPIC_IMAGE_MAX_EDGE
+                if provider in _ANTHROPIC_IMAGE_PROVIDERS
+                else LOCAL_IMAGE_MAX_EDGE
+            ),
+            "loop_guard": True,
+            "result_format": "structured",
+        }
+        if is_ollama:
+            preset.update({
+                "num_ctx": PRODUCT_OLLAMA_NUM_CTX,
+                "preflight": True,
+                "first_byte_timeout_s": PRODUCT_FIRST_BYTE_TIMEOUT_S,
+                "ollama_tool_name": True,
+            })
+        if profile.get("base_url"):
+            preset["base_url"] = str(profile["base_url"])
+        overrides = profile.get("options")
+        if isinstance(overrides, dict):
+            known = {f.name for f in dataclasses.fields(cls)}
+            for key, value in overrides.items():
+                if key not in known or key == "max_turns":
+                    continue
+                if key == "num_ctx" and value is None:
+                    continue
+                preset[key] = value
+        preset["max_turns"] = int(max_turns)
+        return cls(**preset)
+
+
+@dataclass
+class RunContext:
+    """Per-request identity and sinks for ClaudeToolLoop.run (§2a)."""
+
+    request_id: str
+    chat_id: str
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None
+    messages_out: Optional[Any] = None
+
+
+# Streamer→loop meta kinds that the loop consumes itself; they are never
+# forwarded to on_event (stop_reason: P02-T07, rescued: P02-T08,
+# model_digest: plan 04).
+_LOOP_ONLY_META = frozenset({"stop_reason", "rescued", "model_digest"})
 
 # Backoff sleeps in _stream_request go through this hook (spec §2a). It is
 # the only thing tests patch; production behaviour is exactly time.sleep.
@@ -543,6 +676,10 @@ def _stream_anthropic_direct(
     on_text: Callable[[str], None],
     should_cancel: Callable[[], bool],
     tools: Optional[List[Dict[str, Any]]] = None,
+    *,
+    on_meta: Optional[Callable[[Dict[str, Any]], None]] = None,
+    opts: Optional[LoopOptions] = None,
+    tool_mode: Optional[str] = None,
 ) -> Tuple[str, List[Dict]]:
     """Stream a turn from Anthropic Messages API; return (text, tool_blocks).
 
@@ -644,6 +781,10 @@ def _stream_openrouter(
     on_text: Callable[[str], None],
     should_cancel: Callable[[], bool],
     tools: Optional[List[Dict[str, Any]]] = None,
+    *,
+    on_meta: Optional[Callable[[Dict[str, Any]], None]] = None,
+    opts: Optional[LoopOptions] = None,
+    tool_mode: Optional[str] = None,
 ) -> Tuple[str, List[Dict]]:
     """Stream a turn from OpenRouter / OpenAI-style chat completions."""
     or_messages = []
@@ -1063,6 +1204,10 @@ def _stream_ollama(
     on_text: Callable[[str], None],
     should_cancel: Callable[[], bool],
     tools: Optional[List[Dict[str, Any]]] = None,
+    *,
+    on_meta: Optional[Callable[[Dict[str, Any]], None]] = None,
+    opts: Optional[LoopOptions] = None,
+    tool_mode: Optional[str] = None,
 ) -> Tuple[str, List[Dict]]:
     """Stream one turn from Ollama's ``/api/chat`` with tool support.
 
@@ -1298,7 +1443,38 @@ def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
 # ---------------------------------------------------------------------------
 
 class ClaudeLoopError(RuntimeError):
-    pass
+    """A loop failure.
+
+    ``code`` is the error-event code (§2f): ``other`` here, and
+    ``unreachable``/``auth``/``billing``/``model_not_found`` on the
+    subclasses, which the loop raises only when ``options.classify_errors``
+    (or ``classify_unreachable``) is on. The message text never changes, so
+    existing ``except ClaudeLoopError`` handlers keep working.
+    """
+
+    code = "other"
+
+    def __init__(self, message: str = "", *, hint: str = "",
+                 http_status: Optional[int] = None):
+        super().__init__(message)
+        self.hint = str(hint or "")
+        self.http_status = http_status
+
+
+class ProviderUnreachableError(ClaudeLoopError):
+    code = "unreachable"
+
+
+class ProviderAuthError(ClaudeLoopError):
+    code = "auth"
+
+
+class ProviderBillingError(ClaudeLoopError):
+    code = "billing"
+
+
+class ModelNotFoundError(ClaudeLoopError):
+    code = "model_not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -1377,6 +1553,7 @@ class ClaudeToolLoop:
         docs_search: Optional[Any] = None,
         recorder: Optional[RunRecorder] = None,
         wiki_store: Optional[WikiStore] = None,
+        options: Optional[LoopOptions] = None,
     ):
         self.provider_name = str(provider_name or "mock").lower()
         self.api_key = str(api_key or "")
@@ -1399,6 +1576,16 @@ class ClaudeToolLoop:
         # FIRST on most turns to look up prior knowledge before
         # rediscovering it from raw docs.
         self.wiki_store = wiki_store
+        # Behaviour flags (§2a). None keeps today's benchmark behaviour
+        # byte-for-byte; the product passes LoopOptions.product(profile).
+        self.options = options
+        # Per-request context: set at the start of run(), cleared in its finally.
+        self._ctx: Optional[RunContext] = None
+        # "none" only for C4's wrap-up call (plan 05); forwarded to the streamers.
+        self._tool_mode: Optional[str] = None
+        # 1-based turn number and the loop-only meta items of that turn.
+        self._turn = 0
+        self._turn_meta: Dict[str, Dict[str, Any]] = {}
 
     @property
     def _is_anthropic_direct(self) -> bool:
@@ -1668,8 +1855,19 @@ class ClaudeToolLoop:
         the UI sees real-time output instead of a buffered turn split into
         fake "chunks". Tool-use blocks are returned at end-of-turn so the
         caller can dispatch them in stable order.
+
+        With ``self.options`` set the streamers also receive ``on_meta``
+        (streamer→loop callback), ``opts`` and ``tool_mode``; with
+        ``options=None`` they are called exactly as before (S7).
         """
         tools = self._tools_for_turn()
+        extra: Dict[str, Any] = {}
+        if self.options is not None:
+            extra = {
+                "on_meta": self._on_meta,
+                "opts": self.options,
+                "tool_mode": self._tool_mode,
+            }
         if self._is_anthropic_direct:
             return _stream_anthropic_direct(
                 messages=messages,
@@ -1680,6 +1878,7 @@ class ClaudeToolLoop:
                 on_text=on_text,
                 should_cancel=should_cancel,
                 tools=tools,
+                **extra,
             )
         if self._is_ollama:
             # For Ollama, ``api_key`` is repurposed to hold the base URL
@@ -1694,6 +1893,7 @@ class ClaudeToolLoop:
                 on_text=on_text,
                 should_cancel=should_cancel,
                 tools=tools,
+                **extra,
             )
         return _stream_openrouter(
             messages=messages,
@@ -1704,7 +1904,46 @@ class ClaudeToolLoop:
             on_text=on_text,
             should_cancel=should_cancel,
             tools=tools,
+            **extra,
         )
+
+    def _on_meta(self, item: Dict[str, Any]) -> None:
+        """Streamer→loop callback, wired only when ``options`` is set.
+
+        Loop-only kinds (stop_reason, rescued, model_digest) are kept in
+        ``self._turn_meta`` for this turn. ``reasoning`` becomes a reasoning
+        chunk event; every other item (status, usage) becomes a
+        ``system/state`` event carrying the item plus request_id and turn.
+        """
+        if not isinstance(item, dict):
+            return
+        kind = str(item.get("kind") or "")
+        if kind in _LOOP_ONLY_META:
+            self._turn_meta[kind] = dict(item)
+            return
+        if kind == "reasoning":
+            self._emit("reasoning", "chunk", str(item.get("text") or ""))
+            return
+        self._emit("system", "state", "", dict(item))
+
+    def _emit(self, role: str, type: str, text: str = "",
+              metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Send one ``{role, type, text, metadata}`` item to ctx.on_event.
+
+        The metadata gains ``request_id`` and ``turn``. A failing sink is
+        logged and never breaks the run. No ctx or no on_event: no-op.
+        """
+        ctx = self._ctx
+        if ctx is None or ctx.on_event is None:
+            return
+        meta = dict(metadata or {})
+        meta.setdefault("request_id", ctx.request_id)
+        if self._turn:
+            meta.setdefault("turn", self._turn)
+        try:
+            ctx.on_event({"role": role, "type": type, "text": str(text or ""), "metadata": meta})
+        except Exception:
+            logger.warning("on_event sink failed", exc_info=True)
 
     def run(
         self,
@@ -1718,6 +1957,7 @@ class ClaudeToolLoop:
         on_tool_start: Optional[Callable[[str, Dict], None]] = None,
         on_tool_result: Optional[Callable[[str, str, Dict], None]] = None,
         prior_messages: Optional[List[Dict]] = None,
+        ctx: Optional[RunContext] = None,
     ) -> str:
         """
         Run a full multi-turn tool-calling session.
@@ -1727,6 +1967,8 @@ class ClaudeToolLoop:
         on_tool_result(id, name, result_dict) called after tool returns
         prior_messages              optional conversation history from a
                                     resumed chat (Anthropic-style format)
+        ctx                         optional RunContext (request identity and
+                                    sinks); None keeps today's behaviour
 
         Returns the final assistant text.
         """
@@ -1748,6 +1990,9 @@ class ClaudeToolLoop:
         # Open a recorder task for this chat.send. No-op if self.recorder
         # is None. Status is updated below; finalized in the finally block
         # so a cancel / exception still closes the run cleanly on disk.
+        self._ctx = ctx
+        self._turn = 0
+        self._turn_meta = {}
         self._recorder_start_task(prompt, session_id)
         end_status = "complete"
 
@@ -1758,6 +2003,8 @@ class ClaudeToolLoop:
                     logger.info("cancelled before turn %d", turn + 1)
                     break
 
+                self._turn = turn + 1
+                self._turn_meta = {}
                 logger.debug("loop turn %d/%d model=%s",
                              turn + 1, self.MAX_TURNS, self.model)
 
@@ -1883,6 +2130,7 @@ class ClaudeToolLoop:
             raise
         finally:
             self._recorder_end_task(end_status)
+            self._ctx = None
 
         return final_text
 
