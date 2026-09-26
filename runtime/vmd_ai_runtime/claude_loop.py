@@ -18,6 +18,7 @@ import base64
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -607,20 +608,137 @@ def _retry_after_seconds(exc: urllib.error.HTTPError) -> Optional[float]:
 
 # Status codes worth retrying: 429 rate limit, transient server overload.
 _RETRY_STATUS = {429, 500, 502, 503, 529}
+_HTTP_MAX_RETRIES = 5
+_BACKOFF_SLICE_S = 0.1
 
 
-def _stream_request(req: urllib.request.Request, timeout: int, max_retries: int = 5):
+class RunCancelled(Exception):
+    """Stop was pressed while the loop waited in a backoff.
+
+    Raised only with ``opts.cancellable_backoff``; run() turns it into
+    status ``cancelled`` (§5 "Stop during backoff or streaming").
+    """
+
+
+def _status_message(http_status: Optional[int]) -> str:
+    if http_status is None:
+        return "Network error"
+    if http_status == 429:
+        return "Rate limited"
+    if http_status == 529:
+        return "Overloaded"
+    return f"Server error (HTTP {http_status})"
+
+
+def _retry_status(
+    on_meta: Optional[Callable[[Dict[str, Any]], None]],
+    attempt: int,
+    max_attempts: int,
+    wait: float,
+    http_status: Optional[int],
+) -> None:
+    """Tell the loop a retry is coming (the panel shows "Retrying 2/5 in 8 s")."""
+    if on_meta is None:
+        return
+    try:
+        on_meta({
+            "kind": "status",
+            "phase": "retrying",
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "wait_s": wait,
+            "http_status": http_status,
+            "message": _status_message(http_status),
+        })
+    except Exception:
+        logger.debug("on_meta status callback failed", exc_info=True)
+
+
+def _cancellable_sleep(seconds: float, should_cancel: Optional[Callable[[], bool]]) -> None:
+    """Sleep in 0.1 s slices through ``_sleep``; raise RunCancelled on Stop."""
+    total = max(0.0, float(seconds))
+    slices = int(math.ceil(total / _BACKOFF_SLICE_S - 1e-9))
+    for index in range(slices):
+        if should_cancel is not None and should_cancel():
+            raise RunCancelled("cancelled during backoff")
+        _sleep(min(_BACKOFF_SLICE_S, total - index * _BACKOFF_SLICE_S))
+    if should_cancel is not None and should_cancel():
+        raise RunCancelled("cancelled during backoff")
+
+
+def _backoff_sleep(seconds: float, opts: Optional[LoopOptions],
+                   should_cancel: Optional[Callable[[], bool]]) -> None:
+    if opts is not None and opts.cancellable_backoff:
+        _cancellable_sleep(seconds, should_cancel)
+    else:
+        _sleep(seconds)
+
+
+def _classify_http_error(code: int, detail: str) -> "ClaudeLoopError":
+    """Map a non-retried HTTP error to its ClaudeLoopError class (§2f, §5).
+
+    The message is exactly the unclassified one, so logs and tracebacks
+    read the same with and without ``classify_errors``.
+    """
+    message = f"API error HTTP {code}: {detail}"
+    lowered = str(detail or "").lower()
+    if code == 402 or "credit balance" in lowered:
+        return ProviderBillingError(
+            message, hint="Add credits, or switch to another profile.", http_status=code)
+    if code in (401, 403):
+        return ProviderAuthError(
+            message, hint="Check the API key in Settings.", http_status=code)
+    if code == 404:
+        return ModelNotFoundError(
+            message, hint="Choose a model this server provides.", http_status=code)
+    return ClaudeLoopError(message, http_status=code)
+
+
+def _set_read_timeout(resp: Any, timeout: float) -> None:
+    """Best effort: once the first byte has arrived, reads use the per-read timeout."""
+    try:
+        resp.fp.raw._sock.settimeout(timeout)
+    except Exception:
+        pass
+
+
+def _stream_request(
+    req: urllib.request.Request,
+    timeout: int,
+    max_retries: int = 5,
+    *,
+    opts: Optional[LoopOptions] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    on_meta: Optional[Callable[[Dict[str, Any]], None]] = None,
+):
     """Open the request and surface HTTP errors as ClaudeLoopError.
 
     Retries on rate-limit (429) and transient overload (5xx) with backoff,
     honoring the server's Retry-After header when present. This keeps a single
     throttle from killing a whole multi-turn agentic run. Returns the response
     context manager — the caller is responsible for closing it (use ``with``).
+
+    ``opts`` (None on the benchmark path, which behaves exactly as before):
+      * ``connect_retries`` caps the retries on network errors;
+      * ``cancellable_backoff`` sleeps in 0.1 s slices and raises
+        RunCancelled when ``should_cancel()`` turns true;
+      * ``classify_errors`` raises the ClaudeLoopError subclasses;
+      * ``first_byte_timeout_s`` is the timeout until the response opens.
+    ``on_meta`` receives a ``status`` item before each retry wait.
     """
+    open_timeout = timeout
+    if opts is not None and opts.first_byte_timeout_s:
+        open_timeout = float(opts.first_byte_timeout_s)
+    net_limit = max_retries
+    if opts is not None and opts.connect_retries is not None:
+        net_limit = int(opts.connect_retries)
     attempt = 0
     while True:
         try:
-            return urllib.request.urlopen(req, timeout=timeout)
+            resp = urllib.request.urlopen(req, timeout=open_timeout)
+            if open_timeout != timeout:
+                _set_read_timeout(resp, timeout)
+            return resp
         except urllib.error.HTTPError as exc:
             if exc.code in _RETRY_STATUS and attempt < max_retries:
                 attempt += 1
@@ -631,7 +749,8 @@ def _stream_request(req: urllib.request.Request, timeout: int, max_retries: int 
                     "API HTTP %s; backing off %.1fs then retrying (%d/%d)",
                     exc.code, wait, attempt, max_retries,
                 )
-                _sleep(wait)
+                _retry_status(on_meta, attempt, max_retries, wait, exc.code)
+                _backoff_sleep(wait, opts, should_cancel)
                 continue
             body_bytes = b""
             try:
@@ -652,19 +771,35 @@ def _stream_request(req: urllib.request.Request, timeout: int, max_retries: int 
                     detail = _j.get("message", "") or str(_j)[:500]
             except Exception:
                 detail = body_bytes.decode("utf-8", errors="replace")[:500]
+            if opts is not None and opts.classify_errors:
+                raise _classify_http_error(exc.code, detail) from exc
             raise ClaudeLoopError(
                 f"API error HTTP {exc.code}: {detail}"
             ) from exc
         except urllib.error.URLError as exc:
             # Transient network blip (DNS, reset): a couple of retries.
-            if attempt < max_retries:
+            if attempt < net_limit:
                 attempt += 1
                 wait = min(30.0, 2.0 ** attempt)
                 logger.warning("network error (%s); retry %d/%d in %.1fs",
-                               exc, attempt, max_retries, wait)
-                _sleep(wait)
+                               exc, attempt, net_limit, wait)
+                _retry_status(on_meta, attempt, net_limit, wait, None)
+                _backoff_sleep(wait, opts, should_cancel)
                 continue
             raise ClaudeLoopError(f"network error: {exc}") from exc
+
+
+def _open_stream(
+    req: urllib.request.Request,
+    timeout: int,
+    opts: Optional[LoopOptions],
+    should_cancel: Optional[Callable[[], bool]],
+    on_meta: Optional[Callable[[Dict[str, Any]], None]],
+):
+    """Open a provider request. With ``opts=None`` this is exactly the old call."""
+    if opts is None:
+        return _stream_request(req, timeout)
+    return _stream_request(req, timeout, opts=opts, should_cancel=should_cancel, on_meta=on_meta)
 
 
 def _stream_anthropic_direct(
@@ -718,7 +853,7 @@ def _stream_anthropic_direct(
     blocks_in_progress: Dict[int, Dict[str, Any]] = {}
     final_tool_blocks: List[Dict[str, Any]] = []
 
-    with _stream_request(req, timeout) as resp:
+    with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
         for event in _iter_sse_events(resp):
             if event is _DONE_SENTINEL:
                 break
@@ -823,7 +958,7 @@ def _stream_openrouter(
     # as small string fragments we have to concatenate before json.loads.
     tool_calls_acc: Dict[int, Dict[str, Any]] = {}
 
-    with _stream_request(req, timeout) as resp:
+    with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
         for event in _iter_sse_events(resp):
             if event is _DONE_SENTINEL:
                 break
@@ -1272,7 +1407,7 @@ def _stream_ollama(
     tool_call_counter = 0
 
     try:
-        with _stream_request(req, timeout) as resp:
+        with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
             for event in _iter_ndjson_events(resp):
                 if should_cancel():
                     break
@@ -1306,7 +1441,7 @@ def _stream_ollama(
                     })
                 if event.get("done"):
                     break
-    except ClaudeLoopError:
+    except (ClaudeLoopError, RunCancelled):
         raise
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -2018,7 +2153,7 @@ class ClaudeToolLoop:
                         on_text=on_chunk,
                         should_cancel=cancel_event.is_set,
                     )
-                except ClaudeLoopError:
+                except (ClaudeLoopError, RunCancelled):
                     raise
                 except Exception as exc:
                     raise ClaudeLoopError(
@@ -2125,6 +2260,9 @@ class ClaudeToolLoop:
                 logger.warning("hit max turns (%d) without finishing",
                                self.MAX_TURNS)
                 end_status = "max_turns"
+        except RunCancelled:
+            end_status = "cancelled"
+            logger.info("stopped during a provider backoff")
         except Exception:
             end_status = "error"
             raise
