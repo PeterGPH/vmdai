@@ -216,3 +216,101 @@ def test_adapter_never_passes_ctx_or_options():
         "prompt", "system_prompt", "tool_bridge", "session_id", "session_queue",
         "cancel_event", "on_chunk", "on_tool_start", "on_tool_result", "prior_messages",
     ]
+
+
+# --- M1 (plan 02, P02-T08): product options and call metadata ---------------
+
+import re as _re
+import threading as _threading
+from unittest import mock as _mock
+
+from helpers.fake_provider import scripted_call as _scripted_call
+from vmd_ai_runtime.claude_loop import ClaudeToolLoop as _Loop
+from vmd_ai_runtime.claude_loop import LoopOptions as _LoopOptions
+from vmd_ai_runtime.claude_loop import RunContext as _RunContext
+
+
+def test_product_options_strict_bridges_six_keywords():
+    """The product preset changes nothing about how strict bridges are called."""
+    for name, factory in STRICT_BRIDGES:
+        loop = _Loop(provider_name="openrouter", api_key="sk-or-guard", model="guard/model",
+                     options=_LoopOptions.product({"provider": "openrouter", "model": "guard/model"}))
+        calls = run_guard(loop, factory())
+        assert calls, f"{name}: the scripted run made no tool calls"
+        for kwargs in calls:
+            assert set(kwargs) == LEGACY_KWARGS, (name, sorted(kwargs))
+
+
+class _MetaBridge:
+    """Opts in on its class, like the product VmdToolBridge will (plan 05)."""
+
+    supports_call_meta = True
+
+    def __init__(self):
+        self.calls = []
+
+    def execute_tool(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"ok": True, "output": "ok", "error": ""}
+
+
+class _Delegating:
+    """Forwards attribute access like RetrievalAugmentingBridge/ExploreScaffoldBridge."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _drive_one_call(bridge, *, options=None, ctx=None):
+    loop = _Loop("openrouter", "sk-or-guard", "guard/model", options=options)
+    loop._call = _scripted_call([
+        ("", [{"type": "tool_use", "id": "tc_0", "name": "run_vmd_command",
+               "input": {"command": "puts hi"}}]),
+        ("done", []),
+    ])
+    loop.run(prompt="p", system_prompt="", tool_bridge=bridge, session_id="sess_guard",
+             session_queue=None, cancel_event=_threading.Event(),
+             on_chunk=lambda chunk: None, ctx=ctx)
+
+
+def test_supports_call_meta_class_attr_gets_call_key():
+    bridge = _MetaBridge()
+    ctx = _RunContext("req_guard", "chat_0123456789ab")
+    _drive_one_call(bridge, ctx=ctx,
+                    options=_LoopOptions.product({"provider": "openrouter", "model": "guard/model"}))
+    kwargs, = bridge.calls
+    assert set(kwargs) == LEGACY_KWARGS | {"call_key", "request_id"}
+    assert _re.fullmatch(r"[0-9a-f]{12}", kwargs["call_key"])
+    assert kwargs["request_id"] == "req_guard"
+    plain = _MetaBridge()
+    _drive_one_call(plain)  # options=None and ctx=None: the class still opts in
+    assert plain.calls[0]["request_id"] is None
+
+
+def test_getattr_delegating_wrapper_not_opted_in():
+    inner = _MetaBridge()
+    wrapper = _Delegating(inner)
+    assert wrapper.supports_call_meta is True  # the instance says yes...
+    _drive_one_call(wrapper, options=_LoopOptions())
+    assert set(inner.calls[0]) == LEGACY_KWARGS  # ...but only the class counts
+
+    class _Plain:
+        def __init__(self):
+            self.calls = []
+
+        def execute_tool(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"ok": True, "output": "ok", "error": ""}
+
+    plain = _Plain()
+    plain.supports_call_meta = True  # an instance attribute never opts in
+    _drive_one_call(plain, options=_LoopOptions())
+    assert set(plain.calls[0]) == LEGACY_KWARGS
+
+    mocked = _mock.MagicMock()
+    mocked.execute_tool.return_value = {"ok": True, "output": "ok", "error": ""}
+    _drive_one_call(mocked, options=_LoopOptions())
+    assert set(mocked.execute_tool.call_args.kwargs) == LEGACY_KWARGS

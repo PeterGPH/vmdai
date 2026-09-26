@@ -15,6 +15,7 @@ No external SDK is required — all API calls use stdlib urllib.
 from __future__ import annotations
 
 import base64
+import copy
 import dataclasses
 import http.client
 import json
@@ -27,6 +28,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -1541,6 +1543,9 @@ def _stream_ollama(
                 "ollama: rescued %d tool call(s) from JSON-in-content "
                 "(model=%s)", len(rescued), model,
             )
+            if on_meta is not None:
+                # The loop marks these calls origin "rescued" (§2c).
+                on_meta({"kind": "rescued", "ids": [str(b["id"]) for b in rescued]})
             # Drop the JSON text from history so the model doesn't learn
             # to repeat the pattern on the next turn. The UI already
             # received it via on_text — we just don't persist it.
@@ -1751,6 +1756,80 @@ def _build_tool_result_block(
         "tool_use_id": tool_use_id,
         "content": content,
         "is_error": not ok,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Loop → app contract helpers (§2a call_key, §2b canonical copies, §2c)
+# ---------------------------------------------------------------------------
+
+# Tools the runtime answers itself (executor "runtime"); the rest go to Tcl.
+_RUNTIME_TOOLS = frozenset({
+    "search_docs", "wiki_list", "wiki_read", "wiki_update", "wiki_verify_pins",
+})
+
+
+def _mint_call_key() -> str:
+    """A fresh key for one tool execution: 12 hex characters (§2a).
+
+    It names the image and output files and forms the canonical id
+    ``call_<call_key>``; model ids (tc_0, otc_1) repeat across turns.
+    """
+    return uuid.uuid4().hex[:12]
+
+
+def _canonical_message(message: Dict[str, Any], call_keys: List[str]) -> Dict[str, Any]:
+    """Deep copy of ``message`` for messages_out (§2b Canonical copies).
+
+    The i-th tool_use ``id`` (assistant turn) or tool_result
+    ``tool_use_id`` (tool-results turn) becomes ``call_<call_keys[i]>``.
+    The in-run message is never modified.
+    """
+    out = copy.deepcopy(message)
+    content = out.get("content")
+    if not isinstance(content, list):
+        return out
+    index = 0
+    for block in content:
+        if not isinstance(block, dict) or index >= len(call_keys):
+            continue
+        if block.get("type") == "tool_use":
+            block["id"] = "call_" + call_keys[index]
+            index += 1
+        elif block.get("type") == "tool_result":
+            block["tool_use_id"] = "call_" + call_keys[index]
+            index += 1
+    return out
+
+
+def _tool_finished_meta(call_key: str, tool_name: str, executor: str,
+                        result: Dict[str, Any], duration_ms: float) -> Dict[str, Any]:
+    """``tool.finished`` metadata (§2c) from a bridge or runtime result dict.
+
+    Fields a bridge does not report yet (plan 05 adds them) default to
+    None; ``executed`` defaults to "yes" because the tool was dispatched.
+    """
+    output = str(result.get("output") or "")
+    output_bytes = result.get("output_bytes")
+    image = result.get("image")
+    return {
+        "kind": "tool.finished",
+        "call_key": call_key,
+        "tool_name": tool_name,
+        "executor": executor,
+        "ok": bool(result.get("ok", False)),
+        "executed": str(result.get("executed") or "yes"),
+        "output": output,
+        "error": str(result.get("error") or ""),
+        "truncated": bool(result.get("truncated", False)),
+        "duration_ms": int(round(duration_ms)),
+        "statements": result.get("statements"),
+        "blocked": result.get("blocked"),
+        "output_path": result.get("output_path"),
+        "output_bytes": int(output_bytes) if output_bytes is not None else len(output.encode("utf-8")),
+        "image": image if isinstance(image, dict) else None,
+        "saved_path": result.get("saved_path"),
+        "late": False,
     }
 
 
@@ -2212,6 +2291,162 @@ class ClaudeToolLoop:
         item = self._turn_meta.get("stop_reason") or {}
         return str(item.get("value") or "") in _TRUNCATED_STOP_REASONS
 
+    def _text_sink(self, on_chunk: Callable[[str], None]) -> Callable[[str], None]:
+        """on_chunk, plus an ``assistant/chunk`` event when ctx.on_event is set."""
+        ctx = self._ctx
+        if ctx is None or ctx.on_event is None:
+            return on_chunk
+
+        def _sink(chunk: str) -> None:
+            on_chunk(chunk)
+            self._emit("assistant", "chunk", chunk)
+
+        return _sink
+
+    def _out(self, message: Dict[str, Any]) -> None:
+        """Append a deep copy of ``message`` to ctx.messages_out, if any."""
+        ctx = self._ctx
+        if ctx is None or ctx.messages_out is None:
+            return
+        try:
+            ctx.messages_out.append(copy.deepcopy(message))
+        except Exception:
+            logger.warning("messages_out append failed", exc_info=True)
+
+    def _finish_text_turn(self, text: str) -> None:
+        """Seal the run's last turn.
+
+        Its text goes to messages_out only; it is never part of a request
+        body, so the S7 golden requests do not change (§2b).
+        """
+        self.last_final_text_empty = not text
+        self._emit("assistant", "message", text, {"final": True})
+        if text:
+            self._out({"role": "assistant", "content": [{"type": "text", "text": text}]})
+
+    def _rescued_ids(self) -> set:
+        item = self._turn_meta.get("rescued") or {}
+        return {str(i) for i in (item.get("ids") or [])}
+
+    def _dispatch_tool(
+        self,
+        tool_bridge,
+        *,
+        session_id: str,
+        tool_id: str,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        session_queue,
+        cancel_event: threading.Event,
+        call_key: str,
+    ) -> Dict[str, Any]:
+        """Run one tool: runtime-resident tools here, everything else on the bridge."""
+        if tool_name == "search_docs":
+            # Python-resident tool — never round-trips to Tcl. Returned
+            # shape mirrors a Tcl tool result so the downstream
+            # tool_result builder doesn't need a special case.
+            return self._dispatch_search_docs(tool_input)
+        if tool_name == "wiki_list":
+            return self._dispatch_wiki_list(tool_input)
+        if tool_name == "wiki_read":
+            return self._dispatch_wiki_read(tool_input)
+        if tool_name == "wiki_update":
+            return self._dispatch_wiki_update(tool_input)
+        if tool_name == "wiki_verify_pins":
+            return self._dispatch_wiki_verify_pins(tool_input)
+        kwargs: Dict[str, Any] = {
+            "session_id": session_id,
+            "tool_call_id": tool_id,
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "session_queue": session_queue,
+            "cancel_event": cancel_event,
+        }
+        # Only a bridge whose *class* declares supports_call_meta = True gets
+        # the two new keywords. Reading the class, and requiring "is True",
+        # keeps __getattr__ wrappers and mocks on the six legacy keywords.
+        if getattr(type(tool_bridge), "supports_call_meta", False) is True:
+            kwargs["call_key"] = call_key
+            kwargs["request_id"] = self._ctx.request_id if self._ctx is not None else None
+        return tool_bridge.execute_tool(**kwargs)
+
+    def _run_tool_block(
+        self,
+        block: Dict[str, Any],
+        call_key: str,
+        *,
+        tool_bridge,
+        session_id: str,
+        session_queue,
+        cancel_event: threading.Event,
+        on_tool_start: Optional[Callable[[str, Dict], None]],
+        on_tool_result: Optional[Callable[[str, str, Dict], None]],
+        truncated: bool,
+        origin: str,
+    ) -> Dict[str, Any]:
+        """Execute one tool_use block and emit its tool.started/tool.finished pair."""
+        tool_name = str(block.get("name") or "")
+        tool_id = str(block.get("id") or "")
+        tool_input = block.get("input") or {}
+
+        if on_tool_start:
+            try:
+                on_tool_start(tool_name, tool_input)
+            except Exception:
+                pass
+
+        executor = "runtime" if tool_name in _RUNTIME_TOOLS else "tcl"
+        self._emit("system", "state", "", {
+            "kind": "tool.started",
+            "call_key": call_key,
+            "tool_call_id": tool_id,
+            "tool_name": tool_name,
+            "executor": executor,
+            "origin": origin,
+            "input": tool_input,
+        })
+        logger.info("executing tool=%s id=%s call_key=%s", tool_name, tool_id, call_key)
+
+        tool_t0 = time.perf_counter()
+        if truncated:
+            result: Dict[str, Any] = {"ok": False, "output": "",
+                                      "error": TRUNCATED_TOOL_ERROR, "executed": "no"}
+        else:
+            result = self._dispatch_tool(
+                tool_bridge,
+                session_id=session_id,
+                tool_id=tool_id,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                session_queue=session_queue,
+                cancel_event=cancel_event,
+                call_key=call_key,
+            )
+        tool_ms = (time.perf_counter() - tool_t0) * 1000.0
+        self.last_tool_calls += 1
+
+        # Mirror the result into the on-disk recorder so this chat.send
+        # produces a replayable transcript.tcl + snapshots/. Failed tools are
+        # counted in the manifest but never written to transcript.tcl; a
+        # guarded (truncated) call never ran, so it is not recorded at all.
+        if not truncated:
+            self._recorder_record(
+                tool_name=tool_name,
+                tool_input=tool_input,
+                result=result,
+                duration_ms=tool_ms,
+            )
+
+        if on_tool_result:
+            try:
+                on_tool_result(tool_id, tool_name, result)
+            except Exception:
+                pass
+
+        self._emit("system", "state", "",
+                   _tool_finished_meta(call_key, tool_name, executor, result, tool_ms))
+        return result
+
     def run(
         self,
         prompt: str,
@@ -2234,8 +2469,10 @@ class ClaudeToolLoop:
         on_tool_result(id, name, result_dict) called after tool returns
         prior_messages              optional conversation history from a
                                     resumed chat (Anthropic-style format)
-        ctx                         optional RunContext (request identity and
-                                    sinks); None keeps today's behaviour
+        ctx                         optional RunContext: request_id and
+                                    chat_id, on_event (loop events, §2c) and
+                                    messages_out (canonical copies, §2b).
+                                    None keeps today's behaviour.
 
         Returns the final assistant text. The outcome is also left on
         ``last_status`` ('complete' | 'cancelled' | 'error' | 'max_turns'),
@@ -2265,11 +2502,16 @@ class ClaudeToolLoop:
         self.last_final_text_empty = True
         opts = self.options
         max_turns = opts.max_turns if opts is not None else self.MAX_TURNS
+        on_text = self._text_sink(on_chunk)
+
+        # messages_out gets only new messages, starting with the prompt.
+        self._out(messages[-1])
 
         # Open a recorder task for this chat.send. No-op if self.recorder
         # is None. Status is updated below; finalized in the finally block
         # so a cancel / exception still closes the run cleanly on disk.
-        self._recorder_start_task(prompt, session_id)
+        # With ctx the recorder gets the real chat id (§2a).
+        self._recorder_start_task(prompt, ctx.chat_id if ctx is not None else session_id)
         end_status = "complete"
 
         try:
@@ -2282,15 +2524,16 @@ class ClaudeToolLoop:
                 self._turn = turn + 1
                 self._turn_meta = {}
                 self.last_turns = turn + 1
+                self._emit("system", "state", "", {"kind": "turn.started"})
                 logger.debug("loop turn %d/%d model=%s",
                              turn + 1, max_turns, self.model)
 
                 try:
-                    # Real SSE streaming: on_chunk fires for each text delta
+                    # Real SSE streaming: on_text fires for each text delta
                     # as the provider produces it. cancel_event is checked
                     # between SSE events so Stop interrupts mid-generation.
                     text, tool_blocks = self._call_turn(
-                        messages, system_prompt, on_chunk, cancel_event,
+                        messages, system_prompt, on_text, cancel_event,
                     )
                 except (ClaudeLoopError, RunCancelled):
                     raise
@@ -2306,17 +2549,17 @@ class ClaudeToolLoop:
                 # cancelled instead of complete (§2a).
                 if opts is not None and opts.report_cancelled and cancel_event.is_set():
                     end_status = "cancelled"
-                    self.last_final_text_empty = not text
+                    self._finish_text_turn(text)
                     logger.info("stopped during turn %d", turn + 1)
                     break
 
                 # No tool calls → conversation complete
                 if not tool_blocks:
-                    self.last_final_text_empty = not text
                     logger.debug(
                         "loop complete after %d turns, no more tool calls",
                         turn + 1,
                     )
+                    self._finish_text_turn(text)
                     break
 
                 # --- Build assistant message (Anthropic format) ---
@@ -2327,6 +2570,10 @@ class ClaudeToolLoop:
                 messages.append({"role": "assistant",
                                  "content": assistant_content})
 
+                call_keys = [_mint_call_key() for _ in tool_blocks]
+                self._emit("assistant", "message", text, {"final": False})
+                self._out(_canonical_message(messages[-1], call_keys))
+
                 truncated = self._turn_truncated()
                 if truncated:
                     self._emit("system", "state", "", {
@@ -2334,77 +2581,29 @@ class ClaudeToolLoop:
                         "phase": "turn_truncated",
                         "message": "The reply was cut off; its tool calls were not run.",
                     })
+                rescued_ids = self._rescued_ids()
 
                 # --- Execute each tool and collect results ---
                 tool_result_blocks: List[Dict] = []
+                result_keys: List[str] = []
 
-                for block in tool_blocks:
+                for block, call_key in zip(tool_blocks, call_keys):
                     if cancel_event.is_set():
                         end_status = "cancelled"
                         break
-
-                    tool_name = str(block.get("name") or "")
                     tool_id = str(block.get("id") or "")
-                    tool_input = block.get("input") or {}
-
-                    if on_tool_start:
-                        try:
-                            on_tool_start(tool_name, tool_input)
-                        except Exception:
-                            pass
-
-                    logger.info("executing tool=%s id=%s",
-                                tool_name, tool_id)
-
-                    tool_t0 = time.perf_counter()
-                    if truncated:
-                        result = {"ok": False, "output": "",
-                                  "error": TRUNCATED_TOOL_ERROR, "executed": "no"}
-                    elif tool_name == "search_docs":
-                        # Python-resident tool — never round-trips to Tcl.
-                        # Returned shape mirrors a Tcl tool result so the
-                        # downstream tool_result builder doesn't need a
-                        # special case.
-                        result = self._dispatch_search_docs(tool_input)
-                    elif tool_name == "wiki_list":
-                        result = self._dispatch_wiki_list(tool_input)
-                    elif tool_name == "wiki_read":
-                        result = self._dispatch_wiki_read(tool_input)
-                    elif tool_name == "wiki_update":
-                        result = self._dispatch_wiki_update(tool_input)
-                    elif tool_name == "wiki_verify_pins":
-                        result = self._dispatch_wiki_verify_pins(tool_input)
-                    else:
-                        result = tool_bridge.execute_tool(
-                            session_id=session_id,
-                            tool_call_id=tool_id,
-                            tool_name=tool_name,
-                            tool_input=tool_input,
-                            session_queue=session_queue,
-                            cancel_event=cancel_event,
-                        )
-                    tool_ms = (time.perf_counter() - tool_t0) * 1000.0
-                    self.last_tool_calls += 1
-
-                    # Mirror the result into the on-disk recorder so this
-                    # chat.send produces a replayable transcript.tcl +
-                    # snapshots/. Failed tools are counted in the manifest
-                    # but never written to transcript.tcl (by design); a
-                    # guarded (truncated) call never ran, so it is skipped.
-                    if not truncated:
-                        self._recorder_record(
-                            tool_name=tool_name,
-                            tool_input=tool_input,
-                            result=result,
-                            duration_ms=tool_ms,
-                        )
-
-                    if on_tool_result:
-                        try:
-                            on_tool_result(tool_id, tool_name, result)
-                        except Exception:
-                            pass
-
+                    result = self._run_tool_block(
+                        block,
+                        call_key,
+                        tool_bridge=tool_bridge,
+                        session_id=session_id,
+                        session_queue=session_queue,
+                        cancel_event=cancel_event,
+                        on_tool_start=on_tool_start,
+                        on_tool_result=on_tool_result,
+                        truncated=truncated,
+                        origin="rescued" if tool_id in rescued_ids else "model",
+                    )
                     tool_result_blocks.append(
                         _build_tool_result_block(
                             tool_use_id=tool_id,
@@ -2412,12 +2611,14 @@ class ClaudeToolLoop:
                             include_image=self._is_anthropic_direct,
                         )
                     )
+                    result_keys.append(call_key)
 
                 # --- Append tool results to conversation ---
                 if tool_result_blocks:
                     messages.append(
                         {"role": "user", "content": tool_result_blocks}
                     )
+                    self._out(_canonical_message(messages[-1], result_keys))
             else:
                 logger.warning("hit max turns (%d) without finishing",
                                max_turns)
