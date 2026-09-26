@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vmd-ai-runtime"
-version = "0.2.0"
+version = "0.3.0"
 description = "VMD AI runtime: Claude agent loop with run_vmd_command / capture_vmd_snapshot tools"
 requires-python = ">=3.9"
 dependencies = []
