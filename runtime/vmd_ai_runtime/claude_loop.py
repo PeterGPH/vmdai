@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import http.client
 import json
 import logging
 import math
 import os
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -849,9 +851,41 @@ def _stream_anthropic_direct(
         method="POST",
     )
 
+    if opts is None or not opts.raise_stream_errors:
+        return _anthropic_consume(req, timeout, on_text, should_cancel, on_meta, opts)
+    attempt = 0
+    while True:
+        try:
+            return _anthropic_consume(req, timeout, on_text, should_cancel, on_meta, opts)
+        except _SseOverloaded as exc:
+            # An SSE overloaded_error before any output counts as HTTP 529 (§5).
+            if attempt >= _HTTP_MAX_RETRIES:
+                raise ClaudeLoopError(f"API error HTTP 529: {exc}", http_status=529) from exc
+            attempt += 1
+            wait = min(60.0, 2.0 ** attempt)
+            logger.warning("SSE overloaded_error; backing off %.1fs then retrying (%d/%d)",
+                           wait, attempt, _HTTP_MAX_RETRIES)
+            _retry_status(on_meta, attempt, _HTTP_MAX_RETRIES, wait, 529)
+            _backoff_sleep(wait, opts, should_cancel)
+
+
+class _SseOverloaded(Exception):
+    """An Anthropic SSE ``overloaded_error`` that arrived before any output."""
+
+
+def _anthropic_consume(
+    req: urllib.request.Request,
+    timeout: int,
+    on_text: Callable[[str], None],
+    should_cancel: Callable[[], bool],
+    on_meta: Optional[Callable[[Dict[str, Any]], None]],
+    opts: Optional[LoopOptions],
+) -> Tuple[str, List[Dict]]:
+    """Open one Anthropic request and consume its SSE stream."""
     text_parts: List[str] = []
     blocks_in_progress: Dict[int, Dict[str, Any]] = {}
     final_tool_blocks: List[Dict[str, Any]] = []
+    raise_errors = opts is not None and opts.raise_stream_errors
 
     with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
         for event in _iter_sse_events(resp):
@@ -900,6 +934,22 @@ def _stream_anthropic_direct(
                         block["input"] = {}
                     final_tool_blocks.append(block)
                 continue
+
+            if etype == "message_delta":
+                if on_meta is not None:
+                    reason = (event.get("delta") or {}).get("stop_reason")
+                    if reason:
+                        on_meta({"kind": "stop_reason", "value": str(reason)})
+                continue
+
+            if etype == "error" and raise_errors:
+                err = event.get("error") or {}
+                err_type = str(err.get("type") or "")
+                message = str(err.get("message") or err_type or "stream error")
+                if (err_type == "overloaded_error" and not text_parts
+                        and not final_tool_blocks and not blocks_in_progress):
+                    raise _SseOverloaded(message)
+                raise ClaudeLoopError(f"API stream error: {message}")
 
             if etype == "message_stop":
                 break
@@ -968,6 +1018,10 @@ def _stream_openrouter(
             choices = event.get("choices") or []
             if not choices:
                 continue
+            if on_meta is not None:
+                finish = (choices[0] or {}).get("finish_reason")
+                if finish:
+                    on_meta({"kind": "stop_reason", "value": str(finish)})
             delta = (choices[0] or {}).get("delta") or {}
 
             content = delta.get("content")
@@ -1440,6 +1494,9 @@ def _stream_ollama(
                         "input": args,
                     })
                 if event.get("done"):
+                    if on_meta is not None:
+                        on_meta({"kind": "stop_reason",
+                                 "value": str(event.get("done_reason") or "stop")})
                     break
     except (ClaudeLoopError, RunCancelled):
         raise
@@ -1612,6 +1669,37 @@ class ModelNotFoundError(ClaudeLoopError):
     code = "model_not_found"
 
 
+# guard_truncation (§2a, §5): tool calls from a turn cut off by the output
+# token limit are not run; each gets this error result instead.
+TRUNCATED_TOOL_ERROR = (
+    "Not run: your reply hit the output token limit while writing this tool "
+    "call, so its arguments may be incomplete. Make a shorter call, or split "
+    "the work into smaller steps."
+)
+_TRUNCATED_STOP_REASONS = frozenset({"max_tokens", "length"})
+
+# Read errors after the response opened: a "stream drop" (§5).
+_STREAM_DROP_TYPES = (ConnectionError, http.client.IncompleteRead, socket.timeout)
+
+
+def _is_stream_drop(exc: BaseException) -> bool:
+    """True for a read error after the response opened (reset, closed, read timeout).
+
+    Opening errors (URLError), classified errors and Stop never count.
+    """
+    if isinstance(exc, (RunCancelled, urllib.error.URLError)):
+        return False
+    if isinstance(exc, ClaudeLoopError):
+        if exc.code != "other":
+            return False
+        candidate = exc.__cause__
+    else:
+        candidate = exc
+    if candidate is None or isinstance(candidate, urllib.error.URLError):
+        return False
+    return isinstance(candidate, _STREAM_DROP_TYPES)
+
+
 # ---------------------------------------------------------------------------
 # Tool result construction
 # ---------------------------------------------------------------------------
@@ -1721,6 +1809,11 @@ class ClaudeToolLoop:
         # 1-based turn number and the loop-only meta items of that turn.
         self._turn = 0
         self._turn_meta: Dict[str, Dict[str, Any]] = {}
+        # Outcome of the last run(); the app builds request.finished from it.
+        self.last_status: Optional[str] = None
+        self.last_turns = 0
+        self.last_tool_calls = 0
+        self.last_final_text_empty = False
 
     @property
     def _is_anthropic_direct(self) -> bool:
@@ -2080,6 +2173,45 @@ class ClaudeToolLoop:
         except Exception:
             logger.warning("on_event sink failed", exc_info=True)
 
+    def _call_turn(
+        self,
+        messages: List[Dict],
+        system_prompt: str,
+        on_text: Callable[[str], None],
+        cancel_event: threading.Event,
+    ) -> Tuple[str, List[Dict]]:
+        """One model call, retried ``options.turn_retry`` times after a stream drop.
+
+        The retry repeats only the model call with the same messages, so a
+        tool that already ran is never run again. Each retry emits
+        ``turn.retry`` so the panel discards the partial block (§2c).
+        """
+        retries_left = self.options.turn_retry if self.options is not None else 0
+        while True:
+            try:
+                return self._call(
+                    messages,
+                    system_prompt,
+                    on_text=on_text,
+                    should_cancel=cancel_event.is_set,
+                )
+            except Exception as exc:
+                if retries_left <= 0 or cancel_event.is_set() or not _is_stream_drop(exc):
+                    raise
+                retries_left -= 1
+                logger.warning("stream dropped on turn %d (%s); retrying the turn",
+                               self._turn, exc)
+                self._turn_meta = {}
+                self._emit("system", "state", "",
+                           {"kind": "turn.retry", "reason": "stream dropped"})
+
+    def _turn_truncated(self) -> bool:
+        """True when guard_truncation is on and this turn hit the token limit."""
+        if self.options is None or not self.options.guard_truncation:
+            return False
+        item = self._turn_meta.get("stop_reason") or {}
+        return str(item.get("value") or "") in _TRUNCATED_STOP_REASONS
+
     def run(
         self,
         prompt: str,
@@ -2105,7 +2237,9 @@ class ClaudeToolLoop:
         ctx                         optional RunContext (request identity and
                                     sinks); None keeps today's behaviour
 
-        Returns the final assistant text.
+        Returns the final assistant text. The outcome is also left on
+        ``last_status`` ('complete' | 'cancelled' | 'error' | 'max_turns'),
+        ``last_turns``, ``last_tool_calls`` and ``last_final_text_empty``.
         """
         # Conversation history maintained in Anthropic-style format internally.
         # If resuming a prior chat, inject the history before the new prompt.
@@ -2122,17 +2256,24 @@ class ClaudeToolLoop:
         if self.wiki_store is not None:
             system_prompt = system_prompt + WIKI_SYSTEM_PROMPT_ADDENDUM
 
-        # Open a recorder task for this chat.send. No-op if self.recorder
-        # is None. Status is updated below; finalized in the finally block
-        # so a cancel / exception still closes the run cleanly on disk.
         self._ctx = ctx
         self._turn = 0
         self._turn_meta = {}
+        self.last_status = None
+        self.last_turns = 0
+        self.last_tool_calls = 0
+        self.last_final_text_empty = True
+        opts = self.options
+        max_turns = opts.max_turns if opts is not None else self.MAX_TURNS
+
+        # Open a recorder task for this chat.send. No-op if self.recorder
+        # is None. Status is updated below; finalized in the finally block
+        # so a cancel / exception still closes the run cleanly on disk.
         self._recorder_start_task(prompt, session_id)
         end_status = "complete"
 
         try:
-            for turn in range(self.MAX_TURNS):
+            for turn in range(max_turns):
                 if cancel_event.is_set():
                     end_status = "cancelled"
                     logger.info("cancelled before turn %d", turn + 1)
@@ -2140,18 +2281,16 @@ class ClaudeToolLoop:
 
                 self._turn = turn + 1
                 self._turn_meta = {}
+                self.last_turns = turn + 1
                 logger.debug("loop turn %d/%d model=%s",
-                             turn + 1, self.MAX_TURNS, self.model)
+                             turn + 1, max_turns, self.model)
 
                 try:
                     # Real SSE streaming: on_chunk fires for each text delta
                     # as the provider produces it. cancel_event is checked
                     # between SSE events so Stop interrupts mid-generation.
-                    text, tool_blocks = self._call(
-                        messages,
-                        system_prompt,
-                        on_text=on_chunk,
-                        should_cancel=cancel_event.is_set,
+                    text, tool_blocks = self._call_turn(
+                        messages, system_prompt, on_chunk, cancel_event,
                     )
                 except (ClaudeLoopError, RunCancelled):
                     raise
@@ -2163,8 +2302,17 @@ class ClaudeToolLoop:
                 if text:
                     final_text = text
 
+                # report_cancelled: Stop during the stream ends the run as
+                # cancelled instead of complete (§2a).
+                if opts is not None and opts.report_cancelled and cancel_event.is_set():
+                    end_status = "cancelled"
+                    self.last_final_text_empty = not text
+                    logger.info("stopped during turn %d", turn + 1)
+                    break
+
                 # No tool calls → conversation complete
                 if not tool_blocks:
+                    self.last_final_text_empty = not text
                     logger.debug(
                         "loop complete after %d turns, no more tool calls",
                         turn + 1,
@@ -2178,6 +2326,14 @@ class ClaudeToolLoop:
                 assistant_content.extend(tool_blocks)
                 messages.append({"role": "assistant",
                                  "content": assistant_content})
+
+                truncated = self._turn_truncated()
+                if truncated:
+                    self._emit("system", "state", "", {
+                        "kind": "status",
+                        "phase": "turn_truncated",
+                        "message": "The reply was cut off; its tool calls were not run.",
+                    })
 
                 # --- Execute each tool and collect results ---
                 tool_result_blocks: List[Dict] = []
@@ -2201,7 +2357,10 @@ class ClaudeToolLoop:
                                 tool_name, tool_id)
 
                     tool_t0 = time.perf_counter()
-                    if tool_name == "search_docs":
+                    if truncated:
+                        result = {"ok": False, "output": "",
+                                  "error": TRUNCATED_TOOL_ERROR, "executed": "no"}
+                    elif tool_name == "search_docs":
                         # Python-resident tool — never round-trips to Tcl.
                         # Returned shape mirrors a Tcl tool result so the
                         # downstream tool_result builder doesn't need a
@@ -2225,17 +2384,20 @@ class ClaudeToolLoop:
                             cancel_event=cancel_event,
                         )
                     tool_ms = (time.perf_counter() - tool_t0) * 1000.0
+                    self.last_tool_calls += 1
 
                     # Mirror the result into the on-disk recorder so this
                     # chat.send produces a replayable transcript.tcl +
                     # snapshots/. Failed tools are counted in the manifest
-                    # but never written to transcript.tcl (by design).
-                    self._recorder_record(
-                        tool_name=tool_name,
-                        tool_input=tool_input,
-                        result=result,
-                        duration_ms=tool_ms,
-                    )
+                    # but never written to transcript.tcl (by design); a
+                    # guarded (truncated) call never ran, so it is skipped.
+                    if not truncated:
+                        self._recorder_record(
+                            tool_name=tool_name,
+                            tool_input=tool_input,
+                            result=result,
+                            duration_ms=tool_ms,
+                        )
 
                     if on_tool_result:
                         try:
@@ -2258,7 +2420,7 @@ class ClaudeToolLoop:
                     )
             else:
                 logger.warning("hit max turns (%d) without finishing",
-                               self.MAX_TURNS)
+                               max_turns)
                 end_status = "max_turns"
         except RunCancelled:
             end_status = "cancelled"
@@ -2267,6 +2429,7 @@ class ClaudeToolLoop:
             end_status = "error"
             raise
         finally:
+            self.last_status = end_status
             self._recorder_end_task(end_status)
             self._ctx = None
 
