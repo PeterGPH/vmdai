@@ -30,6 +30,9 @@ for i in $(seq 1 60); do
 done
 [ "$up" = "1" ] || { echo "server never came up — start vLLM + tunnel on :8000, then re-run."; exit 1; }
 
+# ---- 1a. provenance: one line per run in the tracked manifest (spec §0) ----
+python3 "$REPO/integrations/run_provenance.py" "$HARNESS/run_manifest.jsonl" runner=run_25cell_retrieval seeds="$SEEDS" arms="${ARMS[*]}" config="$HARNESS/config_arm_${ARMS[0]}.json"
+
 # ---- 1b. gold computed ONCE up front, reused by every arm (deterministic) ----
 echo "=== precomputing gold cache -> $GOLD_CACHE ==="
 python "$HARNESS/precompute_gold_multi.py" --structures-dir "$HARNESS/fixtures_multi" --vmd "$VMD" --out "$GOLD_CACHE" \

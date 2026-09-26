@@ -49,8 +49,6 @@ done
 # ---- provenance: record which CODE + SETTINGS produced this run ----
 # Results/logs are gitignored (large, derived), but this one-line-per-run manifest is TRACKED so
 # every RUN maps back to the exact commit, model, tier and knobs. Lives next to the harness.
-_sha=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo nogit)
-_desc=$(git -C "$REPO" describe --tags --always --dirty 2>/dev/null || echo -)
 _model=$(curl -s "$ENDPOINT" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null || echo unknown)
 
 # ---- guard: served model must match the size token in RUN ----
@@ -67,17 +65,7 @@ if [ -n "$_want" ] && ! printf '%s' "$_model" | grep -iq "$_want"; then
 fi
 
 _tier=$([ -n "${HARD:-}" ] && echo hard || echo easy)
-_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo -)
-python3 - "$HARNESS/run_manifest.jsonl" "$_ts" "$RUN" "$_sha" "$_desc" "$_model" "$_tier" \
-         "$(basename "$FIXDIR")" "$SEEDS" "${CONC:-1}" "${ARMS[*]}" <<'PY'
-import sys, json
-path = sys.argv[1]
-rec = dict(zip(("ts","run","commit","describe","model","tier","fixtures","seeds","conc","arms"),
-               sys.argv[2:12]))
-with open(path, "a") as f:
-    f.write(json.dumps(rec) + "\n")
-print(f"== provenance -> {path}\n   {rec}")
-PY
+python3 "$REPO/integrations/run_provenance.py" "$HARNESS/run_manifest.jsonl" runner=run_atlas_parallel run="$RUN" model="$_model" tier="$_tier" fixtures="$(basename "$FIXDIR")" seeds="$SEEDS" conc="${CONC:-1}" arms="${ARMS[*]}" config="$HARNESS/config_arm_${ARMS[0]}.json"
 
 # ---- gold ONCE, shared by all arms (skip if cache already present) ----
 if [ -f "$GOLD_CACHE" ]; then

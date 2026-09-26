@@ -1,0 +1,39 @@
+# CI for the ChatVMD product suite (spec C9): proves tests/ is hermetic and that
+# S7 (options=None benchmark behaviour) holds on a clean machine with no
+# ~/.vmdai, VMD.app, keychain or tunnel.  vmdbench/ (needs VMD) and
+# integrations/ (needs the gitignored SciVisAgentBench checkout) are excluded.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # tclsh sources files in the system encoding; from plan 08 on, plugin Tcl
+      # files and op goldens carry UTF-8 literals, so pin a UTF-8 locale.
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Tcl 8.6
+        run: sudo apt-get update && sudo apt-get install -y tcl8.6
+      - name: Install pytest (no keyring, no Pillow, so the stdlib paths run)
+        run: python -m pip install pytest
+      - name: Run tests/
+        run: python -m pytest tests -q
