@@ -34,3 +34,9 @@ CAPABILITIES = {
 }
 
 CONVERSATION_MODES = ("local_first", "hybrid_resume", "resume_only")
+
+# Runtime RPC/auth protocol, reported in the READY line, /health and
+# runtime.info (§2c). 2 = launch token + tool.ack. It is separate from the
+# per-session event_protocol that session.start negotiates.
+RUNTIME_PROTOCOL = 2
+RUNTIME_VERSION = "0.3.0"

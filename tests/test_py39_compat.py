@@ -48,6 +48,7 @@ RUNTIME_MODULES: List[str] = [
     "vmd_ai_runtime.tool_bridge",
     "vmd_ai_runtime.wiki_bench",
     "vmd_ai_runtime.wiki_store",
+    "vmd_ai_runtime.launch",
 ]
 
 

@@ -1,9 +1,21 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+import re
+from typing import Any, Dict, Optional
 
 from .constants import CONVERSATION_MODES
 from .errors import RpcError
+
+# Chat ids are minted as chat_<12 hex> (store.py). Anything else is refused
+# before it can reach a filesystem path (§2e Input validation).
+CHAT_ID_RE = re.compile(r"chat_[0-9a-f]{12}")
+
+# Display-event protocols a client may ask for in session.start (§2c).
+EVENT_PROTOCOLS = (1, 2)
+
+# session.start vmd_env (C6): at most these four string fields, 64 chars each.
+VMD_ENV_KEYS = ("vmd_version", "arch", "tcl_patchlevel", "tk_patchlevel")
+VMD_ENV_MAX_CHARS = 64
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
@@ -35,6 +47,32 @@ def _as_int(value: Any, field: str, minimum: int = 0, default: int = 0) -> int:
     return out
 
 
+def _as_chat_id(value: Any, field: str = "chat_id", required: bool = True) -> str:
+    text = _as_str(value, field, required=required)
+    if text and CHAT_ID_RE.fullmatch(text) is None:
+        raise RpcError(
+            "INVALID_PARAMS",
+            f"{field} is invalid",
+            {"pattern": "^chat_[0-9a-f]{12}$"},
+        )
+    return text
+
+
+def _sanitize_vmd_env(value: Any) -> Optional[Dict[str, str]]:
+    """Keep the four known vmd_env fields as strings of at most 64 chars (C6)."""
+    if not isinstance(value, dict):
+        return None
+    out: Dict[str, str] = {}
+    for key in VMD_ENV_KEYS:
+        raw = value.get(key)
+        if raw is None or isinstance(raw, (dict, list, tuple, bool)):
+            continue
+        text = str(raw).strip()[:VMD_ENV_MAX_CHARS]
+        if text:
+            out[key] = text
+    return out or None
+
+
 def validate_rpc_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     body = _as_dict(payload)
     method = _as_str(body.get("method"), "method")
@@ -47,12 +85,32 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
     p = _as_dict(params)
 
     if method == "session.start":
-        return {
+        out = {
             "cwd": _as_str(p.get("cwd") or ".", "cwd", required=False) or ".",
             "ui_mode": _as_str(p.get("ui_mode") or "qt", "ui_mode", required=False) or "qt",
             "client_version": _as_str(p.get("client_version") or "dev", "client_version", required=False) or "dev",
             "platform": _as_str(p.get("platform") or "unknown", "platform", required=False) or "unknown",
         }
+        # New params are passed through only when present, so a tokenless
+        # client gets exactly today's dict.
+        if p.get("launch_token") not in (None, ""):
+            out["launch_token"] = _as_str(p.get("launch_token"), "launch_token")
+        if p.get("event_protocol") is not None:
+            event_protocol = _as_int(p.get("event_protocol"), "event_protocol", minimum=1)
+            if event_protocol not in EVENT_PROTOCOLS:
+                raise RpcError(
+                    "INVALID_PARAMS",
+                    "event_protocol must be 1 or 2",
+                    {"allowed": list(EVENT_PROTOCOLS)},
+                )
+            out["event_protocol"] = event_protocol
+        vmd_env = _sanitize_vmd_env(p.get("vmd_env"))
+        if vmd_env is not None:
+            out["vmd_env"] = vmd_env
+        return out
+
+    if method == "runtime.shutdown":
+        return {"launch_token": _as_str(p.get("launch_token"), "launch_token")}
 
     if method == "session.stop":
         return {"session_id": _as_str(p.get("session_id"), "session_id")}
@@ -63,7 +121,7 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
             raise RpcError("INVALID_PARAMS", "conversation_mode is invalid", {"allowed": list(CONVERSATION_MODES)})
         return {
             "session_id": _as_str(p.get("session_id"), "session_id"),
-            "chat_id": _as_str(p.get("chat_id"), "chat_id", required=False),
+            "chat_id": _as_chat_id(p.get("chat_id"), "chat_id", required=False),
             "text": _as_str(p.get("text"), "text"),
             "model": _as_str(p.get("model") or "", "model", required=False),
             "mode": _as_str(p.get("mode") or "work", "mode", required=False),
@@ -93,14 +151,14 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
     if method == "chat.history.get":
         return {
             "session_id": _as_str(p.get("session_id"), "session_id"),
-            "chat_id": _as_str(p.get("chat_id"), "chat_id"),
+            "chat_id": _as_chat_id(p.get("chat_id"), "chat_id"),
             "limit": _as_int(p.get("limit"), "limit", minimum=1, default=200),
         }
 
     if method == "chat.resume":
         return {
             "session_id": _as_str(p.get("session_id"), "session_id"),
-            "chat_id": _as_str(p.get("chat_id"), "chat_id"),
+            "chat_id": _as_chat_id(p.get("chat_id"), "chat_id"),
         }
 
     if method == "settings.get":

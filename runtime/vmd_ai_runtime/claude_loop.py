@@ -15,14 +15,21 @@ No external SDK is required — all API calls use stdlib urllib.
 from __future__ import annotations
 
 import base64
+import copy
+import dataclasses
+import http.client
 import json
 import logging
+import math
 import os
 import re
+import socket
 import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .provider import (
@@ -42,6 +49,137 @@ from .wiki_store import (
 )
 
 logger = logging.getLogger("vmdai.claude_loop")
+
+# ---------------------------------------------------------------------------
+# Loop options (per profile) and run context (per request): §2a
+# ---------------------------------------------------------------------------
+# options=None and ctx=None keep today's behaviour byte-for-byte (S7). Every
+# behaviour change sits behind a LoopOptions field whose default is today's
+# behaviour; LoopOptions.product(profile) is the ChatVMD preset.
+
+_OLLAMA_PROVIDER_NAMES = ("ollama", "local-ollama", "local_ollama")
+_ANTHROPIC_IMAGE_PROVIDERS = (
+    "anthropic-direct", "anthropic_api", "anthropic-direct-api", "openrouter",
+)
+PRODUCT_OLLAMA_NUM_CTX = 32768        # C7: used when an Ollama profile sets none
+PRODUCT_FIRST_BYTE_TIMEOUT_S = 120.0
+LOCAL_IMAGE_MAX_EDGE = 1024
+ANTHROPIC_IMAGE_MAX_EDGE = 1568
+
+
+@dataclass
+class LoopOptions:
+    """Behaviour flags for one ClaudeToolLoop.
+
+    ``LoopOptions()`` is today's behaviour. The field names are also the
+    keys of a profile's ``options`` in ~/.vmdai/settings.json (§2f), and
+    every field is JSON-serialisable (C6 records ``to_dict()``).
+    """
+
+    num_ctx: Optional[int] = None
+    think: Optional[Any] = None
+    keep_alive: Optional[Any] = None
+    extra_body: Optional[Dict[str, Any]] = None
+    include_usage: bool = False
+    base_url: Optional[str] = None
+    temperature: Optional[float] = None
+    seed: Optional[int] = None
+    context_length: Optional[int] = None
+    connect_retries: Optional[int] = None
+    classify_unreachable: bool = False
+    classify_errors: bool = False
+    preflight: bool = False
+    first_byte_timeout_s: Optional[float] = None
+    cancellable_backoff: bool = False
+    report_cancelled: bool = False
+    turn_retry: int = 0
+    raise_stream_errors: bool = False
+    guard_truncation: bool = False
+    compact_in_run: bool = False
+    rescue: str = "all"
+    tool_overrides: Optional[Dict[str, str]] = None
+    supports_vision: Optional[Any] = None
+    image_max_edge: Optional[int] = None
+    ollama_tool_name: bool = False
+    max_turns: int = 28
+    loop_guard: bool = False
+    result_format: str = "legacy"
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> "LoopOptions":
+        """Build from a dict; unknown keys (a newer settings.json) are ignored."""
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in dict(d or {}).items() if k in known})
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def product(cls, profile: Dict[str, Any], *, max_turns: int = 28) -> "LoopOptions":
+        """The ChatVMD preset for ``profile`` ({provider, model, base_url?, options?}).
+
+        The profile's ``options`` override the preset key by key (unknown
+        keys are ignored). ``max_turns`` always comes from the setting.
+        """
+        profile = dict(profile or {})
+        provider = str(profile.get("provider") or "").strip().lower()
+        is_ollama = provider in _OLLAMA_PROVIDER_NAMES
+        preset: Dict[str, Any] = {
+            "connect_retries": 0 if is_ollama else 1,
+            "classify_unreachable": True,
+            "classify_errors": True,
+            "cancellable_backoff": True,
+            "report_cancelled": True,
+            "turn_retry": 1,
+            "raise_stream_errors": True,
+            "guard_truncation": True,
+            "compact_in_run": True,
+            "rescue": "json",
+            "supports_vision": False if provider == "openai-compatible" else "auto",
+            "image_max_edge": (
+                ANTHROPIC_IMAGE_MAX_EDGE
+                if provider in _ANTHROPIC_IMAGE_PROVIDERS
+                else LOCAL_IMAGE_MAX_EDGE
+            ),
+            "loop_guard": True,
+            "result_format": "structured",
+        }
+        if is_ollama:
+            preset.update({
+                "num_ctx": PRODUCT_OLLAMA_NUM_CTX,
+                "preflight": True,
+                "first_byte_timeout_s": PRODUCT_FIRST_BYTE_TIMEOUT_S,
+                "ollama_tool_name": True,
+            })
+        if profile.get("base_url"):
+            preset["base_url"] = str(profile["base_url"])
+        overrides = profile.get("options")
+        if isinstance(overrides, dict):
+            known = {f.name for f in dataclasses.fields(cls)}
+            for key, value in overrides.items():
+                if key not in known or key == "max_turns":
+                    continue
+                if key == "num_ctx" and value is None:
+                    continue
+                preset[key] = value
+        preset["max_turns"] = int(max_turns)
+        return cls(**preset)
+
+
+@dataclass
+class RunContext:
+    """Per-request identity and sinks for ClaudeToolLoop.run (§2a)."""
+
+    request_id: str
+    chat_id: str
+    on_event: Optional[Callable[[Dict[str, Any]], None]] = None
+    messages_out: Optional[Any] = None
+
+
+# Streamer→loop meta kinds that the loop consumes itself; they are never
+# forwarded to on_event (stop_reason: P02-T07, rescued: P02-T08,
+# model_digest: plan 04).
+_LOOP_ONLY_META = frozenset({"stop_reason", "rescued", "model_digest"})
 
 # Backoff sleeps in _stream_request go through this hook (spec §2a). It is
 # the only thing tests patch; production behaviour is exactly time.sleep.
@@ -474,20 +612,137 @@ def _retry_after_seconds(exc: urllib.error.HTTPError) -> Optional[float]:
 
 # Status codes worth retrying: 429 rate limit, transient server overload.
 _RETRY_STATUS = {429, 500, 502, 503, 529}
+_HTTP_MAX_RETRIES = 5
+_BACKOFF_SLICE_S = 0.1
 
 
-def _stream_request(req: urllib.request.Request, timeout: int, max_retries: int = 5):
+class RunCancelled(Exception):
+    """Stop was pressed while the loop waited in a backoff.
+
+    Raised only with ``opts.cancellable_backoff``; run() turns it into
+    status ``cancelled`` (§5 "Stop during backoff or streaming").
+    """
+
+
+def _status_message(http_status: Optional[int]) -> str:
+    if http_status is None:
+        return "Network error"
+    if http_status == 429:
+        return "Rate limited"
+    if http_status == 529:
+        return "Overloaded"
+    return f"Server error (HTTP {http_status})"
+
+
+def _retry_status(
+    on_meta: Optional[Callable[[Dict[str, Any]], None]],
+    attempt: int,
+    max_attempts: int,
+    wait: float,
+    http_status: Optional[int],
+) -> None:
+    """Tell the loop a retry is coming (the panel shows "Retrying 2/5 in 8 s")."""
+    if on_meta is None:
+        return
+    try:
+        on_meta({
+            "kind": "status",
+            "phase": "retrying",
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "wait_s": wait,
+            "http_status": http_status,
+            "message": _status_message(http_status),
+        })
+    except Exception:
+        logger.debug("on_meta status callback failed", exc_info=True)
+
+
+def _cancellable_sleep(seconds: float, should_cancel: Optional[Callable[[], bool]]) -> None:
+    """Sleep in 0.1 s slices through ``_sleep``; raise RunCancelled on Stop."""
+    total = max(0.0, float(seconds))
+    slices = int(math.ceil(total / _BACKOFF_SLICE_S - 1e-9))
+    for index in range(slices):
+        if should_cancel is not None and should_cancel():
+            raise RunCancelled("cancelled during backoff")
+        _sleep(min(_BACKOFF_SLICE_S, total - index * _BACKOFF_SLICE_S))
+    if should_cancel is not None and should_cancel():
+        raise RunCancelled("cancelled during backoff")
+
+
+def _backoff_sleep(seconds: float, opts: Optional[LoopOptions],
+                   should_cancel: Optional[Callable[[], bool]]) -> None:
+    if opts is not None and opts.cancellable_backoff:
+        _cancellable_sleep(seconds, should_cancel)
+    else:
+        _sleep(seconds)
+
+
+def _classify_http_error(code: int, detail: str) -> "ClaudeLoopError":
+    """Map a non-retried HTTP error to its ClaudeLoopError class (§2f, §5).
+
+    The message is exactly the unclassified one, so logs and tracebacks
+    read the same with and without ``classify_errors``.
+    """
+    message = f"API error HTTP {code}: {detail}"
+    lowered = str(detail or "").lower()
+    if code == 402 or "credit balance" in lowered:
+        return ProviderBillingError(
+            message, hint="Add credits, or switch to another profile.", http_status=code)
+    if code in (401, 403):
+        return ProviderAuthError(
+            message, hint="Check the API key in Settings.", http_status=code)
+    if code == 404:
+        return ModelNotFoundError(
+            message, hint="Choose a model this server provides.", http_status=code)
+    return ClaudeLoopError(message, http_status=code)
+
+
+def _set_read_timeout(resp: Any, timeout: float) -> None:
+    """Best effort: once the first byte has arrived, reads use the per-read timeout."""
+    try:
+        resp.fp.raw._sock.settimeout(timeout)
+    except Exception:
+        pass
+
+
+def _stream_request(
+    req: urllib.request.Request,
+    timeout: int,
+    max_retries: int = 5,
+    *,
+    opts: Optional[LoopOptions] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    on_meta: Optional[Callable[[Dict[str, Any]], None]] = None,
+):
     """Open the request and surface HTTP errors as ClaudeLoopError.
 
     Retries on rate-limit (429) and transient overload (5xx) with backoff,
     honoring the server's Retry-After header when present. This keeps a single
     throttle from killing a whole multi-turn agentic run. Returns the response
     context manager — the caller is responsible for closing it (use ``with``).
+
+    ``opts`` (None on the benchmark path, which behaves exactly as before):
+      * ``connect_retries`` caps the retries on network errors;
+      * ``cancellable_backoff`` sleeps in 0.1 s slices and raises
+        RunCancelled when ``should_cancel()`` turns true;
+      * ``classify_errors`` raises the ClaudeLoopError subclasses;
+      * ``first_byte_timeout_s`` is the timeout until the response opens.
+    ``on_meta`` receives a ``status`` item before each retry wait.
     """
+    open_timeout = timeout
+    if opts is not None and opts.first_byte_timeout_s:
+        open_timeout = float(opts.first_byte_timeout_s)
+    net_limit = max_retries
+    if opts is not None and opts.connect_retries is not None:
+        net_limit = int(opts.connect_retries)
     attempt = 0
     while True:
         try:
-            return urllib.request.urlopen(req, timeout=timeout)
+            resp = urllib.request.urlopen(req, timeout=open_timeout)
+            if open_timeout != timeout:
+                _set_read_timeout(resp, timeout)
+            return resp
         except urllib.error.HTTPError as exc:
             if exc.code in _RETRY_STATUS and attempt < max_retries:
                 attempt += 1
@@ -498,7 +753,8 @@ def _stream_request(req: urllib.request.Request, timeout: int, max_retries: int 
                     "API HTTP %s; backing off %.1fs then retrying (%d/%d)",
                     exc.code, wait, attempt, max_retries,
                 )
-                _sleep(wait)
+                _retry_status(on_meta, attempt, max_retries, wait, exc.code)
+                _backoff_sleep(wait, opts, should_cancel)
                 continue
             body_bytes = b""
             try:
@@ -519,19 +775,35 @@ def _stream_request(req: urllib.request.Request, timeout: int, max_retries: int 
                     detail = _j.get("message", "") or str(_j)[:500]
             except Exception:
                 detail = body_bytes.decode("utf-8", errors="replace")[:500]
+            if opts is not None and opts.classify_errors:
+                raise _classify_http_error(exc.code, detail) from exc
             raise ClaudeLoopError(
                 f"API error HTTP {exc.code}: {detail}"
             ) from exc
         except urllib.error.URLError as exc:
             # Transient network blip (DNS, reset): a couple of retries.
-            if attempt < max_retries:
+            if attempt < net_limit:
                 attempt += 1
                 wait = min(30.0, 2.0 ** attempt)
                 logger.warning("network error (%s); retry %d/%d in %.1fs",
-                               exc, attempt, max_retries, wait)
-                _sleep(wait)
+                               exc, attempt, net_limit, wait)
+                _retry_status(on_meta, attempt, net_limit, wait, None)
+                _backoff_sleep(wait, opts, should_cancel)
                 continue
             raise ClaudeLoopError(f"network error: {exc}") from exc
+
+
+def _open_stream(
+    req: urllib.request.Request,
+    timeout: int,
+    opts: Optional[LoopOptions],
+    should_cancel: Optional[Callable[[], bool]],
+    on_meta: Optional[Callable[[Dict[str, Any]], None]],
+):
+    """Open a provider request. With ``opts=None`` this is exactly the old call."""
+    if opts is None:
+        return _stream_request(req, timeout)
+    return _stream_request(req, timeout, opts=opts, should_cancel=should_cancel, on_meta=on_meta)
 
 
 def _stream_anthropic_direct(
@@ -543,6 +815,10 @@ def _stream_anthropic_direct(
     on_text: Callable[[str], None],
     should_cancel: Callable[[], bool],
     tools: Optional[List[Dict[str, Any]]] = None,
+    *,
+    on_meta: Optional[Callable[[Dict[str, Any]], None]] = None,
+    opts: Optional[LoopOptions] = None,
+    tool_mode: Optional[str] = None,
 ) -> Tuple[str, List[Dict]]:
     """Stream a turn from Anthropic Messages API; return (text, tool_blocks).
 
@@ -577,11 +853,43 @@ def _stream_anthropic_direct(
         method="POST",
     )
 
+    if opts is None or not opts.raise_stream_errors:
+        return _anthropic_consume(req, timeout, on_text, should_cancel, on_meta, opts)
+    attempt = 0
+    while True:
+        try:
+            return _anthropic_consume(req, timeout, on_text, should_cancel, on_meta, opts)
+        except _SseOverloaded as exc:
+            # An SSE overloaded_error before any output counts as HTTP 529 (§5).
+            if attempt >= _HTTP_MAX_RETRIES:
+                raise ClaudeLoopError(f"API error HTTP 529: {exc}", http_status=529) from exc
+            attempt += 1
+            wait = min(60.0, 2.0 ** attempt)
+            logger.warning("SSE overloaded_error; backing off %.1fs then retrying (%d/%d)",
+                           wait, attempt, _HTTP_MAX_RETRIES)
+            _retry_status(on_meta, attempt, _HTTP_MAX_RETRIES, wait, 529)
+            _backoff_sleep(wait, opts, should_cancel)
+
+
+class _SseOverloaded(Exception):
+    """An Anthropic SSE ``overloaded_error`` that arrived before any output."""
+
+
+def _anthropic_consume(
+    req: urllib.request.Request,
+    timeout: int,
+    on_text: Callable[[str], None],
+    should_cancel: Callable[[], bool],
+    on_meta: Optional[Callable[[Dict[str, Any]], None]],
+    opts: Optional[LoopOptions],
+) -> Tuple[str, List[Dict]]:
+    """Open one Anthropic request and consume its SSE stream."""
     text_parts: List[str] = []
     blocks_in_progress: Dict[int, Dict[str, Any]] = {}
     final_tool_blocks: List[Dict[str, Any]] = []
+    raise_errors = opts is not None and opts.raise_stream_errors
 
-    with _stream_request(req, timeout) as resp:
+    with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
         for event in _iter_sse_events(resp):
             if event is _DONE_SENTINEL:
                 break
@@ -629,6 +937,22 @@ def _stream_anthropic_direct(
                     final_tool_blocks.append(block)
                 continue
 
+            if etype == "message_delta":
+                if on_meta is not None:
+                    reason = (event.get("delta") or {}).get("stop_reason")
+                    if reason:
+                        on_meta({"kind": "stop_reason", "value": str(reason)})
+                continue
+
+            if etype == "error" and raise_errors:
+                err = event.get("error") or {}
+                err_type = str(err.get("type") or "")
+                message = str(err.get("message") or err_type or "stream error")
+                if (err_type == "overloaded_error" and not text_parts
+                        and not final_tool_blocks and not blocks_in_progress):
+                    raise _SseOverloaded(message)
+                raise ClaudeLoopError(f"API stream error: {message}")
+
             if etype == "message_stop":
                 break
 
@@ -644,6 +968,10 @@ def _stream_openrouter(
     on_text: Callable[[str], None],
     should_cancel: Callable[[], bool],
     tools: Optional[List[Dict[str, Any]]] = None,
+    *,
+    on_meta: Optional[Callable[[Dict[str, Any]], None]] = None,
+    opts: Optional[LoopOptions] = None,
+    tool_mode: Optional[str] = None,
 ) -> Tuple[str, List[Dict]]:
     """Stream a turn from OpenRouter / OpenAI-style chat completions."""
     or_messages = []
@@ -682,7 +1010,7 @@ def _stream_openrouter(
     # as small string fragments we have to concatenate before json.loads.
     tool_calls_acc: Dict[int, Dict[str, Any]] = {}
 
-    with _stream_request(req, timeout) as resp:
+    with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
         for event in _iter_sse_events(resp):
             if event is _DONE_SENTINEL:
                 break
@@ -692,6 +1020,10 @@ def _stream_openrouter(
             choices = event.get("choices") or []
             if not choices:
                 continue
+            if on_meta is not None:
+                finish = (choices[0] or {}).get("finish_reason")
+                if finish:
+                    on_meta({"kind": "stop_reason", "value": str(finish)})
             delta = (choices[0] or {}).get("delta") or {}
 
             content = delta.get("content")
@@ -901,6 +1233,7 @@ _FENCED_TCL_RE = re.compile(
 def _rescue_json_tool_calls(
     text: str,
     allowed_names: set,
+    mode: str = "all",
 ) -> List[Dict[str, Any]]:
     """Recover tool calls that small Ollama models pasted into the text body.
 
@@ -931,11 +1264,17 @@ def _rescue_json_tool_calls(
        don't fire on Python/shell snippets the model might paste for
        illustration.
 
+    ``mode`` (§2f Rescue): ``"all"`` runs both passes (today's behaviour,
+    the options=None default); ``"json"`` runs pass 1 only, so a ```tcl
+    block in prose never runs (S12); anything else (``"off"``) rescues
+    nothing.
+
     Returns the list of synthesized tool_use blocks (empty if none).
     Conservative on purpose: we'd rather miss a rescue than fire on
     unrelated content.
     """
-    if not text or not allowed_names:
+    mode = str(mode or "all").strip().lower()
+    if not text or not allowed_names or mode not in ("all", "json"):
         return []
 
     # ---- Pass 1: JSON-shaped tool calls -----------------------------
@@ -1030,7 +1369,10 @@ def _rescue_json_tool_calls(
     # qwen2.5-coder and similar code-tuned local models often dodge the
     # tool schema entirely and emit "here's the Tcl I'd run" in a
     # fenced ```tcl block. Treat that as an implicit run_vmd_command
-    # invocation when the model was offered that tool.
+    # invocation when the model was offered that tool. Only in "all"
+    # mode: the product ("json") never runs Tcl written in prose.
+    if mode != "all":
+        return []
     if "run_vmd_command" not in allowed_names:
         return []
 
@@ -1063,6 +1405,10 @@ def _stream_ollama(
     on_text: Callable[[str], None],
     should_cancel: Callable[[], bool],
     tools: Optional[List[Dict[str, Any]]] = None,
+    *,
+    on_meta: Optional[Callable[[Dict[str, Any]], None]] = None,
+    opts: Optional[LoopOptions] = None,
+    tool_mode: Optional[str] = None,
 ) -> Tuple[str, List[Dict]]:
     """Stream one turn from Ollama's ``/api/chat`` with tool support.
 
@@ -1127,7 +1473,7 @@ def _stream_ollama(
     tool_call_counter = 0
 
     try:
-        with _stream_request(req, timeout) as resp:
+        with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
             for event in _iter_ndjson_events(resp):
                 if should_cancel():
                     break
@@ -1160,8 +1506,11 @@ def _stream_ollama(
                         "input": args,
                     })
                 if event.get("done"):
+                    if on_meta is not None:
+                        on_meta({"kind": "stop_reason",
+                                 "value": str(event.get("done_reason") or "stop")})
                     break
-    except ClaudeLoopError:
+    except (ClaudeLoopError, RunCancelled):
         raise
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -1191,9 +1540,11 @@ def _stream_ollama(
     # JSON-in-content rescue: if the model didn't emit structured
     # tool_calls but pasted a tool-call-shaped JSON into the text body,
     # synthesize tool_use blocks from it. See _rescue_json_tool_calls.
-    if not final_tool_blocks and text:
+    # Rescue mode (§2f): options=None keeps "all"; the product uses "json".
+    rescue_mode = opts.rescue if opts is not None else "all"
+    if not final_tool_blocks and text and rescue_mode != "off":
         allowed = {str(t.get("name") or "") for t in tools_list if t.get("name")}
-        rescued = _rescue_json_tool_calls(text, allowed)
+        rescued = _rescue_json_tool_calls(text, allowed, mode=rescue_mode)
         if rescued:
             for block in rescued:
                 if not block.get("id"):
@@ -1204,6 +1555,9 @@ def _stream_ollama(
                 "ollama: rescued %d tool call(s) from JSON-in-content "
                 "(model=%s)", len(rescued), model,
             )
+            if on_meta is not None:
+                # The loop marks these calls origin "rescued" (§2c).
+                on_meta({"kind": "rescued", "ids": [str(b["id"]) for b in rescued]})
             # Drop the JSON text from history so the model doesn't learn
             # to repeat the pattern on the next turn. The UI already
             # received it via on_text — we just don't persist it.
@@ -1298,7 +1652,69 @@ def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
 # ---------------------------------------------------------------------------
 
 class ClaudeLoopError(RuntimeError):
-    pass
+    """A loop failure.
+
+    ``code`` is the error-event code (§2f): ``other`` here, and
+    ``unreachable``/``auth``/``billing``/``model_not_found`` on the
+    subclasses, which the loop raises only when ``options.classify_errors``
+    (or ``classify_unreachable``) is on. The message text never changes, so
+    existing ``except ClaudeLoopError`` handlers keep working.
+    """
+
+    code = "other"
+
+    def __init__(self, message: str = "", *, hint: str = "",
+                 http_status: Optional[int] = None):
+        super().__init__(message)
+        self.hint = str(hint or "")
+        self.http_status = http_status
+
+
+class ProviderUnreachableError(ClaudeLoopError):
+    code = "unreachable"
+
+
+class ProviderAuthError(ClaudeLoopError):
+    code = "auth"
+
+
+class ProviderBillingError(ClaudeLoopError):
+    code = "billing"
+
+
+class ModelNotFoundError(ClaudeLoopError):
+    code = "model_not_found"
+
+
+# guard_truncation (§2a, §5): tool calls from a turn cut off by the output
+# token limit are not run; each gets this error result instead.
+TRUNCATED_TOOL_ERROR = (
+    "Not run: your reply hit the output token limit while writing this tool "
+    "call, so its arguments may be incomplete. Make a shorter call, or split "
+    "the work into smaller steps."
+)
+_TRUNCATED_STOP_REASONS = frozenset({"max_tokens", "length"})
+
+# Read errors after the response opened: a "stream drop" (§5).
+_STREAM_DROP_TYPES = (ConnectionError, http.client.IncompleteRead, socket.timeout)
+
+
+def _is_stream_drop(exc: BaseException) -> bool:
+    """True for a read error after the response opened (reset, closed, read timeout).
+
+    Opening errors (URLError), classified errors and Stop never count.
+    """
+    if isinstance(exc, (RunCancelled, urllib.error.URLError)):
+        return False
+    if isinstance(exc, ClaudeLoopError):
+        if exc.code != "other":
+            return False
+        candidate = exc.__cause__
+    else:
+        candidate = exc
+    if candidate is None or isinstance(candidate, urllib.error.URLError):
+        return False
+    return isinstance(candidate, _STREAM_DROP_TYPES)
 
 
 # ---------------------------------------------------------------------------
@@ -1356,6 +1772,80 @@ def _build_tool_result_block(
 
 
 # ---------------------------------------------------------------------------
+# Loop → app contract helpers (§2a call_key, §2b canonical copies, §2c)
+# ---------------------------------------------------------------------------
+
+# Tools the runtime answers itself (executor "runtime"); the rest go to Tcl.
+_RUNTIME_TOOLS = frozenset({
+    "search_docs", "wiki_list", "wiki_read", "wiki_update", "wiki_verify_pins",
+})
+
+
+def _mint_call_key() -> str:
+    """A fresh key for one tool execution: 12 hex characters (§2a).
+
+    It names the image and output files and forms the canonical id
+    ``call_<call_key>``; model ids (tc_0, otc_1) repeat across turns.
+    """
+    return uuid.uuid4().hex[:12]
+
+
+def _canonical_message(message: Dict[str, Any], call_keys: List[str]) -> Dict[str, Any]:
+    """Deep copy of ``message`` for messages_out (§2b Canonical copies).
+
+    The i-th tool_use ``id`` (assistant turn) or tool_result
+    ``tool_use_id`` (tool-results turn) becomes ``call_<call_keys[i]>``.
+    The in-run message is never modified.
+    """
+    out = copy.deepcopy(message)
+    content = out.get("content")
+    if not isinstance(content, list):
+        return out
+    index = 0
+    for block in content:
+        if not isinstance(block, dict) or index >= len(call_keys):
+            continue
+        if block.get("type") == "tool_use":
+            block["id"] = "call_" + call_keys[index]
+            index += 1
+        elif block.get("type") == "tool_result":
+            block["tool_use_id"] = "call_" + call_keys[index]
+            index += 1
+    return out
+
+
+def _tool_finished_meta(call_key: str, tool_name: str, executor: str,
+                        result: Dict[str, Any], duration_ms: float) -> Dict[str, Any]:
+    """``tool.finished`` metadata (§2c) from a bridge or runtime result dict.
+
+    Fields a bridge does not report yet (plan 05 adds them) default to
+    None; ``executed`` defaults to "yes" because the tool was dispatched.
+    """
+    output = str(result.get("output") or "")
+    output_bytes = result.get("output_bytes")
+    image = result.get("image")
+    return {
+        "kind": "tool.finished",
+        "call_key": call_key,
+        "tool_name": tool_name,
+        "executor": executor,
+        "ok": bool(result.get("ok", False)),
+        "executed": str(result.get("executed") or "yes"),
+        "output": output,
+        "error": str(result.get("error") or ""),
+        "truncated": bool(result.get("truncated", False)),
+        "duration_ms": int(round(duration_ms)),
+        "statements": result.get("statements"),
+        "blocked": result.get("blocked"),
+        "output_path": result.get("output_path"),
+        "output_bytes": int(output_bytes) if output_bytes is not None else len(output.encode("utf-8")),
+        "image": image if isinstance(image, dict) else None,
+        "saved_path": result.get("saved_path"),
+        "late": False,
+    }
+
+
+# ---------------------------------------------------------------------------
 # The Claude tool loop
 # ---------------------------------------------------------------------------
 
@@ -1377,6 +1867,7 @@ class ClaudeToolLoop:
         docs_search: Optional[Any] = None,
         recorder: Optional[RunRecorder] = None,
         wiki_store: Optional[WikiStore] = None,
+        options: Optional[LoopOptions] = None,
     ):
         self.provider_name = str(provider_name or "mock").lower()
         self.api_key = str(api_key or "")
@@ -1399,6 +1890,21 @@ class ClaudeToolLoop:
         # FIRST on most turns to look up prior knowledge before
         # rediscovering it from raw docs.
         self.wiki_store = wiki_store
+        # Behaviour flags (§2a). None keeps today's benchmark behaviour
+        # byte-for-byte; the product passes LoopOptions.product(profile).
+        self.options = options
+        # Per-request context: set at the start of run(), cleared in its finally.
+        self._ctx: Optional[RunContext] = None
+        # "none" only for C4's wrap-up call (plan 05); forwarded to the streamers.
+        self._tool_mode: Optional[str] = None
+        # 1-based turn number and the loop-only meta items of that turn.
+        self._turn = 0
+        self._turn_meta: Dict[str, Dict[str, Any]] = {}
+        # Outcome of the last run(); the app builds request.finished from it.
+        self.last_status: Optional[str] = None
+        self.last_turns = 0
+        self.last_tool_calls = 0
+        self.last_final_text_empty = False
 
     @property
     def _is_anthropic_direct(self) -> bool:
@@ -1668,8 +2174,19 @@ class ClaudeToolLoop:
         the UI sees real-time output instead of a buffered turn split into
         fake "chunks". Tool-use blocks are returned at end-of-turn so the
         caller can dispatch them in stable order.
+
+        With ``self.options`` set the streamers also receive ``on_meta``
+        (streamer→loop callback), ``opts`` and ``tool_mode``; with
+        ``options=None`` they are called exactly as before (S7).
         """
         tools = self._tools_for_turn()
+        extra: Dict[str, Any] = {}
+        if self.options is not None:
+            extra = {
+                "on_meta": self._on_meta,
+                "opts": self.options,
+                "tool_mode": self._tool_mode,
+            }
         if self._is_anthropic_direct:
             return _stream_anthropic_direct(
                 messages=messages,
@@ -1680,6 +2197,7 @@ class ClaudeToolLoop:
                 on_text=on_text,
                 should_cancel=should_cancel,
                 tools=tools,
+                **extra,
             )
         if self._is_ollama:
             # For Ollama, ``api_key`` is repurposed to hold the base URL
@@ -1694,6 +2212,7 @@ class ClaudeToolLoop:
                 on_text=on_text,
                 should_cancel=should_cancel,
                 tools=tools,
+                **extra,
             )
         return _stream_openrouter(
             messages=messages,
@@ -1704,7 +2223,241 @@ class ClaudeToolLoop:
             on_text=on_text,
             should_cancel=should_cancel,
             tools=tools,
+            **extra,
         )
+
+    def _on_meta(self, item: Dict[str, Any]) -> None:
+        """Streamer→loop callback, wired only when ``options`` is set.
+
+        Loop-only kinds (stop_reason, rescued, model_digest) are kept in
+        ``self._turn_meta`` for this turn. ``reasoning`` becomes a reasoning
+        chunk event; every other item (status, usage) becomes a
+        ``system/state`` event carrying the item plus request_id and turn.
+        """
+        if not isinstance(item, dict):
+            return
+        kind = str(item.get("kind") or "")
+        if kind in _LOOP_ONLY_META:
+            self._turn_meta[kind] = dict(item)
+            return
+        if kind == "reasoning":
+            self._emit("reasoning", "chunk", str(item.get("text") or ""))
+            return
+        self._emit("system", "state", "", dict(item))
+
+    def _emit(self, role: str, type: str, text: str = "",
+              metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Send one ``{role, type, text, metadata}`` item to ctx.on_event.
+
+        The metadata gains ``request_id`` and ``turn``. A failing sink is
+        logged and never breaks the run. No ctx or no on_event: no-op.
+        """
+        ctx = self._ctx
+        if ctx is None or ctx.on_event is None:
+            return
+        meta = dict(metadata or {})
+        meta.setdefault("request_id", ctx.request_id)
+        if self._turn:
+            meta.setdefault("turn", self._turn)
+        try:
+            ctx.on_event({"role": role, "type": type, "text": str(text or ""), "metadata": meta})
+        except Exception:
+            logger.warning("on_event sink failed", exc_info=True)
+
+    def _call_turn(
+        self,
+        messages: List[Dict],
+        system_prompt: str,
+        on_text: Callable[[str], None],
+        cancel_event: threading.Event,
+    ) -> Tuple[str, List[Dict]]:
+        """One model call, retried ``options.turn_retry`` times after a stream drop.
+
+        The retry repeats only the model call with the same messages, so a
+        tool that already ran is never run again. Each retry emits
+        ``turn.retry`` so the panel discards the partial block (§2c).
+        """
+        retries_left = self.options.turn_retry if self.options is not None else 0
+        while True:
+            try:
+                return self._call(
+                    messages,
+                    system_prompt,
+                    on_text=on_text,
+                    should_cancel=cancel_event.is_set,
+                )
+            except Exception as exc:
+                if retries_left <= 0 or cancel_event.is_set() or not _is_stream_drop(exc):
+                    raise
+                retries_left -= 1
+                logger.warning("stream dropped on turn %d (%s); retrying the turn",
+                               self._turn, exc)
+                self._turn_meta = {}
+                self._emit("system", "state", "",
+                           {"kind": "turn.retry", "reason": "stream dropped"})
+
+    def _turn_truncated(self) -> bool:
+        """True when guard_truncation is on and this turn hit the token limit."""
+        if self.options is None or not self.options.guard_truncation:
+            return False
+        item = self._turn_meta.get("stop_reason") or {}
+        return str(item.get("value") or "") in _TRUNCATED_STOP_REASONS
+
+    def _text_sink(self, on_chunk: Callable[[str], None]) -> Callable[[str], None]:
+        """on_chunk, plus an ``assistant/chunk`` event when ctx.on_event is set."""
+        ctx = self._ctx
+        if ctx is None or ctx.on_event is None:
+            return on_chunk
+
+        def _sink(chunk: str) -> None:
+            on_chunk(chunk)
+            self._emit("assistant", "chunk", chunk)
+
+        return _sink
+
+    def _out(self, message: Dict[str, Any]) -> None:
+        """Append a deep copy of ``message`` to ctx.messages_out, if any."""
+        ctx = self._ctx
+        if ctx is None or ctx.messages_out is None:
+            return
+        try:
+            ctx.messages_out.append(copy.deepcopy(message))
+        except Exception:
+            logger.warning("messages_out append failed", exc_info=True)
+
+    def _finish_text_turn(self, text: str) -> None:
+        """Seal the run's last turn.
+
+        Its text goes to messages_out only; it is never part of a request
+        body, so the S7 golden requests do not change (§2b).
+        """
+        self.last_final_text_empty = not text
+        self._emit("assistant", "message", text, {"final": True})
+        if text:
+            self._out({"role": "assistant", "content": [{"type": "text", "text": text}]})
+
+    def _rescued_ids(self) -> set:
+        item = self._turn_meta.get("rescued") or {}
+        return {str(i) for i in (item.get("ids") or [])}
+
+    def _dispatch_tool(
+        self,
+        tool_bridge,
+        *,
+        session_id: str,
+        tool_id: str,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        session_queue,
+        cancel_event: threading.Event,
+        call_key: str,
+    ) -> Dict[str, Any]:
+        """Run one tool: runtime-resident tools here, everything else on the bridge."""
+        if tool_name == "search_docs":
+            # Python-resident tool — never round-trips to Tcl. Returned
+            # shape mirrors a Tcl tool result so the downstream
+            # tool_result builder doesn't need a special case.
+            return self._dispatch_search_docs(tool_input)
+        if tool_name == "wiki_list":
+            return self._dispatch_wiki_list(tool_input)
+        if tool_name == "wiki_read":
+            return self._dispatch_wiki_read(tool_input)
+        if tool_name == "wiki_update":
+            return self._dispatch_wiki_update(tool_input)
+        if tool_name == "wiki_verify_pins":
+            return self._dispatch_wiki_verify_pins(tool_input)
+        kwargs: Dict[str, Any] = {
+            "session_id": session_id,
+            "tool_call_id": tool_id,
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "session_queue": session_queue,
+            "cancel_event": cancel_event,
+        }
+        # Only a bridge whose *class* declares supports_call_meta = True gets
+        # the two new keywords. Reading the class, and requiring "is True",
+        # keeps __getattr__ wrappers and mocks on the six legacy keywords.
+        if getattr(type(tool_bridge), "supports_call_meta", False) is True:
+            kwargs["call_key"] = call_key
+            kwargs["request_id"] = self._ctx.request_id if self._ctx is not None else None
+        return tool_bridge.execute_tool(**kwargs)
+
+    def _run_tool_block(
+        self,
+        block: Dict[str, Any],
+        call_key: str,
+        *,
+        tool_bridge,
+        session_id: str,
+        session_queue,
+        cancel_event: threading.Event,
+        on_tool_start: Optional[Callable[[str, Dict], None]],
+        on_tool_result: Optional[Callable[[str, str, Dict], None]],
+        truncated: bool,
+        origin: str,
+    ) -> Dict[str, Any]:
+        """Execute one tool_use block and emit its tool.started/tool.finished pair."""
+        tool_name = str(block.get("name") or "")
+        tool_id = str(block.get("id") or "")
+        tool_input = block.get("input") or {}
+
+        if on_tool_start:
+            try:
+                on_tool_start(tool_name, tool_input)
+            except Exception:
+                pass
+
+        executor = "runtime" if tool_name in _RUNTIME_TOOLS else "tcl"
+        self._emit("system", "state", "", {
+            "kind": "tool.started",
+            "call_key": call_key,
+            "tool_call_id": tool_id,
+            "tool_name": tool_name,
+            "executor": executor,
+            "origin": origin,
+            "input": tool_input,
+        })
+        logger.info("executing tool=%s id=%s call_key=%s", tool_name, tool_id, call_key)
+
+        tool_t0 = time.perf_counter()
+        if truncated:
+            result: Dict[str, Any] = {"ok": False, "output": "",
+                                      "error": TRUNCATED_TOOL_ERROR, "executed": "no"}
+        else:
+            result = self._dispatch_tool(
+                tool_bridge,
+                session_id=session_id,
+                tool_id=tool_id,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                session_queue=session_queue,
+                cancel_event=cancel_event,
+                call_key=call_key,
+            )
+        tool_ms = (time.perf_counter() - tool_t0) * 1000.0
+        self.last_tool_calls += 1
+
+        # Mirror the result into the on-disk recorder so this chat.send
+        # produces a replayable transcript.tcl + snapshots/. Failed tools are
+        # counted in the manifest but never written to transcript.tcl; a
+        # guarded (truncated) call never ran, so it is not recorded at all.
+        if not truncated:
+            self._recorder_record(
+                tool_name=tool_name,
+                tool_input=tool_input,
+                result=result,
+                duration_ms=tool_ms,
+            )
+
+        if on_tool_result:
+            try:
+                on_tool_result(tool_id, tool_name, result)
+            except Exception:
+                pass
+
+        self._emit("system", "state", "",
+                   _tool_finished_meta(call_key, tool_name, executor, result, tool_ms))
+        return result
 
     def run(
         self,
@@ -1718,6 +2471,7 @@ class ClaudeToolLoop:
         on_tool_start: Optional[Callable[[str, Dict], None]] = None,
         on_tool_result: Optional[Callable[[str, str, Dict], None]] = None,
         prior_messages: Optional[List[Dict]] = None,
+        ctx: Optional[RunContext] = None,
     ) -> str:
         """
         Run a full multi-turn tool-calling session.
@@ -1727,8 +2481,14 @@ class ClaudeToolLoop:
         on_tool_result(id, name, result_dict) called after tool returns
         prior_messages              optional conversation history from a
                                     resumed chat (Anthropic-style format)
+        ctx                         optional RunContext: request_id and
+                                    chat_id, on_event (loop events, §2c) and
+                                    messages_out (canonical copies, §2b).
+                                    None keeps today's behaviour.
 
-        Returns the final assistant text.
+        Returns the final assistant text. The outcome is also left on
+        ``last_status`` ('complete' | 'cancelled' | 'error' | 'max_turns'),
+        ``last_turns``, ``last_tool_calls`` and ``last_final_text_empty``.
         """
         # Conversation history maintained in Anthropic-style format internally.
         # If resuming a prior chat, inject the history before the new prompt.
@@ -1745,33 +2505,49 @@ class ClaudeToolLoop:
         if self.wiki_store is not None:
             system_prompt = system_prompt + WIKI_SYSTEM_PROMPT_ADDENDUM
 
+        self._ctx = ctx
+        self._turn = 0
+        self._turn_meta = {}
+        self.last_status = None
+        self.last_turns = 0
+        self.last_tool_calls = 0
+        self.last_final_text_empty = True
+        opts = self.options
+        max_turns = opts.max_turns if opts is not None else self.MAX_TURNS
+        on_text = self._text_sink(on_chunk)
+
+        # messages_out gets only new messages, starting with the prompt.
+        self._out(messages[-1])
+
         # Open a recorder task for this chat.send. No-op if self.recorder
         # is None. Status is updated below; finalized in the finally block
         # so a cancel / exception still closes the run cleanly on disk.
-        self._recorder_start_task(prompt, session_id)
+        # With ctx the recorder gets the real chat id (§2a).
+        self._recorder_start_task(prompt, ctx.chat_id if ctx is not None else session_id)
         end_status = "complete"
 
         try:
-            for turn in range(self.MAX_TURNS):
+            for turn in range(max_turns):
                 if cancel_event.is_set():
                     end_status = "cancelled"
                     logger.info("cancelled before turn %d", turn + 1)
                     break
 
+                self._turn = turn + 1
+                self._turn_meta = {}
+                self.last_turns = turn + 1
+                self._emit("system", "state", "", {"kind": "turn.started"})
                 logger.debug("loop turn %d/%d model=%s",
-                             turn + 1, self.MAX_TURNS, self.model)
+                             turn + 1, max_turns, self.model)
 
                 try:
-                    # Real SSE streaming: on_chunk fires for each text delta
+                    # Real SSE streaming: on_text fires for each text delta
                     # as the provider produces it. cancel_event is checked
                     # between SSE events so Stop interrupts mid-generation.
-                    text, tool_blocks = self._call(
-                        messages,
-                        system_prompt,
-                        on_text=on_chunk,
-                        should_cancel=cancel_event.is_set,
+                    text, tool_blocks = self._call_turn(
+                        messages, system_prompt, on_text, cancel_event,
                     )
-                except ClaudeLoopError:
+                except (ClaudeLoopError, RunCancelled):
                     raise
                 except Exception as exc:
                     raise ClaudeLoopError(
@@ -1781,12 +2557,21 @@ class ClaudeToolLoop:
                 if text:
                     final_text = text
 
+                # report_cancelled: Stop during the stream ends the run as
+                # cancelled instead of complete (§2a).
+                if opts is not None and opts.report_cancelled and cancel_event.is_set():
+                    end_status = "cancelled"
+                    self._finish_text_turn(text)
+                    logger.info("stopped during turn %d", turn + 1)
+                    break
+
                 # No tool calls → conversation complete
                 if not tool_blocks:
                     logger.debug(
                         "loop complete after %d turns, no more tool calls",
                         turn + 1,
                     )
+                    self._finish_text_turn(text)
                     break
 
                 # --- Build assistant message (Anthropic format) ---
@@ -1797,70 +2582,40 @@ class ClaudeToolLoop:
                 messages.append({"role": "assistant",
                                  "content": assistant_content})
 
+                call_keys = [_mint_call_key() for _ in tool_blocks]
+                self._emit("assistant", "message", text, {"final": False})
+                self._out(_canonical_message(messages[-1], call_keys))
+
+                truncated = self._turn_truncated()
+                if truncated:
+                    self._emit("system", "state", "", {
+                        "kind": "status",
+                        "phase": "turn_truncated",
+                        "message": "The reply was cut off; its tool calls were not run.",
+                    })
+                rescued_ids = self._rescued_ids()
+
                 # --- Execute each tool and collect results ---
                 tool_result_blocks: List[Dict] = []
+                result_keys: List[str] = []
 
-                for block in tool_blocks:
+                for block, call_key in zip(tool_blocks, call_keys):
                     if cancel_event.is_set():
                         end_status = "cancelled"
                         break
-
-                    tool_name = str(block.get("name") or "")
                     tool_id = str(block.get("id") or "")
-                    tool_input = block.get("input") or {}
-
-                    if on_tool_start:
-                        try:
-                            on_tool_start(tool_name, tool_input)
-                        except Exception:
-                            pass
-
-                    logger.info("executing tool=%s id=%s",
-                                tool_name, tool_id)
-
-                    tool_t0 = time.perf_counter()
-                    if tool_name == "search_docs":
-                        # Python-resident tool — never round-trips to Tcl.
-                        # Returned shape mirrors a Tcl tool result so the
-                        # downstream tool_result builder doesn't need a
-                        # special case.
-                        result = self._dispatch_search_docs(tool_input)
-                    elif tool_name == "wiki_list":
-                        result = self._dispatch_wiki_list(tool_input)
-                    elif tool_name == "wiki_read":
-                        result = self._dispatch_wiki_read(tool_input)
-                    elif tool_name == "wiki_update":
-                        result = self._dispatch_wiki_update(tool_input)
-                    elif tool_name == "wiki_verify_pins":
-                        result = self._dispatch_wiki_verify_pins(tool_input)
-                    else:
-                        result = tool_bridge.execute_tool(
-                            session_id=session_id,
-                            tool_call_id=tool_id,
-                            tool_name=tool_name,
-                            tool_input=tool_input,
-                            session_queue=session_queue,
-                            cancel_event=cancel_event,
-                        )
-                    tool_ms = (time.perf_counter() - tool_t0) * 1000.0
-
-                    # Mirror the result into the on-disk recorder so this
-                    # chat.send produces a replayable transcript.tcl +
-                    # snapshots/. Failed tools are counted in the manifest
-                    # but never written to transcript.tcl (by design).
-                    self._recorder_record(
-                        tool_name=tool_name,
-                        tool_input=tool_input,
-                        result=result,
-                        duration_ms=tool_ms,
+                    result = self._run_tool_block(
+                        block,
+                        call_key,
+                        tool_bridge=tool_bridge,
+                        session_id=session_id,
+                        session_queue=session_queue,
+                        cancel_event=cancel_event,
+                        on_tool_start=on_tool_start,
+                        on_tool_result=on_tool_result,
+                        truncated=truncated,
+                        origin="rescued" if tool_id in rescued_ids else "model",
                     )
-
-                    if on_tool_result:
-                        try:
-                            on_tool_result(tool_id, tool_name, result)
-                        except Exception:
-                            pass
-
                     tool_result_blocks.append(
                         _build_tool_result_block(
                             tool_use_id=tool_id,
@@ -1868,21 +2623,32 @@ class ClaudeToolLoop:
                             include_image=self._is_anthropic_direct,
                         )
                     )
+                    result_keys.append(call_key)
 
                 # --- Append tool results to conversation ---
                 if tool_result_blocks:
                     messages.append(
                         {"role": "user", "content": tool_result_blocks}
                     )
+                    self._out(_canonical_message(messages[-1], result_keys))
             else:
                 logger.warning("hit max turns (%d) without finishing",
-                               self.MAX_TURNS)
+                               max_turns)
                 end_status = "max_turns"
+                # report_cancelled: Stop during the last allowed turn's tool
+                # round is still a cancel (options=None keeps max_turns; S7).
+                if opts is not None and opts.report_cancelled and cancel_event.is_set():
+                    end_status = "cancelled"
+        except RunCancelled:
+            end_status = "cancelled"
+            logger.info("stopped during a provider backoff")
         except Exception:
             end_status = "error"
             raise
         finally:
+            self.last_status = end_status
             self._recorder_end_task(end_status)
+            self._ctx = None
 
         return final_text
 
