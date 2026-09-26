@@ -37,6 +37,7 @@ from .provider import (
     resolve_anthropic_api_key,
     resolve_ollama_host,
     resolve_ollama_model,
+    resolve_openai_compatible_api_key,
     resolve_openrouter_api_key,
 )
 from .recorder import RunRecorder
@@ -160,6 +161,12 @@ class LoopOptions:
                 if key not in known or key == "max_turns":
                     continue
                 if key == "num_ctx" and value is None:
+                    continue
+                problem = option_type_error(key, value)
+                if problem is not None:
+                    # Plan 02 final review (a): a hand-edited settings.json cannot
+                    # break the loop; the preset value stays.
+                    logger.warning("ignoring profile option %s: %s", key, problem)
                     continue
                 preset[key] = value
         preset["max_turns"] = int(max_turns)
@@ -2853,6 +2860,22 @@ def build_claude_loop(
         return ClaudeToolLoop(
             provider_name="ollama",
             api_key=base_url,   # repurposed: base URL, not a real key
+            model=chosen,
+            docs_search=docs_search,
+            wiki_store=wiki_store,
+        )
+
+    if name in ("openai-compatible", "openai_compatible"):
+        # A local vLLM/SGLang/LM Studio server. The key falls back to "EMPTY";
+        # on this env-driven path the URL comes from VMD_AI_OPENAI_BASE_URL.
+        key, _source = resolve_openai_compatible_api_key()
+        chosen = explicit_model or os.getenv("VMD_AI_MODEL") or ""
+        if not chosen:
+            logger.warning("openai-compatible provider requested but no model configured.")
+            return None
+        return ClaudeToolLoop(
+            provider_name="openai-compatible",
+            api_key=key,
             model=chosen,
             docs_search=docs_search,
             wiki_store=wiki_store,

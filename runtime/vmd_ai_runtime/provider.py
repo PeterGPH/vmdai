@@ -136,6 +136,29 @@ def resolve_ollama_model() -> tuple[str, str]:
     return "", ""
 
 
+def resolve_openai_compatible_api_key() -> tuple[str, str]:
+    """
+    Resolve the key for an OpenAI-compatible server (vLLM, SGLang, LM Studio).
+
+    Order:
+      1. ``VMD_AI_OPENAI_API_KEY`` env var
+      2. Saved keyring entry under provider="openai-compatible"
+      3. The literal ``EMPTY`` that local servers accept
+    """
+    key = _clean_token(os.getenv("VMD_AI_OPENAI_API_KEY"))
+    if key:
+        return key, "VMD_AI_OPENAI_API_KEY"
+    try:
+        from .keys import read_keyring_for_provider
+    except Exception:
+        return "EMPTY", "default"
+    saved, _err = read_keyring_for_provider("openai-compatible")
+    saved = _clean_token(saved)
+    if saved:
+        return saved, "keyring"
+    return "EMPTY", "default"
+
+
 class MockProvider:
     def stream_response(
         self,
@@ -523,4 +546,8 @@ def build_provider(mode: str):
         return "anthropic-direct", AnthropicDirectProvider()
     if selected in ("ollama", "local-ollama", "local_ollama"):
         return "ollama", OllamaProvider()
+    if selected in ("openai-compatible", "openai_compatible"):
+        key, _src = resolve_openai_compatible_api_key()
+        base = os.getenv("VMD_AI_OPENAI_BASE_URL") or "http://localhost:8000/v1"
+        return "openai-compatible", OpenRouterProvider(api_key=key, base_url=base)
     return "mock", MockProvider()

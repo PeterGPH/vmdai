@@ -10,6 +10,7 @@ Key additions over the skeleton:
 """
 from __future__ import annotations
 
+import copy
 import hmac
 import json
 import os
@@ -19,9 +20,11 @@ from typing import Any, Callable, Dict, List, Optional
 from pathlib import Path
 
 from . import conversation
+from . import settings_store as settings_mod
 from .claude_loop import (
     ClaudeLoopError,
     ClaudeToolLoop,
+    LoopOptions,
     RunContext,
     VMD_SYSTEM_PROMPT,
     WIKI_SYSTEM_PROMPT_ADDENDUM,
@@ -37,13 +40,31 @@ from .logging_utils import redact_sensitive
 from .protocol import validate_method_params, validate_rpc_payload
 from .provider import (
     build_provider,
+    resolve_anthropic_api_key,
     resolve_ollama_model,
+    resolve_openai_compatible_api_key,
     resolve_openrouter_api_key,
+)
+from .settings_store import (
+    DEFAULT_BASE_URLS,
+    TOP_LEVEL_DEFAULTS,
+    SettingsStore,
+    normalize_provider,
+    resolve_profile,
 )
 from .sessions import RequestState, SessionManager, SessionState
 from .store import ChatStore
 from .tool_bridge import VmdToolBridge
 from .wiki_store import WikiStore
+
+
+# §2f Rescue: shown once per token session whose profile opts into rescue "all".
+RESCUE_ALL_NOTICE = (
+    "This profile runs tool calls that the model writes as plain text "
+    "(options.rescue is \"all\"), including tcl code blocks in its answers. "
+    "Set options.rescue to \"json\" in ~/.vmdai/settings.json to run only "
+    "tool-call JSON that names an offered tool."
+)
 
 
 class RuntimeApp:
@@ -61,7 +82,15 @@ class RuntimeApp:
         allow_tokenless_v1: bool = True,
         on_shutdown: Optional[Callable[[], None]] = None,
         loop_factory: Optional[Callable[[Dict[str, Any]], Optional[ClaudeToolLoop]]] = None,
+        settings_store: Optional[SettingsStore] = None,
+        cli_provider: Optional[str] = None,
     ):
+        # Runtime-owned profiles (§2f). Only main.py passes a store; tests
+        # and the A/B scripts keep plan 02's env-driven behaviour.
+        self.settings_store = settings_store
+        self.cli_provider = (str(cli_provider).strip() or None) if cli_provider else None
+        self.first_run_servers: List[Dict[str, Any]] = []
+        self._profile_router: Optional[Callable[[Optional[Dict[str, Any]]], Optional[ClaudeToolLoop]]] = None
         self.sessions = SessionManager()
         # Launch token (§2e). main.py generates it; None (in-process tests)
         # means no session can authenticate and runtime.shutdown is refused.
@@ -151,6 +180,29 @@ class RuntimeApp:
                 self.has_agent_loop(),
             )
 
+        if settings_store is not None and loop_factory is None:
+            # Settings profiles (token sessions) get the product loop; the
+            # legacy {provider, model} profile keeps plan 02's factory. The
+            # router is the base factory, so provider.set's reset keeps it.
+            legacy_factory = self._base_loop_factory
+
+            def _route(profile: Optional[Dict[str, Any]]) -> Optional[ClaudeToolLoop]:
+                if profile is not None and "source" in profile:
+                    return self._profile_loop_factory(profile)
+                return legacy_factory(profile)
+
+            self._base_loop_factory = _route
+            self._loop_factory = _route
+            self._profile_router = _route
+        if settings_store is not None and not settings_store.exists():
+            # First run (§2f): probe :11435 then :11434, 300 ms each.
+            try:
+                self.first_run_servers = list(settings_mod.probe_local_ollama())
+                settings_store.first_run(self.first_run_servers)
+            except Exception:
+                if self.logger:
+                    self.logger.warning("first-run probe failed", exc_info=True)
+
     # ------------------------------------------------------------------
     # Loop factory (§3): a fresh ClaudeToolLoop per request
     # ------------------------------------------------------------------
@@ -183,18 +235,39 @@ class RuntimeApp:
         )
 
     def profile_for_session(self, state: Optional[SessionState] = None) -> Optional[Dict[str, Any]]:
-        """The profile a request of ``state`` runs with.
+        """The profile a request of ``state`` runs with (§7 Precedence).
 
-        M1 foundation: the legacy profile {provider, model} from the
-        env/--provider choice and the last provider.set. Plan 03 makes
-        token sessions read the active profile in settings.json.
+        Token sessions of a runtime that owns settings.json use
+        resolve_profile (CLI flag > active profile; VMD_AI_PROVIDER is
+        seed-only and never used live); the
+        returned copy adds ``name`` and ``source``, and None means there is
+        no usable profile (NO_MODEL). Everything else gets the legacy
+        profile {provider, model}: the env/--provider choice and the model
+        of the last provider.set.
         """
+        if state is not None and getattr(state, "authenticated", False) and self.settings_store is not None:
+            name, profile, source = resolve_profile(self.settings_store, self.cli_provider, os.environ)
+            if profile is None:
+                return None
+            out = copy.deepcopy(profile)
+            out["name"] = name
+            out["source"] = source
+            return out
         return {"provider": self._loop_provider, "model": self._loop_model}
 
     def has_agent_loop(self, state: Optional[SessionState] = None) -> bool:
-        """True when a request of ``state`` would run the agent loop, not mock mode."""
+        """True when a request of ``state`` would run the agent loop, not mock mode.
+
+        Settings profiles get the cheap predicate (_can_build_profile), which
+        never builds a ClaudeToolLoop; everything else asks the active
+        factory (plan 02 review ruling (b)).
+        """
         try:
-            return self._loop_factory(self.profile_for_session(state)) is not None
+            profile = self.profile_for_session(state)
+            router = self._profile_router
+            if router is not None and self._loop_factory is router and profile is not None and "source" in profile:
+                return self._can_build_profile(profile)   # ruling (b): no loop is built
+            return self._loop_factory(profile) is not None
         except Exception:
             if self.logger:
                 self.logger.warning("loop factory failed", exc_info=True)
@@ -209,6 +282,83 @@ class RuntimeApp:
                 f"failed to build the agent loop: {exc}",
                 {"provider": (profile or {}).get("provider")},
             )
+
+    # ------------------------------------------------------------------
+    # Settings profiles (§2f)
+    # ------------------------------------------------------------------
+
+    def _profile_loop_parts(self, profile: Optional[Dict[str, Any]]) -> Optional[tuple]:
+        """(provider, model, api_key) for a settings profile, or None when no loop can be built.
+
+        Cheap: builds no ClaudeToolLoop. The factory and _can_build_profile share it."""
+        if not profile:
+            return None
+        provider_name = normalize_provider(profile.get("provider"))
+        model = str(profile.get("model") or "").strip()
+        if not provider_name or not model:
+            return None
+        if provider_name == "ollama":
+            api_key = str(profile.get("base_url") or DEFAULT_BASE_URLS["ollama"]).rstrip("/")
+        else:
+            api_key = self._api_key_for(provider_name)
+            if not api_key:
+                return None
+        return provider_name, model, api_key
+
+    def _can_build_profile(self, profile: Optional[Dict[str, Any]]) -> bool:
+        """Plan 02 final review (b): the profile factory's cheap can_build predicate."""
+        return self._profile_loop_parts(profile) is not None
+
+    def _profile_loop_factory(self, profile: Dict[str, Any]) -> Optional[ClaudeToolLoop]:
+        """One product loop for a settings profile (§2f, C7).
+
+        Options come from LoopOptions.product(profile) with max_turns from
+        settings.json; keys from provider.resolve_* (env, then keyring). The
+        wiki is wired only when settings.wiki_enabled is true (§2g). Returns
+        None when the profile has no model or a needed key is missing.
+        """
+        parts = self._profile_loop_parts(profile)
+        if parts is None:
+            return None
+        provider_name, model, api_key = parts
+        options = LoopOptions.product(profile, max_turns=int(self._setting("max_turns")))
+        wiki = self.wiki_store if self._setting("wiki_enabled") else None
+        return ClaudeToolLoop(provider_name=provider_name, api_key=api_key, model=model,
+                              docs_search=self.docs_search, wiki_store=wiki, options=options)
+
+    @staticmethod
+    def _api_key_for(provider_name: str) -> str:
+        if provider_name == "anthropic-direct":
+            return resolve_anthropic_api_key()[0]
+        if provider_name == "openrouter":
+            return resolve_openrouter_api_key()[0]
+        if provider_name == "openai-compatible":
+            return resolve_openai_compatible_api_key()[0]
+        return ""
+
+    def _setting(self, name: str) -> Any:
+        """A top-level settings.json value, or its default when there is no store."""
+        if self.settings_store is None:
+            return TOP_LEVEL_DEFAULTS[name]
+        return self.settings_store.load().get(name, TOP_LEVEL_DEFAULTS[name])
+
+    def _profile_summary(self, state) -> Optional[Dict[str, Any]]:
+        profile = self.profile_for_session(state)
+        if profile is None or "source" not in profile:
+            return None
+        summary = {"name": profile.get("name"), "provider": profile.get("provider"),
+                   "model": profile.get("model", "")}
+        if profile.get("base_url"):
+            summary["base_url"] = profile["base_url"]
+        return summary
+
+    @staticmethod
+    def _no_model_error() -> RpcError:
+        return RpcError(
+            "NO_MODEL",
+            "No model configured. Choose a provider and model, or add a profile to ~/.vmdai/settings.json.",
+            {"action": "open_settings"},
+        )
 
     # ------------------------------------------------------------------
     # RPC dispatch
@@ -356,6 +506,7 @@ class RuntimeApp:
             if authenticated:
                 result["event_protocol"] = state.event_protocol
                 result["runtime"] = {"version": RUNTIME_VERSION, "pid": os.getpid()}
+                result["profile"] = self._profile_summary(state)
             return result
 
         if method == "session.stop":
@@ -369,7 +520,8 @@ class RuntimeApp:
 
         if method == "chat.send":
             state = self._get_session(params["session_id"], session_token)
-            if params.get("model"):
+            # A token session always runs its profile's model (§2h).
+            if params.get("model") and not state.authenticated:
                 state.settings["model"] = params["model"]
             if params.get("mode"):
                 state.settings["mode"] = params["mode"]
@@ -384,6 +536,17 @@ class RuntimeApp:
                     raise RpcError("REQUEST_CONFLICT", "an active request is already running")
                 # A fresh loop for this request (None: mock mode).
                 loop = self._new_loop_for(state)
+                if loop is None and state.authenticated and self.settings_store is not None:
+                    # Mock mode is not reachable from the product (§2f).
+                    raise self._no_model_error()
+                loop_options = getattr(loop, "options", None)
+                if (state.authenticated and loop_options is not None
+                        and getattr(loop_options, "rescue", None) == "all"
+                        and not getattr(state, "rescue_all_noticed", False)):
+                    # §2f: rescue "all" is an explicit profile opt-in, and a
+                    # notice explains it (once per session).
+                    state.rescue_all_noticed = True
+                    state.queue.push("system", "message", RESCUE_ALL_NOTICE, {"notice": "rescue_all"})
                 if state.chat_id is None:
                     self._open_new_chat(state)
                 chat_id = state.chat_id
@@ -759,8 +922,10 @@ class RuntimeApp:
         # The session's model setting overrides the loop's model (plan 02).
         # A per-request loop is adjusted in place; an assigned loop is shared
         # between requests, so it gets a copy that keeps the wiki store.
+        # Token sessions always run their profile's model (§2h); the session
+        # model override stays for tokenless clients only.
         model = str(state.settings.get("model") or DEFAULT_SETTINGS["model"])
-        if model and model != loop.model:
+        if not state.authenticated and model and model != loop.model:
             if loop is self._assigned_loop:
                 loop = ClaudeToolLoop(
                     provider_name=loop.provider_name,

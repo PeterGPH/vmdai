@@ -13,6 +13,7 @@ from typing import Dict, Optional, Tuple
 _PROVIDER_ENV: Dict[str, str] = {
     "openrouter": "OPENROUTER_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "openai-compatible": "VMD_AI_OPENAI_API_KEY",
 }
 
 _KEYRING_SERVICE = "vmd_ai"

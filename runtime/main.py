@@ -15,6 +15,7 @@ from vmd_ai_runtime.launch import (
     write_token_file,
 )
 from vmd_ai_runtime.logging_utils import configure_logging, default_log_path
+from vmd_ai_runtime.settings_store import SettingsStore, normalize_provider
 
 # Reentrant: a second SIGTERM/SIGINT can run its handler on the main thread
 # while the first one still holds the lock (inside thread.start()).
@@ -55,6 +56,12 @@ def parse_args(argv=None):
         default=None,
         help="Directory containing immutable raw sources for the wiki to "
              "pin. Default: ~/.vmdai/raw/",
+    )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="Profile or provider name for this runtime (anthropic-direct, openrouter, "
+             "ollama, openai-compatible). Beats the active profile in ~/.vmdai/settings.json.",
     )
     parser.add_argument(
         "--disable-wiki",
@@ -117,6 +124,9 @@ def _serve(args, logger, log_path) -> int:
         launch_token=token,
         allow_tokenless_v1=not args.announce,
         on_shutdown=_request_shutdown,
+        provider_mode=normalize_provider(args.provider) or None,
+        settings_store=SettingsStore(),
+        cli_provider=args.provider,
     )
     server = create_server(app, host=args.host, port=args.port)
     holder["server"] = server

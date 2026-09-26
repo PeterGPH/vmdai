@@ -30,7 +30,7 @@ CAPABILITIES = {
     "tools": ["run_vmd_command", "capture_vmd_snapshot"],
     "agent_loop": True,     # Claude drives tool calls autonomously
     "history": True,
-    "keys": ["openrouter", "anthropic"],
+    "keys": ["openrouter", "anthropic", "openai-compatible"],
 }
 
 CONVERSATION_MODES = ("local_first", "hybrid_resume", "resume_only", "full")
