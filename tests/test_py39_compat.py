@@ -32,6 +32,7 @@ RUNTIME_MODULES: List[str] = [
     "vmd_ai_runtime.events",
     "vmd_ai_runtime.image_utils",
     "vmd_ai_runtime.keys",
+    "vmd_ai_runtime.locks",
     "vmd_ai_runtime.logging_utils",
     "vmd_ai_runtime.protocol",
     "vmd_ai_runtime.provider",

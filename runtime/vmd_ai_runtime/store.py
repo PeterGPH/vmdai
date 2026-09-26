@@ -7,23 +7,42 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from .locks import store_lock
+
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 class ChatStore:
+    """Chats under ~/.vmdai/chats (or ``root_dir``).
+
+    Writes to a chat's manifest.json and to index.jsonl run under the
+    store lock (locks.store_lock), because several runtimes may share the
+    directory (§2f Writes, §7 Several runtimes). The default store shares
+    ~/.vmdai/.store.lock with settings.json; a custom ``root_dir`` keeps its
+    own lock file inside that directory.
+    """
+
     def __init__(self, root_dir: str | None = None):
         self.root_dir = Path(root_dir or os.path.expanduser("~/.vmdai/chats"))
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.root_dir / "index.jsonl"
+        self.lock_root = self.root_dir.parent if root_dir is None else self.root_dir
+
+    def chat_dir(self, chat_id: str) -> Path:
+        return self.root_dir / chat_id
 
     def _chat_dir(self, chat_id: str) -> Path:
-        return self.root_dir / chat_id
+        # Kept for callers written before chat_dir became public.
+        return self.chat_dir(chat_id)
+
+    def exists(self, chat_id: str) -> bool:
+        return bool(chat_id) and (self.chat_dir(chat_id) / "manifest.json").is_file()
 
     def create_chat(self, title_hint: str = "") -> str:
         chat_id = f"chat_{uuid.uuid4().hex[:12]}"
-        chat_dir = self._chat_dir(chat_id)
+        chat_dir = self.chat_dir(chat_id)
         chat_dir.mkdir(parents=True, exist_ok=True)
         manifest = {
             "chat_id": chat_id,
@@ -32,13 +51,16 @@ class ChatStore:
             "updated_at": _now_iso(),
             "message_count": 0,
         }
-        (chat_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        (chat_dir / "events.jsonl").touch()
-        self._append_index_row({"chat_id": chat_id, "title": manifest["title"], "updated_at": manifest["updated_at"]})
+        with store_lock(self.lock_root):
+            self._write_manifest(chat_id, manifest)
+            (chat_dir / "events.jsonl").touch()
+            self._append_index_row({"chat_id": chat_id, "title": manifest["title"], "updated_at": manifest["updated_at"]})
         return chat_id
 
     def append_events(self, chat_id: str, events: Iterable[Dict[str, Any]]) -> int:
-        chat_dir = self._chat_dir(chat_id)
+        if not chat_id:
+            return 0
+        chat_dir = self.chat_dir(chat_id)
         if not chat_dir.exists():
             return 0
         events_path = chat_dir / "events.jsonl"
@@ -74,7 +96,9 @@ class ChatStore:
 
     def get_manifest(self, chat_id: str) -> Dict[str, Any] | None:
         """Return the manifest dict for a chat, or None if it doesn't exist."""
-        manifest_path = self._chat_dir(chat_id) / "manifest.json"
+        if not chat_id:
+            return None
+        manifest_path = self.chat_dir(chat_id) / "manifest.json"
         if not manifest_path.exists():
             return None
         try:
@@ -87,7 +111,7 @@ class ChatStore:
 
         Returns at most *limit* events (most recent if the file has more).
         """
-        events_path = self._chat_dir(chat_id) / "events.jsonl"
+        events_path = self.chat_dir(chat_id) / "events.jsonl"
         if not events_path.exists():
             return []
         all_events: List[Dict[str, Any]] = []
@@ -107,33 +131,41 @@ class ChatStore:
 
     def update_title(self, chat_id: str, title: str) -> None:
         """Update the display title for a chat."""
-        manifest_path = self._chat_dir(chat_id) / "manifest.json"
+        manifest_path = self.chat_dir(chat_id) / "manifest.json"
         if not manifest_path.exists():
             return
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            return
-        manifest["title"] = title.strip() or manifest.get("title", "New Chat")
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        with store_lock(self.lock_root):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                return
+            manifest["title"] = title.strip() or manifest.get("title", "New Chat")
+            self._write_manifest(chat_id, manifest)
 
     def _touch_manifest(self, chat_id: str, delta_messages: int = 0) -> None:
-        manifest_path = self._chat_dir(chat_id) / "manifest.json"
+        manifest_path = self.chat_dir(chat_id) / "manifest.json"
         if not manifest_path.exists():
             return
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            return
-        manifest["updated_at"] = _now_iso()
-        manifest["message_count"] = int(manifest.get("message_count") or 0) + int(delta_messages or 0)
+        with store_lock(self.lock_root):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                return
+            manifest["updated_at"] = _now_iso()
+            manifest["message_count"] = int(manifest.get("message_count") or 0) + int(delta_messages or 0)
+            self._write_manifest(chat_id, manifest)
+            self._append_index_row({
+                "chat_id": chat_id,
+                "title": manifest.get("title") or "New Chat",
+                "updated_at": manifest["updated_at"],
+                "message_count": manifest["message_count"],
+            })
+
+    # Callers hold the store lock; these two never take it themselves.
+
+    def _write_manifest(self, chat_id: str, manifest: Dict[str, Any]) -> None:
+        manifest_path = self.chat_dir(chat_id) / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._append_index_row({
-            "chat_id": chat_id,
-            "title": manifest.get("title") or "New Chat",
-            "updated_at": manifest["updated_at"],
-            "message_count": manifest["message_count"],
-        })
 
     def _append_index_row(self, row: Dict[str, Any]) -> None:
         with self.index_path.open("a", encoding="utf-8") as handle:
