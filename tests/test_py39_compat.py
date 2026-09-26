@@ -36,6 +36,7 @@ RUNTIME_MODULES: List[str] = [
     "vmd_ai_runtime.logging_utils",
     "vmd_ai_runtime.protocol",
     "vmd_ai_runtime.provider",
+    "vmd_ai_runtime.provider_catalog",
     "vmd_ai_runtime.rag",
     "vmd_ai_runtime.rag.audit",
     "vmd_ai_runtime.rag.golden",
