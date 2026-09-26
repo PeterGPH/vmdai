@@ -20,12 +20,17 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import re
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .locks import store_lock
+
+logger = logging.getLogger("vmdai.settings")
 
 SETTINGS_VERSION = 1
 TOP_LEVEL_DEFAULTS: Dict[str, Any] = {
@@ -53,6 +58,8 @@ DEFAULT_MODELS: Dict[str, str] = {
     "openrouter": "anthropic/claude-sonnet-4.6",
 }
 DEFAULT_OLLAMA_NUM_CTX = 32768
+LOCAL_OLLAMA_PORTS = (11435, 11434)        # the SSH tunnel first, then a local Ollama
+SHOW_TIMEOUT_S = 3.0
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ALIASES: Dict[str, str] = {
     "anthropic-direct": "anthropic-direct", "anthropic_api": "anthropic-direct",
@@ -320,6 +327,65 @@ class SettingsStore:
 
         return self._mutate(change)
 
+    def first_run(self, servers: Sequence[Dict[str, Any]], *, last_provider_path: Optional[str] = None,
+                  urlopen: Optional[Callable[..., Any]] = None) -> Dict[str, Any]:
+        """Create profiles on a machine with no settings.json (§2f First run, C7).
+
+        Each responding Ollama becomes ``ollama-<port>`` with its first model
+        that has the tools capability and ``num_ctx = min(32768, context_length)``;
+        the first one becomes active. ``last_provider.txt`` (``<provider>\\t<model>``)
+        seeds ``claude`` or ``openrouter`` (never active) or picks the model of
+        the matching ``ollama-<port>`` profile. Writes nothing when no profile
+        was created, so the next start probes again.
+        """
+        opener = urlopen or _default_urlopen
+        created: Dict[str, Dict[str, Any]] = {}
+        served: Dict[str, List[str]] = {}
+        active: Optional[str] = None
+        for server in servers or []:
+            base_url = str(server.get("base_url") or "").rstrip("/")
+            if not base_url:
+                continue
+            try:
+                profile = profile_from_server(base_url, urlopen=opener, server=server)
+            except Exception:
+                logger.warning("first run: could not read models from %s", base_url, exc_info=True)
+                continue
+            if not profile.get("model"):
+                continue
+            name = "ollama-%d" % _port_of(base_url)
+            created[name] = profile
+            served[name] = [str(m) for m in server.get("models") or []]
+            if active is None:
+                active = name
+        seed_path = Path(last_provider_path) if last_provider_path else self.root / "last_provider.txt"
+        seed = _read_last_provider(seed_path)
+        if seed is not None:
+            provider, model = seed
+            if provider == "anthropic-direct" and "claude" not in created:
+                created["claude"] = {"provider": provider, "model": model or DEFAULT_MODELS[provider], "options": {}}
+            elif provider == "openrouter" and "openrouter" not in created:
+                created["openrouter"] = {"provider": provider, "base_url": DEFAULT_BASE_URLS[provider],
+                                         "model": model or DEFAULT_MODELS[provider], "options": {}}
+            elif provider == "ollama" and model:
+                for name, models in served.items():
+                    if model in models:
+                        created[name]["model"] = model
+                        created[name]["options"]["num_ctx"] = _num_ctx_for(created[name]["base_url"], model, opener)
+                        break
+        if not created:
+            return self.load()
+
+        def change(data: Dict[str, Any]) -> None:
+            if data["profiles"]:
+                return          # another runtime finished its first run first
+            for name, profile in created.items():
+                data["profiles"][name] = _clean_profile(profile)
+            data["active"] = active
+
+        self._mutate(change)
+        return self.load()
+
 
 def _env_profile(provider: str, env: Mapping[str, str]) -> Dict[str, Any]:
     """A profile built from the environment, for the CLI flag or VMD_AI_PROVIDER."""
@@ -362,3 +428,135 @@ def resolve_profile(store: SettingsStore, cli_provider: Optional[str],
     if profile is not None:
         return name, profile, "profile"
     return None, None, "none"
+
+
+# ---------------------------------------------------------------------------
+# First run: probe local Ollama servers (§2f, C7). Only /api/version,
+# /api/tags and /api/show are called, never /api/chat or /api/generate.
+# ---------------------------------------------------------------------------
+
+def _default_urlopen(request: Any, timeout: Optional[float] = None) -> Any:
+    """urllib.request.urlopen, looked up at call time so tests and cassettes can patch it."""
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def _http_json(urlopen: Callable[..., Any], method: str, url: str,
+               body: Optional[Dict[str, Any]] = None, timeout: float = SHOW_TIMEOUT_S) -> Any:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+    return json.loads(raw.decode("utf-8") or "null")
+
+
+def context_length_from_show(show: Dict[str, Any]) -> Optional[int]:
+    """``model_info["<general.architecture>.context_length"]`` from /api/show, or None."""
+    info = show.get("model_info") if isinstance(show, dict) else None
+    if not isinstance(info, dict):
+        return None
+    arch = info.get("general.architecture")
+    keys = ["%s.context_length" % arch] if arch else []
+    keys += sorted(str(k) for k in info if str(k).endswith(".context_length"))
+    for key in keys:
+        value = info.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return None
+
+
+def _capped_num_ctx(show: Dict[str, Any]) -> int:
+    context_length = context_length_from_show(show)
+    return min(DEFAULT_OLLAMA_NUM_CTX, context_length) if context_length else DEFAULT_OLLAMA_NUM_CTX
+
+
+def _show(urlopen: Callable[..., Any], base_url: str, model: str) -> Dict[str, Any]:
+    try:
+        show = _http_json(urlopen, "POST", base_url + "/api/show", {"model": model})
+    except Exception:
+        return {}
+    return show if isinstance(show, dict) else {}
+
+
+def _num_ctx_for(base_url: str, model: str, urlopen: Callable[..., Any]) -> int:
+    return _capped_num_ctx(_show(urlopen, base_url, model))
+
+
+def _tag_names(tags: Any) -> List[str]:
+    models = tags.get("models") if isinstance(tags, dict) else None
+    names = []
+    for tag in models or []:
+        if isinstance(tag, dict) and (tag.get("name") or tag.get("model")):
+            names.append(str(tag.get("name") or tag.get("model")))
+    return names
+
+
+def _port_of(base_url: str) -> int:
+    try:
+        return int(urllib.parse.urlsplit(base_url).port or 11434)
+    except ValueError:
+        return 11434
+
+
+def profile_from_server(base_url: str, *, urlopen: Callable[..., Any],
+                        server: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """An ``ollama`` profile for one server: its first model with the tools
+    capability (else its first model) and ``num_ctx = min(32768, context_length)``
+    from /api/show, or 32768 when the length is missing (C7)."""
+    base = str(base_url).rstrip("/")
+    if server is not None and server.get("models") is not None:
+        names = [str(m) for m in server["models"] if m]
+    else:
+        names = _tag_names(_http_json(urlopen, "GET", base + "/api/tags"))
+    chosen, chosen_show = "", {}
+    for name in names:
+        show = _show(urlopen, base, name)
+        if not chosen:
+            chosen, chosen_show = name, show
+        if "tools" in (show.get("capabilities") or []):
+            chosen, chosen_show = name, show
+            break
+    return {"provider": "ollama", "base_url": base, "model": chosen,
+            "options": {"num_ctx": _capped_num_ctx(chosen_show)}}
+
+
+def probe_local_ollama(ports: Sequence[int] = (11435, 11434), timeout: float = 0.3) -> List[Dict[str, Any]]:
+    """Ask 127.0.0.1:<port>/api/version on each port, in order, ``timeout`` s each.
+
+    A responder is listed as {base_url, version, models}; a refused, reset
+    or silent port is skipped, so a stale tunnel costs about ``timeout``.
+    """
+    servers: List[Dict[str, Any]] = []
+    for port in ports:
+        base_url = "http://127.0.0.1:%d" % int(port)
+        try:
+            payload = _http_json(_default_urlopen, "GET", base_url + "/api/version", timeout=timeout)
+        except Exception:
+            continue
+        if not isinstance(payload, dict) or "version" not in payload:
+            continue
+        try:
+            models = _tag_names(_http_json(_default_urlopen, "GET", base_url + "/api/tags", timeout=SHOW_TIMEOUT_S))
+        except Exception:
+            models = []
+        servers.append({"base_url": base_url, "version": str(payload["version"]), "models": models})
+    return servers
+
+
+def _read_last_provider(path: Path) -> Optional[Tuple[str, str]]:
+    """(provider, model) from the plugin's last_provider.txt, or None."""
+    try:
+        line = path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return None
+    provider, _tab, model = line.partition("\t")
+    provider = normalize_provider(provider)
+    return (provider, model.strip()) if provider else None
