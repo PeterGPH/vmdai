@@ -168,15 +168,16 @@ def test_guard_truncation_blocks_tool_calls(monkeypatch):
 
 
 def test_guard_truncation_off_runs_with_empty_input(monkeypatch):
-    _serve(
-        monkeypatch,
-        anthropic_tool_use("toolu_1", "run_vmd_command", '{"command": "mol new', stop_reason="max_tokens"),
-        anthropic_text("ok"),
-    )
-    bridge = SpyBridge()
-    run_loop(_loop(LoopOptions(), provider="anthropic-direct"), bridge=bridge)
-    assert bridge.calls == [{"tool_call_id": "toolu_1", "tool_name": "run_vmd_command",
-                             "tool_input": {}}]
+    for opts in (None, LoopOptions()):  # options=None is today's path (plan-01 carry-forward)
+        _serve(
+            monkeypatch,
+            anthropic_tool_use("toolu_1", "run_vmd_command", '{"command": "mol new', stop_reason="max_tokens"),
+            anthropic_text("ok"),
+        )
+        bridge = SpyBridge()
+        run_loop(_loop(opts, provider="anthropic-direct"), bridge=bridge)
+        assert bridge.calls == [{"tool_call_id": "toolu_1", "tool_name": "run_vmd_command",
+                                 "tool_input": {}}]
 
 
 def test_max_turns_from_options():
@@ -189,3 +190,18 @@ def test_max_turns_from_options():
     assert loop.last_status == "max_turns"
     assert (loop.last_turns, loop.last_tool_calls) == (3, 3)
     assert loop.last_final_text_empty is True
+
+    # options=None keeps today's cap (plan-01 carry-forward): MAX_TURNS model calls, no 29th,
+    # and the recorder closes the run as 'max_turns' exactly as before LoopOptions existed.
+    bridge, recorder, seen = SpyBridge(), StatusRecorder(), []
+    loop = _loop(None)
+    loop.recorder = recorder
+    loop._call = scripted_call(
+        [("", [tool_use(f"tc_{n}", "run_vmd_command", command=f"puts {n}")]) for n in range(40)],
+        seen=seen)
+    assert run_loop(loop, bridge=bridge) == ""
+    assert ClaudeToolLoop.MAX_TURNS == 28
+    assert len(seen) == 28
+    assert [c["tool_input"]["command"] for c in bridge.calls] == [f"puts {n}" for n in range(28)]
+    assert recorder.status == "max_turns"
+    assert (loop.last_status, loop.last_turns, loop.last_tool_calls) == ("max_turns", 28, 28)
