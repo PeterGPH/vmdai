@@ -26,6 +26,7 @@ RUNTIME_MODULES: List[str] = [
     "vmd_ai_runtime.claude_loop",
     "vmd_ai_runtime.client",
     "vmd_ai_runtime.constants",
+    "vmd_ai_runtime.conversation",
     "vmd_ai_runtime.docs_search",
     "vmd_ai_runtime.errors",
     "vmd_ai_runtime.events",
