@@ -2823,7 +2823,7 @@ def build_claude_loop(
 # History → Anthropic messages conversion
 # ---------------------------------------------------------------------------
 
-def events_to_messages(events: List[Dict]) -> List[Dict]:
+def events_to_messages(events: List[Dict], drop_trailing_user: bool = False) -> List[Dict]:
     """Convert stored JSONL events into Anthropic-style alternating messages.
 
     Only ``user`` and ``assistant`` roles produce messages.  Consecutive events
@@ -2834,9 +2834,28 @@ def events_to_messages(events: List[Dict]) -> List[Dict]:
     don't have enough information to rebuild full tool_use/tool_result blocks
     from the JSONL log.  The resulting message list gives Claude *textual*
     context of the prior conversation, which is sufficient for continuity.
+
+    ``drop_trailing_user`` skips the last user message event when no
+    assistant message follows it: the prompt chat.send has just persisted,
+    which run() appends again (the resume dedupe fix, spec §2b).
     """
+    skip_index = -1
+    if drop_trailing_user:
+        for index in range(len(events) - 1, -1, -1):
+            ev = events[index]
+            if str(ev.get("type") or "") != "message" or not str(ev.get("text") or "").strip():
+                continue
+            role = str(ev.get("role") or "")
+            if role == "assistant":
+                break
+            if role == "user":
+                skip_index = index
+                break
+
     messages: List[Dict] = []
-    for ev in events:
+    for index, ev in enumerate(events):
+        if index == skip_index:
+            continue
         role = str(ev.get("role") or "")
         etype = str(ev.get("type") or "")
         text = str(ev.get("text") or "").strip()
@@ -2855,6 +2874,4 @@ def events_to_messages(events: List[Dict]) -> List[Dict]:
             else:
                 messages.append({"role": "assistant", "content": text})
 
-    # Ensure the list doesn't end with a user message that will be duplicated
-    # by the new prompt (the caller appends the new user message separately).
     return messages
