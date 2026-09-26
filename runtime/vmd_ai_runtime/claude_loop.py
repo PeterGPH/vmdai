@@ -166,6 +166,48 @@ class LoopOptions:
         return cls(**preset)
 
 
+# Carry-forward ruling (a): the value types a profile's options may hold.
+# settings_store rejects an ill-typed value on write (SettingsError INVALID);
+# LoopOptions.product drops one with a warning and keeps the preset. null is
+# allowed exactly where the LoopOptions field defaults to None.
+OPTION_INT_KEYS = ("num_ctx", "seed", "context_length", "connect_retries", "turn_retry", "image_max_edge")
+OPTION_NUMBER_KEYS = ("temperature", "first_byte_timeout_s")
+OPTION_BOOL_KEYS = ("classify_unreachable", "classify_errors", "preflight", "cancellable_backoff",
+                    "report_cancelled", "raise_stream_errors", "guard_truncation", "compact_in_run",
+                    "ollama_tool_name", "loop_guard", "include_usage")
+OPTION_STR_KEYS = ("rescue", "result_format", "base_url")
+OPTION_DICT_KEYS = ("extra_body", "tool_overrides")
+OPTION_UNCHECKED_KEYS = ("think", "keep_alive", "supports_vision", "max_turns")
+RESCUE_MODES = ("all", "json", "off")
+
+
+def option_type_error(key: str, value: Any) -> Optional[str]:
+    """Why ``value`` cannot be the profile option ``key``, or None when it can.
+
+    Unknown keys and OPTION_UNCHECKED_KEYS are never an error.
+    """
+    if key in OPTION_UNCHECKED_KEYS:
+        return None
+    if value is None:
+        defaults = {f.name: f.default for f in dataclasses.fields(LoopOptions)}
+        return "must not be null" if key in defaults and defaults[key] is not None else None
+    if key in OPTION_INT_KEYS:
+        ok = isinstance(value, int) and not isinstance(value, bool)
+        return None if ok else "must be an integer, not %r" % (value,)
+    if key in OPTION_NUMBER_KEYS:
+        ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+        return None if ok else "must be a number, not %r" % (value,)
+    if key in OPTION_BOOL_KEYS:
+        return None if isinstance(value, bool) else "must be true or false, not %r" % (value,)
+    if key == "rescue":
+        return None if value in RESCUE_MODES else "must be one of all, json, off, not %r" % (value,)
+    if key in OPTION_STR_KEYS:
+        return None if isinstance(value, str) else "must be a string, not %r" % (value,)
+    if key in OPTION_DICT_KEYS:
+        return None if isinstance(value, dict) else "must be an object, not %r" % (value,)
+    return None
+
+
 @dataclass
 class RunContext:
     """Per-request identity and sinks for ClaudeToolLoop.run (§2a)."""

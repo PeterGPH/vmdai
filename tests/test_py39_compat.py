@@ -46,6 +46,7 @@ RUNTIME_MODULES: List[str] = [
     "vmd_ai_runtime.scripts.build_docs_index",
     "vmd_ai_runtime.server",
     "vmd_ai_runtime.sessions",
+    "vmd_ai_runtime.settings_store",
     "vmd_ai_runtime.store",
     "vmd_ai_runtime.tool_bridge",
     "vmd_ai_runtime.wiki_bench",
