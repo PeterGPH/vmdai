@@ -10,15 +10,16 @@ Key additions over the skeleton:
 """
 from __future__ import annotations
 
+import hmac
 import os
 import threading
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Optional
 
 from pathlib import Path
 
 from .claude_loop import ClaudeToolLoop, ClaudeLoopError, VMD_SYSTEM_PROMPT, build_claude_loop, events_to_messages
 from .recorder import RunRecorder
-from .constants import CAPABILITIES, DEFAULT_SETTINGS
+from .constants import CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_VERSION
 from .docs_search import DocsSearch
 from .errors import RpcError
 from .keys import KeyStore
@@ -29,7 +30,7 @@ from .provider import (
     resolve_ollama_model,
     resolve_openrouter_api_key,
 )
-from .sessions import RequestState, SessionManager
+from .sessions import RequestState, SessionManager, SessionState
 from .store import ChatStore
 from .tool_bridge import VmdToolBridge
 from .wiki_store import WikiStore
@@ -46,8 +47,18 @@ class RuntimeApp:
         wiki_root: str | None = None,
         wiki_raw_root: str | None = None,
         enable_wiki: bool = True,
+        launch_token: Optional[str] = None,
+        allow_tokenless_v1: bool = True,
+        on_shutdown: Optional[Callable[[], None]] = None,
     ):
         self.sessions = SessionManager()
+        # Launch token (§2e). main.py generates it; None (in-process tests)
+        # means no session can authenticate and runtime.shutdown is refused.
+        # allow_tokenless_v1 is False under --announce, so a tokenless
+        # session.start is accepted only from old plugins and dev scripts.
+        self.launch_token: Optional[str] = str(launch_token) if launch_token else None
+        self.allow_tokenless_v1 = bool(allow_tokenless_v1)
+        self._on_shutdown = on_shutdown
         self.store = ChatStore(store_dir)
         # KeyStore.__init__ hydrates os.environ from any keys saved in the
         # OS keychain, so the provider auto-detect below sees them.
@@ -184,13 +195,63 @@ class RuntimeApp:
             raise RpcError("AUTH_FAILED", "invalid session or token")
         return state
 
+    def _token_matches(self, candidate: str) -> bool:
+        if not self.launch_token or not candidate:
+            return False
+        return hmac.compare_digest(
+            str(candidate).encode("utf-8"), self.launch_token.encode("utf-8")
+        )
+
+    def _require_auth(self, state: SessionState) -> None:
+        """Raise AUTH_REQUIRED unless ``state`` was started with the launch token.
+
+        Privileged calls (§2e) check this: provider.set with base_url,
+        options or profile; settings.json writes; session.set_cwd; and
+        models.list/provider.test with an arbitrary base_url.
+        """
+        if not getattr(state, "authenticated", False):
+            raise RpcError(
+                "AUTH_REQUIRED",
+                "this call needs a session started with the launch token",
+            )
+
     def _dispatch(self, method: str, params: Dict[str, Any], session_token: str) -> Dict[str, Any]:
+
+        # ---- Runtime lifecycle ----
+
+        if method == "runtime.shutdown":
+            if not self._token_matches(params["launch_token"]):
+                raise RpcError("AUTH_FAILED", "invalid launch token")
+            if self.logger:
+                self.logger.info("runtime.shutdown requested over RPC")
+            if self._on_shutdown is not None:
+                self._on_shutdown()
+            return {"ok": True}
 
         # ---- Session lifecycle ----
 
         if method == "session.start":
+            launch_token = str(params.get("launch_token") or "")
+            authenticated = False
+            if launch_token:
+                if not self._token_matches(launch_token):
+                    raise RpcError("AUTH_FAILED", "invalid launch token")
+                authenticated = True
+            elif not self.allow_tokenless_v1:
+                raise RpcError(
+                    "AUTH_REQUIRED",
+                    "this runtime was started with --announce; "
+                    "session.start needs the launch token",
+                )
             chat_id = self.store.create_chat(title_hint="VMD AI Chat")
-            state = self.sessions.create_session(cwd=params["cwd"], chat_id=chat_id)
+            state = self.sessions.create_session(
+                cwd=params["cwd"],
+                chat_id=chat_id,
+                authenticated=authenticated,
+                # M1 speaks display protocol 1 only; plan 07 negotiates 2.
+                event_protocol=1,
+                vmd_env=params.get("vmd_env") if authenticated else None,
+            )
             state.queue.push("system", "lifecycle", "session_started", {"chat_id": chat_id})
             # Surface a one-time security notice so users see the trust
             # boundary before they send their first prompt. The model
@@ -209,7 +270,7 @@ class RuntimeApp:
                 ),
                 {"notice": "tcl_trust_boundary"},
             )
-            return {
+            result = {
                 "session_id": state.session_id,
                 "session_token": state.session_token,
                 "capabilities": CAPABILITIES,
@@ -218,6 +279,10 @@ class RuntimeApp:
                 "provider": self.provider_name,
                 "agent_loop": self.claude_loop is not None,
             }
+            if authenticated:
+                result["event_protocol"] = state.event_protocol
+                result["runtime"] = {"version": RUNTIME_VERSION, "pid": os.getpid()}
+            return result
 
         if method == "session.stop":
             state = self._get_session(params["session_id"], session_token)

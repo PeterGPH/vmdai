@@ -26,6 +26,14 @@ class SessionState:
     settings: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_SETTINGS))
     queue: EventQueue = field(default_factory=EventQueue)
     active_request: Optional[RequestState] = None
+    # True when session.start carried the runtime's launch token (§2e).
+    # Tokenless sessions keep today's methods and fields; privileged calls
+    # check this flag through RuntimeApp._require_auth.
+    authenticated: bool = False
+    # Negotiated display-event protocol (§2c). The M1 runtime answers 1.
+    event_protocol: int = 1
+    # Sanitised VMD/Tcl versions from session.start (C6); token sessions only.
+    vmd_env: Optional[Dict[str, str]] = None
 
 
 class SessionManager:
@@ -33,11 +41,27 @@ class SessionManager:
         self._lock = threading.Lock()
         self._sessions: Dict[str, SessionState] = {}
 
-    def create_session(self, cwd: str, chat_id: str) -> SessionState:
+    def create_session(
+        self,
+        cwd: str,
+        chat_id: str,
+        *,
+        authenticated: bool = False,
+        event_protocol: int = 1,
+        vmd_env: Optional[Dict[str, str]] = None,
+    ) -> SessionState:
         root = os.path.realpath(cwd or os.getcwd())
         sid = f"sess_{uuid.uuid4().hex[:12]}"
         token = uuid.uuid4().hex
-        state = SessionState(session_id=sid, session_token=token, cwd=root, chat_id=chat_id)
+        state = SessionState(
+            session_id=sid,
+            session_token=token,
+            cwd=root,
+            chat_id=chat_id,
+            authenticated=bool(authenticated),
+            event_protocol=int(event_protocol),
+            vmd_env=dict(vmd_env) if vmd_env else None,
+        )
         with self._lock:
             self._sessions[sid] = state
         return state
