@@ -34,6 +34,8 @@ class SessionState:
     event_protocol: int = 1
     # Sanitised VMD/Tcl versions from session.start (C6); token sessions only.
     vmd_env: Optional[Dict[str, str]] = None
+    # Held by chat.send while it checks for and starts a request (§3).
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
 
 class SessionManager:

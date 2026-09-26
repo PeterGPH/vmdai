@@ -17,7 +17,14 @@ from typing import Any, Callable, Dict, Optional
 
 from pathlib import Path
 
-from .claude_loop import ClaudeToolLoop, ClaudeLoopError, VMD_SYSTEM_PROMPT, build_claude_loop, events_to_messages
+from .claude_loop import (
+    ClaudeLoopError,
+    ClaudeToolLoop,
+    RunContext,
+    VMD_SYSTEM_PROMPT,
+    build_claude_loop,
+    events_to_messages,
+)
 from .recorder import RunRecorder
 from .constants import CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_VERSION
 from .docs_search import DocsSearch
@@ -50,6 +57,7 @@ class RuntimeApp:
         launch_token: Optional[str] = None,
         allow_tokenless_v1: bool = True,
         on_shutdown: Optional[Callable[[], None]] = None,
+        loop_factory: Optional[Callable[[Dict[str, Any]], Optional[ClaudeToolLoop]]] = None,
     ):
         self.sessions = SessionManager()
         # Launch token (§2e). main.py generates it; None (in-process tests)
@@ -120,22 +128,83 @@ class RuntimeApp:
 
         self.provider_name, self.provider = build_provider(env_provider)
 
-        # Build the Claude tool loop (None if no key / mock mode). The
-        # docs_search instance is wired in here so the agent can call
-        # search_docs when an index is available; the wiki_store is wired
-        # in so the agent can call wiki_list / wiki_read / wiki_update /
-        # wiki_verify_pins as the persistent knowledge base.
-        self.claude_loop: ClaudeToolLoop | None = build_claude_loop(
-            env_provider,
-            docs_search=self.docs_search,
-            wiki_store=self.wiki_store,
+        # Every request gets a fresh ClaudeToolLoop from the loop factory
+        # (§3), so no loop, recorder or model override is shared between
+        # requests. The default factory builds from the legacy profile: the
+        # env/--provider choice plus the model picked through provider.set.
+        # The docs_search and wiki_store instances are wired into every loop.
+        self._loop_provider = env_provider
+        self._loop_model: Optional[str] = None
+        self._base_loop_factory: Callable[[Optional[Dict[str, Any]]], Optional[ClaudeToolLoop]] = (
+            loop_factory if loop_factory is not None else self._default_loop_factory
         )
+        self._loop_factory = self._base_loop_factory
+        self._assigned_loop: Optional[ClaudeToolLoop] = None
 
         if self.logger:
             self.logger.info(
                 "provider=%s agent_loop=%s",
                 self.provider_name,
-                self.claude_loop is not None,
+                self.has_agent_loop(),
+            )
+
+    # ------------------------------------------------------------------
+    # Loop factory (§3): a fresh ClaudeToolLoop per request
+    # ------------------------------------------------------------------
+
+    @property
+    def claude_loop(self) -> Optional[ClaudeToolLoop]:
+        """The loop assigned from outside (tests), or None.
+
+        The runtime keeps no loop of its own: chat.send builds one per
+        request through the loop factory. Assigning a loop installs a
+        factory that returns that object, so tests that set
+        ``app.claude_loop = FakeLoop(...)`` keep working unchanged.
+        """
+        return self._assigned_loop
+
+    @claude_loop.setter
+    def claude_loop(self, loop: Optional[ClaudeToolLoop]) -> None:
+        self._assigned_loop = loop
+        self._loop_factory = lambda _profile: loop
+
+    def _default_loop_factory(self, profile: Optional[Dict[str, Any]]) -> Optional[ClaudeToolLoop]:
+        """Build a loop for ``profile`` with the app's docs and wiki stores."""
+        if not profile:
+            return None
+        return build_claude_loop(
+            str(profile.get("provider") or ""),
+            docs_search=self.docs_search,
+            wiki_store=self.wiki_store,
+            model=profile.get("model") or None,
+        )
+
+    def profile_for_session(self, state: Optional[SessionState] = None) -> Optional[Dict[str, Any]]:
+        """The profile a request of ``state`` runs with.
+
+        M1 foundation: the legacy profile {provider, model} from the
+        env/--provider choice and the last provider.set. Plan 03 makes
+        token sessions read the active profile in settings.json.
+        """
+        return {"provider": self._loop_provider, "model": self._loop_model}
+
+    def has_agent_loop(self, state: Optional[SessionState] = None) -> bool:
+        """True when a request of ``state`` would run the agent loop, not mock mode."""
+        try:
+            return self._loop_factory(self.profile_for_session(state)) is not None
+        except Exception:
+            if self.logger:
+                self.logger.warning("loop factory failed", exc_info=True)
+            return False
+
+    def _build_loop(self, profile: Optional[Dict[str, Any]]) -> Optional[ClaudeToolLoop]:
+        try:
+            return self._loop_factory(profile)
+        except Exception as exc:
+            raise RpcError(
+                "PROVIDER_INIT_FAILED",
+                f"failed to build the agent loop: {exc}",
+                {"provider": (profile or {}).get("provider")},
             )
 
     # ------------------------------------------------------------------
@@ -277,7 +346,7 @@ class RuntimeApp:
                 "defaults": dict(state.settings),
                 "chat_id": chat_id,
                 "provider": self.provider_name,
-                "agent_loop": self.claude_loop is not None,
+                "agent_loop": self.has_agent_loop(state),
             }
             if authenticated:
                 result["event_protocol"] = state.event_protocol
@@ -301,54 +370,56 @@ class RuntimeApp:
             if params.get("conversation_mode"):
                 state.settings["conversation_mode"] = params["conversation_mode"]
 
-            with threading.Lock():
-                if (
-                    state.active_request
-                    and state.active_request.thread
-                    and state.active_request.thread.is_alive()
-                ):
+            # The session lock makes check-then-start atomic: two concurrent
+            # chat.send calls on one session can never both start a request.
+            with state.lock:
+                active = state.active_request
+                if active is not None and (active.thread is None or active.thread.is_alive()):
                     raise RpcError("REQUEST_CONFLICT", "an active request is already running")
 
-            request_id = f"req_{os.urandom(6).hex()}"
-            request = RequestState(request_id=request_id)
-            state.active_request = request
+                # A fresh loop for this request (None → mock mode).
+                loop = self._build_loop(self.profile_for_session(state))
 
-            user_event = state.queue.push(
-                "user", "message", params["text"], {"request_id": request_id}
-            )
-            self.store.append_events(state.chat_id, [user_event])
+                request_id = f"req_{os.urandom(6).hex()}"
+                request = RequestState(request_id=request_id)
+                state.active_request = request
 
-            # Auto-set chat title from the first user message
-            manifest = self.store.get_manifest(state.chat_id)
-            if manifest and manifest.get("message_count", 0) <= 1:
-                title = params["text"][:60].strip()
-                if len(params["text"]) > 60:
-                    title += "..."
-                self.store.update_title(state.chat_id, title)
+                user_event = state.queue.push(
+                    "user", "message", params["text"], {"request_id": request_id}
+                )
+                self.store.append_events(state.chat_id, [user_event])
 
-            # Use Claude tool loop when available; fall back to simple provider
-            if self.claude_loop is not None:
-                target = self._run_claude_loop_response
-            else:
-                target = self._run_provider_response
+                # Auto-set chat title from the first user message
+                manifest = self.store.get_manifest(state.chat_id)
+                if manifest and manifest.get("message_count", 0) <= 1:
+                    title = params["text"][:60].strip()
+                    if len(params["text"]) > 60:
+                        title += "..."
+                    self.store.update_title(state.chat_id, title)
 
-            # Build prior context when conversation_mode asks for it
-            conv_mode = str(state.settings.get("conversation_mode") or "local_first")
-            prior_messages = None
-            if conv_mode in ("hybrid_resume", "resume_only") and self.claude_loop is not None:
-                try:
-                    raw_events = self.store.read_events(state.chat_id, limit=200)
-                    prior_messages = events_to_messages(raw_events)
-                except Exception:
-                    prior_messages = None
+                # Build prior context when conversation_mode asks for it
+                conv_mode = str(state.settings.get("conversation_mode") or "local_first")
+                prior_messages = None
+                if conv_mode in ("hybrid_resume", "resume_only") and loop is not None:
+                    try:
+                        raw_events = self.store.read_events(state.chat_id, limit=200)
+                        prior_messages = events_to_messages(raw_events)
+                    except Exception:
+                        prior_messages = None
 
-            thread = threading.Thread(
-                target=target,
-                args=(state.session_id, request_id, params["text"], request.cancel_event, prior_messages),
-                daemon=True,
-            )
-            request.thread = thread
-            thread.start()
+                # Use the agent loop when there is one; fall back to the simple provider
+                if loop is not None:
+                    target = self._run_claude_loop_response
+                    args = (state.session_id, request_id, params["text"],
+                            request.cancel_event, prior_messages, loop)
+                else:
+                    target = self._run_provider_response
+                    args = (state.session_id, request_id, params["text"],
+                            request.cancel_event, prior_messages)
+
+                thread = threading.Thread(target=target, args=args, daemon=True)
+                request.thread = thread
+                thread.start()
             return {"request_id": request_id}
 
         if method == "chat.cancel":
@@ -412,7 +483,7 @@ class RuntimeApp:
                 "settings": dict(state.settings),
                 "key_sources": self.keys.get_sources(),
                 "provider": self.provider_name,
-                "agent_loop": self.claude_loop is not None,
+                "agent_loop": self.has_agent_loop(state),
             }
 
         if method == "settings.set":
@@ -441,19 +512,24 @@ class RuntimeApp:
 
             picked_model = str(params.get("model") or "").strip() or None
             try:
-                self.provider_name, self.provider = build_provider(requested)
-                self.claude_loop = build_claude_loop(
-                    requested,
-                    docs_search=self.docs_search,
-                    wiki_store=self.wiki_store,
-                    model=picked_model,
-                )
+                provider_name, provider = build_provider(requested)
+                agent_loop = self._base_loop_factory(
+                    {"provider": requested, "model": picked_model}
+                ) is not None
             except Exception as exc:
                 raise RpcError(
                     "PROVIDER_INIT_FAILED",
                     f"failed to initialize provider '{requested}': {exc}",
                     {"provider": requested},
                 )
+
+            self.provider_name, self.provider = provider_name, provider
+            self._loop_provider = requested
+            self._loop_model = picked_model
+            # Never install a shared loop: drop any loop assigned from
+            # outside and go back to a fresh loop per request (§3).
+            self._assigned_loop = None
+            self._loop_factory = self._base_loop_factory
 
             if picked_model:
                 state.settings["model"] = picked_model
@@ -462,14 +538,14 @@ class RuntimeApp:
                 self.logger.info(
                     "provider switched to %s (agent_loop=%s, model=%s)",
                     self.provider_name,
-                    self.claude_loop is not None,
+                    agent_loop,
                     state.settings.get("model"),
                 )
 
             return {
                 "ok": True,
                 "provider": self.provider_name,
-                "agent_loop": self.claude_loop is not None,
+                "agent_loop": agent_loop,
                 "model": state.settings.get("model"),
             }
 
@@ -626,13 +702,19 @@ class RuntimeApp:
         prompt: str,
         cancel_event: threading.Event,
         prior_messages: list | None = None,
+        loop: ClaudeToolLoop | None = None,
     ) -> None:
         """
-        Full agentic response: Claude calls VMD tools as needed until done.
-        Runs on a daemon thread; pushes chunk/lifecycle events to the queue.
+        Full agentic response: the model calls VMD tools as needed until done.
+        Runs on a daemon thread with the loop chat.send built for this
+        request; pushes chunk/lifecycle events to the queue.
         """
         state = self.sessions.get(session_id)
         if state is None:
+            return
+        if loop is None:
+            if state.active_request and state.active_request.request_id == request_id:
+                state.active_request = None
             return
 
         model = str(state.settings.get("model") or DEFAULT_SETTINGS["model"])
@@ -654,17 +736,21 @@ class RuntimeApp:
             # Transcript entry for tool results is written in tool.command_result handler
             pass
 
-        # Temporarily override the model on the loop if settings differ
-        loop = self.claude_loop
-        if loop is not None and model and model != loop.model:
-            from .claude_loop import ClaudeToolLoop
-            loop = ClaudeToolLoop(
-                provider_name=loop.provider_name,
-                api_key=loop.api_key,
-                model=model,
-                timeout=loop.timeout,
-                docs_search=self.docs_search,
-            )
+        # The session's model setting overrides the loop's model, as before.
+        # A per-request loop is adjusted in place. An assigned loop is shared
+        # between requests, so it gets a copy, which now keeps the wiki store.
+        if model and model != loop.model:
+            if loop is self._assigned_loop:
+                loop = ClaudeToolLoop(
+                    provider_name=loop.provider_name,
+                    api_key=loop.api_key,
+                    model=model,
+                    timeout=loop.timeout,
+                    docs_search=self.docs_search,
+                    wiki_store=self.wiki_store,
+                )
+            else:
+                loop.model = model
 
         # Build a per-task RunRecorder for this chat.send. The recorder
         # writes <state.cwd>/.vmdai_runs/<task_id>/transcript.tcl plus
@@ -673,12 +759,12 @@ class RuntimeApp:
         # disable. Falls back to ~/.vmdai/runs/ when state.cwd is empty
         # so we never silently drop artifacts.
         recorder = self._build_recorder_for_session(state)
-        prev_recorder = loop.recorder if loop is not None else None
-        if loop is not None:
-            loop.recorder = recorder
+        prev_recorder = loop.recorder
+        loop.recorder = recorder
+        ctx = RunContext(request_id=request_id, chat_id=state.chat_id)
 
         try:
-            output = loop.run(  # type: ignore[union-attr]
+            output = loop.run(
                 prompt=prompt,
                 system_prompt=system_prompt,
                 tool_bridge=self.tool_bridge,
@@ -689,6 +775,7 @@ class RuntimeApp:
                 on_tool_start=on_tool_start,
                 on_tool_result=on_tool_result,
                 prior_messages=prior_messages,
+                ctx=ctx,
             )
         except ClaudeLoopError as exc:
             err_event = state.queue.push(
@@ -700,8 +787,7 @@ class RuntimeApp:
             self.store.append_events(state.chat_id, [err_event])
             if state.active_request and state.active_request.request_id == request_id:
                 state.active_request = None
-            if loop is not None:
-                loop.recorder = prev_recorder
+            loop.recorder = prev_recorder
             return
         except Exception as exc:
             err_event = state.queue.push(
@@ -713,8 +799,7 @@ class RuntimeApp:
             self.store.append_events(state.chat_id, [err_event])
             if state.active_request and state.active_request.request_id == request_id:
                 state.active_request = None
-            if loop is not None:
-                loop.recorder = prev_recorder
+            loop.recorder = prev_recorder
             return
 
         # Finalize
@@ -736,10 +821,9 @@ class RuntimeApp:
         if state.active_request and state.active_request.request_id == request_id:
             state.active_request = None
 
-        # Unbind the per-task recorder so the shared loop doesn't carry
-        # this run's recorder into the next chat.send.
-        if loop is not None:
-            loop.recorder = prev_recorder
+        # Unbind the per-task recorder so an assigned (shared) loop doesn't
+        # carry this run's recorder into the next chat.send.
+        loop.recorder = prev_recorder
 
     # ------------------------------------------------------------------
     # Background thread: simple provider (mock / fallback)
