@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 from .constants import DEFAULT_SETTINGS
 from .events import EventQueue
+from .locks import ChatLock
 
 
 @dataclass
@@ -22,7 +23,8 @@ class SessionState:
     session_id: str
     session_token: str
     cwd: str
-    chat_id: str
+    # None for a token session until its first chat.send creates the chat (§2b).
+    chat_id: Optional[str]
     settings: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_SETTINGS))
     queue: EventQueue = field(default_factory=EventQueue)
     active_request: Optional[RequestState] = None
@@ -36,6 +38,8 @@ class SessionState:
     vmd_env: Optional[Dict[str, str]] = None
     # Held by chat.send while it checks for and starts a request (§3).
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    # Held while this session has its chat open (token sessions only, §2b).
+    chat_lock: Optional[ChatLock] = field(default=None, repr=False, compare=False)
 
 
 class SessionManager:

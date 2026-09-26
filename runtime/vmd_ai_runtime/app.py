@@ -11,20 +11,23 @@ Key additions over the skeleton:
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import threading
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from pathlib import Path
 
+from . import conversation
 from .claude_loop import (
     ClaudeLoopError,
     ClaudeToolLoop,
     RunContext,
     VMD_SYSTEM_PROMPT,
+    WIKI_SYSTEM_PROMPT_ADDENDUM,
     build_claude_loop,
-    events_to_messages,
 )
+from .locks import ChatLock
 from .recorder import RunRecorder
 from .constants import CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_VERSION
 from .docs_search import DocsSearch
@@ -312,7 +315,9 @@ class RuntimeApp:
                     "this runtime was started with --announce; "
                     "session.start needs the launch token",
                 )
-            chat_id = self.store.create_chat(title_hint="VMD AI Chat")
+            # Token sessions create their chat lazily on the first chat.send
+            # (§2b Lock lifecycle); tokenless sessions keep eager creation.
+            chat_id = None if authenticated else self.store.create_chat(title_hint="VMD AI Chat")
             state = self.sessions.create_session(
                 cwd=params["cwd"],
                 chat_id=chat_id,
@@ -356,6 +361,7 @@ class RuntimeApp:
         if method == "session.stop":
             state = self._get_session(params["session_id"], session_token)
             self._cancel_active_request(state)
+            self._release_chat_lock(state)
             self.sessions.remove(state.session_id)
             return {"ok": True}
 
@@ -370,65 +376,67 @@ class RuntimeApp:
             if params.get("conversation_mode"):
                 state.settings["conversation_mode"] = params["conversation_mode"]
 
-            # The session lock makes check-then-start atomic: two concurrent
-            # chat.send calls on one session can never both start a request.
+            # The session lock makes check-then-start atomic (plan 02). The
+            # chat is captured here, so the worker keeps writing to it even if
+            # the session later resumes another chat.
             with state.lock:
-                active = state.active_request
-                if active is not None and (active.thread is None or active.thread.is_alive()):
+                if self._request_running(state):
                     raise RpcError("REQUEST_CONFLICT", "an active request is already running")
-
-                # A fresh loop for this request (None → mock mode).
-                loop = self._build_loop(self.profile_for_session(state))
-
+                # A fresh loop for this request (None: mock mode).
+                loop = self._new_loop_for(state)
+                if state.chat_id is None:
+                    self._open_new_chat(state)
+                chat_id = state.chat_id
                 request_id = f"req_{os.urandom(6).hex()}"
                 request = RequestState(request_id=request_id)
                 state.active_request = request
-
-                # Roll back on any failure before the worker starts (a store
-                # write error, a prompt the store cannot encode): a request
-                # left with thread=None would count as running forever.
                 try:
                     user_event = state.queue.push(
                         "user", "message", params["text"], {"request_id": request_id}
                     )
-                    self.store.append_events(state.chat_id, [user_event])
+                    self.store.append_events(chat_id, [user_event])
 
                     # Auto-set chat title from the first user message
-                    manifest = self.store.get_manifest(state.chat_id)
+                    manifest = self.store.get_manifest(chat_id)
                     if manifest and manifest.get("message_count", 0) <= 1:
                         title = params["text"][:60].strip()
                         if len(params["text"]) > 60:
                             title += "..."
-                        self.store.update_title(state.chat_id, title)
+                        self.store.update_title(chat_id, title)
 
-                    # Build prior context when conversation_mode asks for it
                     conv_mode = str(state.settings.get("conversation_mode") or "local_first")
-                    prior_messages = None
-                    if conv_mode in ("hybrid_resume", "resume_only") and loop is not None:
-                        try:
-                            raw_events = self.store.read_events(state.chat_id, limit=200)
-                            prior_messages = events_to_messages(raw_events)
-                        except Exception:
-                            prior_messages = None
-
-                    # Use the agent loop when there is one; fall back to the simple provider
                     if loop is not None:
-                        target = self._run_claude_loop_response
-                        args = (state.session_id, request_id, params["text"],
-                                request.cancel_event, prior_messages, loop)
+                        system_prompt = self._system_prompt_for_request(state)
+                        try:
+                            prior_messages = self._prior_for(state, chat_id, conv_mode, loop, system_prompt)
+                        except Exception:
+                            if self.logger:
+                                self.logger.warning("building the prior failed; sending without history",
+                                                    exc_info=True)
+                            prior_messages = None
+                        thread = threading.Thread(
+                            target=self._run_claude_loop_response,
+                            args=(state.session_id, request_id, params["text"], request.cancel_event,
+                                  prior_messages),
+                            kwargs={"loop": loop, "chat_id": chat_id, "system_prompt": system_prompt},
+                            daemon=True,
+                        )
                     else:
-                        target = self._run_provider_response
-                        args = (state.session_id, request_id, params["text"],
-                                request.cancel_event, prior_messages)
-
-                    thread = threading.Thread(target=target, args=args, daemon=True)
+                        thread = threading.Thread(
+                            target=self._run_provider_response,
+                            args=(state.session_id, request_id, params["text"], request.cancel_event, None),
+                            daemon=True,
+                        )
                     request.thread = thread
                     thread.start()
                 except Exception:
-                    if state.active_request is request:
-                        state.active_request = None
+                    self._clear_active(state, request_id)
                     raise
-            return {"request_id": request_id}
+
+            reply: Dict[str, Any] = {"request_id": request_id}
+            if state.authenticated:
+                reply["chat_id"] = chat_id
+            return reply
 
         if method == "chat.cancel":
             state = self._get_session(params["session_id"], session_token)
@@ -466,6 +474,8 @@ class RuntimeApp:
 
         if method == "chat.resume":
             state = self._get_session(params["session_id"], session_token)
+            if state.authenticated:
+                return self._resume_token_session(state, params["chat_id"])
             self._cancel_active_request(state)
             chat_id = params["chat_id"]
             manifest = self.store.get_manifest(chat_id)
@@ -709,32 +719,34 @@ class RuntimeApp:
         request_id: str,
         prompt: str,
         cancel_event: threading.Event,
-        prior_messages: list | None = None,
-        loop: ClaudeToolLoop | None = None,
+        prior_messages: Optional[list] = None,
+        loop: Optional[ClaudeToolLoop] = None,
+        chat_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ) -> None:
-        """
-        Full agentic response: the model calls VMD tools as needed until done.
-        Runs on a daemon thread with the loop chat.send built for this
-        request; pushes chunk/lifecycle events to the queue.
+        """Full agentic response on a daemon thread.
+
+        chat.send passes the loop it built for this request, the chat it
+        captured when the request started, and the system prompt the prior
+        was budgeted for. Token sessions also get a messages.jsonl Appender
+        (full memory, §2b).
         """
         state = self.sessions.get(session_id)
         if state is None:
             return
         if loop is None:
-            if state.active_request and state.active_request.request_id == request_id:
-                state.active_request = None
+            self._clear_active(state, request_id)
             return
-
-        model = str(state.settings.get("model") or DEFAULT_SETTINGS["model"])
-        mode = str(state.settings.get("mode") or "work")
-        system_prompt = VMD_SYSTEM_PROMPT + f"\n\nMode: {mode}."
-        chunk_events = []
+        if chat_id is None:
+            chat_id = state.chat_id
+        if system_prompt is None:
+            system_prompt = self._system_prompt_for_request(state)
+        chunk_events: List[Dict[str, Any]] = []
 
         def on_chunk(chunk: str) -> None:
-            ev = state.queue.push(
-                "assistant", "chunk", chunk, {"request_id": request_id}
+            chunk_events.append(
+                state.queue.push("assistant", "chunk", chunk, {"request_id": request_id})
             )
-            chunk_events.append(ev)
 
         def on_tool_start(tool_name: str, tool_input: dict) -> None:
             # Tool start events are pushed directly by VmdToolBridge
@@ -744,9 +756,10 @@ class RuntimeApp:
             # Transcript entry for tool results is written in tool.command_result handler
             pass
 
-        # The session's model setting overrides the loop's model, as before.
-        # A per-request loop is adjusted in place. An assigned loop is shared
-        # between requests, so it gets a copy, which now keeps the wiki store.
+        # The session's model setting overrides the loop's model (plan 02).
+        # A per-request loop is adjusted in place; an assigned loop is shared
+        # between requests, so it gets a copy that keeps the wiki store.
+        model = str(state.settings.get("model") or DEFAULT_SETTINGS["model"])
         if model and model != loop.model:
             if loop is self._assigned_loop:
                 loop = ClaudeToolLoop(
@@ -760,17 +773,17 @@ class RuntimeApp:
             else:
                 loop.model = model
 
-        # Build a per-task RunRecorder for this chat.send. The recorder
-        # writes <state.cwd>/.vmdai_runs/<task_id>/transcript.tcl plus
-        # snapshots — every successful tool call deposits a replayable
-        # artifact on disk, automatically. Set VMD_AI_RECORDER=off to
-        # disable. Falls back to ~/.vmdai/runs/ when state.cwd is empty
-        # so we never silently drop artifacts.
-        recorder = self._build_recorder_for_session(state)
-        prev_recorder = loop.recorder
-        loop.recorder = recorder
-        ctx = RunContext(request_id=request_id, chat_id=state.chat_id)
+        messages_out = None
+        if state.authenticated and chat_id:
+            messages_out = conversation.Appender(self.store.chat_dir(chat_id), request_id)
+        ctx = RunContext(request_id=request_id, chat_id=chat_id or "", on_event=None,
+                         messages_out=messages_out)
 
+        # Per-request recorder; restored afterwards so an assigned (shared)
+        # loop never carries it into the next request.
+        prev_recorder = loop.recorder
+        loop.recorder = self._build_recorder_for_session(state)
+        events_to_persist: List[Dict[str, Any]] = []
         try:
             output = loop.run(
                 prompt=prompt,
@@ -786,52 +799,27 @@ class RuntimeApp:
                 ctx=ctx,
             )
         except ClaudeLoopError as exc:
-            err_event = state.queue.push(
-                "error",
-                "message",
-                f"Agent error: {exc}",
+            events_to_persist.append(state.queue.push(
+                "error", "message", f"Agent error: {exc}",
                 {"request_id": request_id, "provider": self.provider_name},
-            )
-            self.store.append_events(state.chat_id, [err_event])
-            if state.active_request and state.active_request.request_id == request_id:
-                state.active_request = None
-            loop.recorder = prev_recorder
-            return
+            ))
         except Exception as exc:
-            err_event = state.queue.push(
-                "error",
-                "message",
-                f"Unexpected error: {exc}",
-                {"request_id": request_id},
-            )
-            self.store.append_events(state.chat_id, [err_event])
-            if state.active_request and state.active_request.request_id == request_id:
-                state.active_request = None
-            loop.recorder = prev_recorder
-            return
-
-        # Finalize
-        events_to_persist = list(chunk_events)
-        if cancel_event.is_set():
-            cancel_ev = state.queue.push(
-                "system", "lifecycle", "cancelled", {"request_id": request_id}
-            )
-            events_to_persist.append(cancel_ev)
+            events_to_persist.append(state.queue.push(
+                "error", "message", f"Unexpected error: {exc}", {"request_id": request_id},
+            ))
         else:
-            final_ev = state.queue.push(
-                "assistant", "message", output, {"request_id": request_id}
-            )
-            events_to_persist.append(final_ev)
-
-        if events_to_persist:
-            self.store.append_events(state.chat_id, events_to_persist)
-
-        if state.active_request and state.active_request.request_id == request_id:
-            state.active_request = None
-
-        # Unbind the per-task recorder so an assigned (shared) loop doesn't
-        # carry this run's recorder into the next chat.send.
-        loop.recorder = prev_recorder
+            events_to_persist.extend(chunk_events)
+            if cancel_event.is_set():
+                events_to_persist.append(state.queue.push(
+                    "system", "lifecycle", "cancelled", {"request_id": request_id}))
+            else:
+                events_to_persist.append(state.queue.push(
+                    "assistant", "message", output, {"request_id": request_id}))
+        finally:
+            loop.recorder = prev_recorder
+            if events_to_persist and chat_id:
+                self.store.append_events(chat_id, events_to_persist)
+            self._clear_active(state, request_id)
 
     # ------------------------------------------------------------------
     # Background thread: simple provider (mock / fallback)
@@ -906,6 +894,115 @@ class RuntimeApp:
         if not active:
             return
         active.cancel_event.set()
+
+    # ------------------------------------------------------------------
+    # Memory, chats and locks (§2b)
+    # ------------------------------------------------------------------
+
+    def _new_loop_for(self, state) -> Optional[ClaudeToolLoop]:
+        """A fresh loop for one request of this session, or None (mock mode).
+
+        The one place request code builds a loop: plan 02's _build_loop
+        (PROVIDER_INIT_FAILED on errors) over profile_for_session.
+        """
+        return self._build_loop(self.profile_for_session(state))
+
+    @staticmethod
+    def _request_running(state) -> bool:
+        active = state.active_request
+        return active is not None and (active.thread is None or active.thread.is_alive())
+
+    @staticmethod
+    def _clear_active(state, request_id: str) -> None:
+        if state.active_request is not None and state.active_request.request_id == request_id:
+            state.active_request = None
+
+    @staticmethod
+    def _release_chat_lock(state) -> None:
+        lock = getattr(state, "chat_lock", None)
+        if lock is not None:
+            lock.release()
+        state.chat_lock = None
+
+    def _open_new_chat(self, state) -> str:
+        """Create this session's chat on its first chat.send and lock it."""
+        chat_id = self.store.create_chat(title_hint="VMD AI Chat")
+        lock = ChatLock(self.store.chat_dir(chat_id))
+        if not lock.acquire():
+            raise RpcError("CHAT_LOCKED", "could not lock the new chat", {"chat_id": chat_id})
+        self._release_chat_lock(state)
+        state.chat_lock = lock
+        state.chat_id = chat_id
+        return chat_id
+
+    def _resume_token_session(self, state, chat_id: str) -> Dict[str, Any]:
+        """chat.resume for a token session: conflicts, per-chat lock, last_seq."""
+        with state.lock:
+            if self._request_running(state):
+                raise RpcError("REQUEST_CONFLICT",
+                               "a request is running; stop it before switching chats",
+                               {"chat_id": chat_id})
+            manifest = self.store.get_manifest(chat_id)
+            if manifest is None:
+                raise RpcError("NOT_FOUND", f"chat {chat_id} not found")
+            if chat_id != state.chat_id:
+                lock = ChatLock(self.store.chat_dir(chat_id))
+                if not lock.acquire():
+                    raise RpcError("CHAT_LOCKED", "This chat is open in another VMD window.",
+                                   {"chat_id": chat_id})
+                self._release_chat_lock(state)
+                state.chat_lock = lock
+                state.chat_id = chat_id
+            state.queue.clear()
+            # Polling after last_seq delivers the chat_resumed event below.
+            last_seq = state.queue.last_seq
+            state.queue.push("system", "lifecycle", "chat_resumed", {"chat_id": chat_id})
+        return {
+            "ok": True,
+            "chat_id": chat_id,
+            "title": manifest.get("title", ""),
+            "message_count": manifest.get("message_count", 0),
+            "last_seq": last_seq,
+        }
+
+    def _system_prompt_for_request(self, state) -> str:
+        mode = str(state.settings.get("mode") or "work")
+        return VMD_SYSTEM_PROMPT + f"\n\nMode: {mode}."
+
+    def _run_budget_for(self, loop: ClaudeToolLoop, system_prompt: str) -> int:
+        """run_budget for this loop (§2b Budget), counting the wiki addendum run() adds."""
+        prompt = system_prompt
+        if loop.wiki_store is not None:
+            prompt = prompt + WIKI_SYSTEM_PROMPT_ADDENDUM
+        tools_chars = len(json.dumps(loop._tools_for_turn()))
+        context_tokens = conversation.context_tokens_for(loop.provider_name, getattr(loop, "options", None))
+        return conversation.compute_run_budget(context_tokens, len(prompt), tools_chars)
+
+    def _prior_for(self, state, chat_id: str, conv_mode: str, loop: ClaudeToolLoop,
+                   system_prompt: str) -> Optional[List[Dict[str, Any]]]:
+        """Prior messages for this request (§2b), or None.
+
+        Token sessions in "full" mode read messages.jsonl, seeding it once
+        from a legacy chat's text history. hybrid_resume/resume_only (and
+        "full" from a tokenless session) use the legacy text path with the
+        duplicate-prompt fix. local_first sends no history.
+        """
+        if state.authenticated and conv_mode == "full":
+            chat_dir = self.store.chat_dir(chat_id)
+            if not conversation.messages_path(chat_dir).exists():
+                legacy = conversation.legacy_prior(
+                    self.store.read_events(chat_id, limit=conversation.ALL_EVENTS))
+                conversation.import_legacy(chat_dir, legacy)
+            prior = conversation.build_prior(
+                chat_dir,
+                self._run_budget_for(loop, system_prompt),
+                conversation.max_images_for(loop.provider_name),
+            )
+            return prior or None
+        if conv_mode in ("hybrid_resume", "resume_only", "full"):
+            events = self.store.read_events(chat_id, limit=conversation.ALL_EVENTS)
+            return conversation.legacy_prior(events) or None
+        return None
 
     @staticmethod
     def _system_prompt_for_mode(mode: str) -> str:

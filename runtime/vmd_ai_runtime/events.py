@@ -38,6 +38,12 @@ class EventQueue:
             self._events.clear()
             self._seq = 0
 
+    @property
+    def last_seq(self) -> int:
+        """Sequence number of the newest event pushed (0 when none)."""
+        with self._lock:
+            return self._seq
+
     def poll(self, after_seq: int, limit: int) -> Dict[str, Any]:
         safe_after = max(0, int(after_seq or 0))
         safe_limit = max(1, min(int(limit or 50), 500))

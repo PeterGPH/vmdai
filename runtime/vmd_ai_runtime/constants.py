@@ -33,7 +33,7 @@ CAPABILITIES = {
     "keys": ["openrouter", "anthropic"],
 }
 
-CONVERSATION_MODES = ("local_first", "hybrid_resume", "resume_only")
+CONVERSATION_MODES = ("local_first", "hybrid_resume", "resume_only", "full")
 
 # Runtime RPC/auth protocol, reported in the READY line, /health and
 # runtime.info (§2c). 2 = launch token + tool.ack. It is separate from the
