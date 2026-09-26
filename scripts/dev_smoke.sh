@@ -2,9 +2,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="${PYTHON:-python3}"
-PORT="${VMD_AI_PORT:-8765}"
+PYTHON_BIN="${VMD_AI_PYTHON:-${PYTHON:-python3}}"
+# The port: VMD_AI_PORT, else the port of VMD_AI_ATTACH=host:port (the
+# address the plugin attaches to), else 8765.
+ATTACH_PORT=""
+if [ -n "${VMD_AI_ATTACH:-}" ]; then
+  ATTACH_PORT="${VMD_AI_ATTACH##*:}"
+fi
+PORT="${VMD_AI_PORT:-${ATTACH_PORT:-8765}}"
 STORE_DIR="${VMD_AI_STORE_DIR:-$HOME/.vmdai/chats_smoke}"
+TOKEN_FILE="$HOME/.vmdai/run/runtime-${PORT}.json"
 
 "$ROOT_DIR/scripts/print_env_checks.sh"
 
@@ -19,11 +26,15 @@ for _ in $(seq 1 40); do
   sleep 0.1
 done
 
-PYTHONPATH="$ROOT_DIR/runtime:${PYTHONPATH:-}" "$PYTHON_BIN" - <<'PY'
+echo "[smoke] launch token file: ${TOKEN_FILE}"
+test -f "$TOKEN_FILE" || { echo "[smoke] token file missing" >&2; exit 1; }
+
+VMD_AI_PORT="$PORT" PYTHONPATH="$ROOT_DIR/runtime:${PYTHONPATH:-}" "$PYTHON_BIN" - <<'PY'
+import os
 import time
 from vmd_ai_runtime.client import RuntimeClient
 
-client = RuntimeClient(port=8765)
+client = RuntimeClient(port=int(os.environ.get("VMD_AI_PORT", "8765")))
 health = client.health()
 print('[smoke] health:', health)
 
