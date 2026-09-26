@@ -1233,6 +1233,7 @@ _FENCED_TCL_RE = re.compile(
 def _rescue_json_tool_calls(
     text: str,
     allowed_names: set,
+    mode: str = "all",
 ) -> List[Dict[str, Any]]:
     """Recover tool calls that small Ollama models pasted into the text body.
 
@@ -1263,11 +1264,17 @@ def _rescue_json_tool_calls(
        don't fire on Python/shell snippets the model might paste for
        illustration.
 
+    ``mode`` (§2f Rescue): ``"all"`` runs both passes (today's behaviour,
+    the options=None default); ``"json"`` runs pass 1 only, so a ```tcl
+    block in prose never runs (S12); anything else (``"off"``) rescues
+    nothing.
+
     Returns the list of synthesized tool_use blocks (empty if none).
     Conservative on purpose: we'd rather miss a rescue than fire on
     unrelated content.
     """
-    if not text or not allowed_names:
+    mode = str(mode or "all").strip().lower()
+    if not text or not allowed_names or mode not in ("all", "json"):
         return []
 
     # ---- Pass 1: JSON-shaped tool calls -----------------------------
@@ -1362,7 +1369,10 @@ def _rescue_json_tool_calls(
     # qwen2.5-coder and similar code-tuned local models often dodge the
     # tool schema entirely and emit "here's the Tcl I'd run" in a
     # fenced ```tcl block. Treat that as an implicit run_vmd_command
-    # invocation when the model was offered that tool.
+    # invocation when the model was offered that tool. Only in "all"
+    # mode: the product ("json") never runs Tcl written in prose.
+    if mode != "all":
+        return []
     if "run_vmd_command" not in allowed_names:
         return []
 
@@ -1530,9 +1540,11 @@ def _stream_ollama(
     # JSON-in-content rescue: if the model didn't emit structured
     # tool_calls but pasted a tool-call-shaped JSON into the text body,
     # synthesize tool_use blocks from it. See _rescue_json_tool_calls.
-    if not final_tool_blocks and text:
+    # Rescue mode (§2f): options=None keeps "all"; the product uses "json".
+    rescue_mode = opts.rescue if opts is not None else "all"
+    if not final_tool_blocks and text and rescue_mode != "off":
         allowed = {str(t.get("name") or "") for t in tools_list if t.get("name")}
-        rescued = _rescue_json_tool_calls(text, allowed)
+        rescued = _rescue_json_tool_calls(text, allowed, mode=rescue_mode)
         if rescued:
             for block in rescued:
                 if not block.get("id"):
