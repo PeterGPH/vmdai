@@ -16,7 +16,9 @@ from vmd_ai_runtime.launch import (
 )
 from vmd_ai_runtime.logging_utils import configure_logging, default_log_path
 
-_SHUTDOWN_LOCK = threading.Lock()
+# Reentrant: a second SIGTERM/SIGINT can run its handler on the main thread
+# while the first one still holds the lock (inside thread.start()).
+_SHUTDOWN_LOCK = threading.RLock()
 
 
 def parse_args(argv=None):

@@ -56,6 +56,32 @@ def _stop_while_streaming(cancel, text):
     return _call
 
 
+class _StopDuringCall(SpyBridge):
+    """SpyBridge that presses Stop while its ``n``-th tool call runs."""
+
+    def __init__(self, cancel, n):
+        super().__init__()
+        self.cancel, self.n = cancel, n
+
+    def execute_tool(self, **kwargs):
+        result = super().execute_tool(**kwargs)
+        if len(self.calls) == self.n:
+            self.cancel.set()
+        return result
+
+
+def _stop_in_last_tool_round(opts, turns):
+    """Run ``turns`` tool turns; Stop lands in the tool round of the last one."""
+    cancel = threading.Event()
+    loop = _loop(opts)
+    loop._call = scripted_call(
+        [("", [tool_use(f"tc_{i}", "run_vmd_command", command=f"puts {i}")]) for i in range(turns)])
+    bridge = _StopDuringCall(cancel, turns)
+    run_loop(loop, bridge=bridge, cancel_event=cancel)
+    assert len(bridge.calls) == turns
+    return loop
+
+
 def test_report_cancelled_on():
     cancel = threading.Event()
     loop = _loop(LoopOptions(report_cancelled=True))
@@ -63,6 +89,11 @@ def test_report_cancelled_on():
     assert run_loop(loop, cancel_event=cancel) == "partial"
     assert loop.last_status == "cancelled"
     assert loop.last_final_text_empty is False
+
+    # Stop during the tool round of the last allowed turn is still a cancel,
+    # not max_turns (the for/else must not overwrite it).
+    loop = _stop_in_last_tool_round(LoopOptions(report_cancelled=True, max_turns=1), 1)
+    assert (loop.last_status, loop.last_turns) == ("cancelled", 1)
 
 
 def test_report_cancelled_off():
@@ -72,6 +103,12 @@ def test_report_cancelled_off():
         loop._call = _stop_while_streaming(cancel, "partial")
         run_loop(loop, cancel_event=cancel)
         assert loop.last_status == "complete"  # today's behaviour
+
+    # Without the flag, Stop in the last turn's tool round keeps today's
+    # max_turns (options=None: the 28-turn cap; S7).
+    for opts, turns in ((None, 28), (LoopOptions(max_turns=1), 1)):
+        loop = _stop_in_last_tool_round(opts, turns)
+        assert (loop.last_status, loop.last_turns) == ("max_turns", turns)
 
 
 def test_turn_retry_once_after_stream_drop():

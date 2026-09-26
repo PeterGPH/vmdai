@@ -164,6 +164,28 @@ def test_sigterm_exits_within_2s(tmp_path):
     finally:
         _stop(proc)
 
+    # A second signal can re-enter _start_shutdown on the main thread while
+    # the first handler still holds the lock; it must return, not deadlock.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("vmdai_runtime_main_under_test", MAIN)
+    runtime_main = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runtime_main)
+
+    class _Server:
+        def shutdown(self):
+            pass
+
+    server, nested = _Server(), []
+
+    def first_handler():
+        with runtime_main._SHUTDOWN_LOCK:
+            nested.append(runtime_main._start_shutdown(server))
+
+    thread = threading.Thread(target=first_handler, daemon=True)
+    thread.start()
+    thread.join(2.0)
+    assert nested and nested[0] is runtime_main._start_shutdown(server)
+
 
 def test_sigterm_during_active_request_exits_within_2s(tmp_path):
     # A listener that accepts and never answers: the worker blocks in urlopen.

@@ -384,42 +384,50 @@ class RuntimeApp:
                 request = RequestState(request_id=request_id)
                 state.active_request = request
 
-                user_event = state.queue.push(
-                    "user", "message", params["text"], {"request_id": request_id}
-                )
-                self.store.append_events(state.chat_id, [user_event])
+                # Roll back on any failure before the worker starts (a store
+                # write error, a prompt the store cannot encode): a request
+                # left with thread=None would count as running forever.
+                try:
+                    user_event = state.queue.push(
+                        "user", "message", params["text"], {"request_id": request_id}
+                    )
+                    self.store.append_events(state.chat_id, [user_event])
 
-                # Auto-set chat title from the first user message
-                manifest = self.store.get_manifest(state.chat_id)
-                if manifest and manifest.get("message_count", 0) <= 1:
-                    title = params["text"][:60].strip()
-                    if len(params["text"]) > 60:
-                        title += "..."
-                    self.store.update_title(state.chat_id, title)
+                    # Auto-set chat title from the first user message
+                    manifest = self.store.get_manifest(state.chat_id)
+                    if manifest and manifest.get("message_count", 0) <= 1:
+                        title = params["text"][:60].strip()
+                        if len(params["text"]) > 60:
+                            title += "..."
+                        self.store.update_title(state.chat_id, title)
 
-                # Build prior context when conversation_mode asks for it
-                conv_mode = str(state.settings.get("conversation_mode") or "local_first")
-                prior_messages = None
-                if conv_mode in ("hybrid_resume", "resume_only") and loop is not None:
-                    try:
-                        raw_events = self.store.read_events(state.chat_id, limit=200)
-                        prior_messages = events_to_messages(raw_events)
-                    except Exception:
-                        prior_messages = None
+                    # Build prior context when conversation_mode asks for it
+                    conv_mode = str(state.settings.get("conversation_mode") or "local_first")
+                    prior_messages = None
+                    if conv_mode in ("hybrid_resume", "resume_only") and loop is not None:
+                        try:
+                            raw_events = self.store.read_events(state.chat_id, limit=200)
+                            prior_messages = events_to_messages(raw_events)
+                        except Exception:
+                            prior_messages = None
 
-                # Use the agent loop when there is one; fall back to the simple provider
-                if loop is not None:
-                    target = self._run_claude_loop_response
-                    args = (state.session_id, request_id, params["text"],
-                            request.cancel_event, prior_messages, loop)
-                else:
-                    target = self._run_provider_response
-                    args = (state.session_id, request_id, params["text"],
-                            request.cancel_event, prior_messages)
+                    # Use the agent loop when there is one; fall back to the simple provider
+                    if loop is not None:
+                        target = self._run_claude_loop_response
+                        args = (state.session_id, request_id, params["text"],
+                                request.cancel_event, prior_messages, loop)
+                    else:
+                        target = self._run_provider_response
+                        args = (state.session_id, request_id, params["text"],
+                                request.cancel_event, prior_messages)
 
-                thread = threading.Thread(target=target, args=args, daemon=True)
-                request.thread = thread
-                thread.start()
+                    thread = threading.Thread(target=target, args=args, daemon=True)
+                    request.thread = thread
+                    thread.start()
+                except Exception:
+                    if state.active_request is request:
+                        state.active_request = None
+                    raise
             return {"request_id": request_id}
 
         if method == "chat.cancel":

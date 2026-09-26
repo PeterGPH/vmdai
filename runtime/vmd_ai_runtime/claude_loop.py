@@ -2635,6 +2635,10 @@ class ClaudeToolLoop:
                 logger.warning("hit max turns (%d) without finishing",
                                max_turns)
                 end_status = "max_turns"
+                # report_cancelled: Stop during the last allowed turn's tool
+                # round is still a cancel (options=None keeps max_turns; S7).
+                if opts is not None and opts.report_cancelled and cancel_event.is_set():
+                    end_status = "cancelled"
         except RunCancelled:
             end_status = "cancelled"
             logger.info("stopped during a provider backoff")

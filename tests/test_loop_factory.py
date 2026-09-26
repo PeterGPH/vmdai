@@ -77,6 +77,24 @@ def test_concurrent_send_conflict(tmp_path):
     conflicts = [r for r in results if r.get("error", {}).get("code") == "REQUEST_CONFLICT"]
     assert (len(started), len(conflicts)) == (1, 1), results
 
+    # A send that fails before its worker starts rolls back, so it never
+    # wedges the session in REQUEST_CONFLICT: a store write error (disk full)
+    # and a prompt the store cannot encode (a lone surrogate escape).
+    original = app.store.append_events
+
+    def disk_full_once(chat_id, events):
+        app.store.append_events = original
+        raise OSError(28, "No space left on device")
+
+    app.store.append_events = disk_full_once
+    for text in ("hi", "hello \ud83d"):
+        failed = _send(app, session, text=text)
+        assert failed.get("error", {}).get("code") == "INTERNAL_ERROR", failed
+        assert app.sessions.get(session["session_id"]).active_request is None
+    again = _send(app, session)
+    assert "result" in again, again
+    wait_idle(app, session["session_id"])
+
 
 def test_per_request_loop_gets_wiki_store(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
