@@ -57,17 +57,22 @@ def test_chat_lock_exclusive_across_processes(tmp_path):
 def test_chat_lock_released_on_kill(tmp_path):
     """Review focus: the OS frees the per-chat lock when the holder is SIGKILLed."""
     proc, line = _spawn(CHAT_HOLDER, tmp_path)
-    assert line == "held"
-    os.kill(proc.pid, signal.SIGKILL)
-    proc.wait(5)
-    mine = ChatLock(tmp_path)
-    assert mine.acquire() is True and mine.held is True
-    other = ChatLock(tmp_path)
-    assert other.acquire() is False            # exclusive inside one process too
-    mine.release()
-    assert mine.held is False and other.acquire() is True
-    other.release()
-    assert (tmp_path / ".lock").exists()
+    try:
+        assert line == "held"
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(5)
+        mine = ChatLock(tmp_path)
+        assert mine.acquire() is True and mine.held is True
+        other = ChatLock(tmp_path)
+        assert other.acquire() is False            # exclusive inside one process too
+        mine.release()
+        assert mine.held is False and other.acquire() is True
+        other.release()
+        assert (tmp_path / ".lock").exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(5)
 
 
 def test_store_lock_serialises_index_appends(tmp_path):

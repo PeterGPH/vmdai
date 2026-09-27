@@ -2,6 +2,7 @@
 (§2c Stage split, §3 RPC table, §2e privileged ops, S11)."""
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -194,6 +195,53 @@ def test_provider_set_activates_when_none_is_active(tmp_path):
         "base_url": "http://localhost:8000/v1", "options": {}})
 
 
+def test_provider_set_switch_keeps_other_profiles(tmp_path):
+    """I1 (whole-branch review): a provider switch with no explicit ``profile``
+    lands on (or creates) a profile of the requested provider instead of
+    overwriting the active profile in place, so switching providers and back
+    restores the tunnel profile's base_url and options untouched."""
+    tunnel = {"provider": "ollama", "base_url": "http://127.0.0.1:11435", "model": "qwen3.8:27b",
+              "options": {"num_ctx": 16384, "keep_alive": "30m"}}
+    store = SettingsStore()
+    store.save_profile("ollama-11435", tunnel, activate=True)
+    app = make_token_app(tmp_path, settings_store=store)
+    session = start(app, tmp_path)
+
+    reply = result(call(app, "provider.set", {"provider": "anthropic-direct",
+                                              "model": "claude-sonnet-4-5"}, session))
+    assert reply["profile"] == "claude"
+    assert store.active_profile()[0] == "claude"
+    assert store.get_profile("ollama-11435") == tunnel
+
+    reply = result(call(app, "provider.set", {"provider": "ollama", "model": "qwen3.8:27b"}, session))
+    assert reply["profile"] == "ollama-11435"
+    assert store.active_profile()[0] == "ollama-11435"
+    restored = store.get_profile("ollama-11435")
+    assert restored["base_url"] == "http://127.0.0.1:11435"
+    assert restored["options"] == {"num_ctx": 16384, "keep_alive": "30m"}
+
+    # A default-named `ollama` profile, when present, is preferred over ollama-11435.
+    store.save_profile("ollama", {"provider": "ollama", "model": "llama3.1:8b", "options": {}})
+    result(call(app, "provider.set", {"provider": "anthropic-direct", "model": "claude-sonnet-4-6"}, session))
+    reply = result(call(app, "provider.set", {"provider": "ollama", "model": "qwen3.8:27b"}, session))
+    assert reply["profile"] == "ollama"
+    assert store.active_profile()[0] == "ollama"
+
+    # No anthropic-direct profile exists, but a differently-provider'd
+    # `claude` profile does: the switch creates and activates `claude-2`.
+    other = SettingsStore(home=str(tmp_path / "other"))
+    other.save_profile("claude", {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
+                       activate=True)
+    other_app = make_token_app(tmp_path / "other_app", settings_store=other)
+    other_session = start(other_app, tmp_path / "other_app")
+    reply = result(call(other_app, "provider.set", {"provider": "anthropic-direct",
+                                                    "model": "claude-sonnet-4-5"}, other_session))
+    assert reply["profile"] == "claude-2"
+    assert other.active_profile()[0] == "claude-2"
+    assert other.get_profile("claude-2")["provider"] == "anthropic-direct"
+    assert other.get_profile("claude")["provider"] == "openrouter"          # untouched
+
+
 def test_settings_set_persisted_keys_require_auth(tmp_path):
     app = _app(tmp_path)
     token_session, tokenless = start(app, tmp_path), start(app, tmp_path, token="")
@@ -227,3 +275,33 @@ def test_read_only_settings_rejected_over_rpc(tmp_path):
     assert envelope["error"]["data"] == {"reason": "read_only", "settings_source": "invalid"}
     assert result(call(app, "runtime.info", {}, session))["settings_source"] == "invalid"
     assert store.path.read_text() == "{broken"
+
+
+def test_hand_edited_top_level_settings_fall_back(tmp_path):
+    """M1: a malformed top-level value falls back to its default instead of crashing."""
+    store = SettingsStore()
+    store.save_profile("qwen", QWEN, activate=True)
+    data = json.loads(store.path.read_text())
+    data["max_turns"] = None
+    data["wiki_enabled"] = "false"
+    store.path.write_text(json.dumps(data))
+    app = make_token_app(tmp_path, settings_store=store)
+    session = start(app, tmp_path)
+    info = result(call(app, "runtime.info", {}, session))
+    assert info["max_turns"] == 28 and info["wiki"] is False
+    reply = result(send(app, session, "hello"))
+    assert reply["request_id"]
+    wait_idle(app, session)
+
+    other_home = tmp_path / "other"
+    other = SettingsStore(home=str(other_home))
+    other.path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps({"version": 1, "active": None, "profiles": []})
+    other.path.write_text(raw)
+    other_app = make_token_app(tmp_path / "other_app", settings_store=other)
+    other_session = start(other_app, tmp_path / "other_app")
+    assert other.settings_source == "invalid"
+    envelope = call(other_app, "provider.set", {"provider": "ollama", "model": "m"}, other_session)
+    assert error_code(envelope) == "INVALID_PARAMS"
+    assert envelope["error"]["data"]["reason"] == "read_only"
+    assert other.path.read_text() == raw

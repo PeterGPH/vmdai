@@ -188,3 +188,22 @@ def test_ill_typed_option_values_rejected(tmp_path):
     fine = {"turn_retry": 2, "temperature": 0, "seed": None, "rescue": "off", "think": "high",
             "supports_vision": "auto", "future_knob": [1]}
     assert store.save_profile("other", dict(QWEN, options=fine))["options"] == fine
+
+
+def test_base_url_must_be_http(tmp_path):
+    """M5: both profile.base_url and options.base_url get the http(s) check."""
+    store = SettingsStore(home=str(tmp_path))
+    with pytest.raises(SettingsError) as info:
+        store.save_profile("qwen", dict(QWEN, base_url="file:///etc/passwd"))
+    assert info.value.code == "INVALID" and "base_url" in info.value.message
+    assert not store.path.exists()
+    with pytest.raises(SettingsError) as info:
+        store.save_profile("qwen", dict(QWEN, options=dict(QWEN["options"], base_url="ftp://x")))
+    assert info.value.code == "INVALID" and "base_url" in info.value.message
+    assert not store.path.exists()
+    store.save_profile("qwen", dict(QWEN, base_url="http://127.0.0.1:11435"), activate=True)
+    before = store.path.read_text()
+    with pytest.raises(SettingsError) as info:
+        store.update_profile("qwen", options={"base_url": "ftp://x"})
+    assert info.value.code == "INVALID"
+    assert store.path.read_text() == before

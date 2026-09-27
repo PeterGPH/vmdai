@@ -122,6 +122,14 @@ def _clean_profile(profile: Any) -> Dict[str, Any]:
         problem = option_type_error(str(key), value)
         if problem is not None:
             raise SettingsError("INVALID", "options.%s %s" % (key, problem))
+    from .errors import RpcError  # late import: no cycle, but keeps protocol optional at module load
+    from .protocol import _as_base_url
+    for field, value in (("base_url", profile.get("base_url")), ("options.base_url", options.get("base_url"))):
+        if value not in (None, ""):
+            try:
+                _as_base_url(value)
+            except RpcError:
+                raise SettingsError("INVALID", "%s must be an http(s) URL" % field)
     out = copy.deepcopy(profile)
     out["provider"] = provider
     out["model"] = str(profile.get("model") or "")
@@ -131,6 +139,23 @@ def _clean_profile(profile: Any) -> Dict[str, Any]:
     else:
         out["base_url"] = str(out["base_url"]).rstrip("/")
     return out
+
+
+def checked_setting(data: Mapping[str, Any], name: str) -> Any:
+    """``data[name]``, or its default when the value is malformed (M1).
+
+    Guards against a hand-edited settings.json: ``max_turns: null`` would
+    otherwise crash the agent-loop build (``int(None)``), and
+    ``wiki_enabled: "false"`` is truthy and would silently turn the wiki on.
+    """
+    default = TOP_LEVEL_DEFAULTS[name]
+    value = data.get(name, default)
+    try:
+        _check_patch({name: value})
+    except SettingsError as exc:
+        logger.warning("settings.json: %s; using the default %r", exc.message, default)
+        return default
+    return value
 
 
 def _check_patch(patch: Any) -> Dict[str, Any]:
@@ -176,6 +201,8 @@ class SettingsStore:
         except (OSError, ValueError):
             return default_settings(), "invalid"
         if not isinstance(data, dict):
+            return default_settings(), "invalid"
+        if "profiles" in data and not isinstance(data["profiles"], dict):
             return default_settings(), "invalid"
         version = data.get("version", 0)
         if isinstance(version, bool) or not isinstance(version, int):
@@ -244,7 +271,7 @@ class SettingsStore:
         with store_lock(self.root):
             data, source = self._read()
             if source in ("newer", "invalid"):
-                reason = "was written by a newer ChatVMD" if source == "newer" else "is not valid JSON"
+                reason = "was written by a newer ChatVMD" if source == "newer" else "is not a valid settings file"
                 raise SettingsError("READ_ONLY", "%s %s; it will not be overwritten" % (self.path, reason))
             data = self._migrate(data)
             outcome = change(data)
@@ -286,7 +313,7 @@ class SettingsStore:
 
         def change(data: Dict[str, Any]) -> Dict[str, Any]:
             data.update(clean)
-            return {key: data.get(key, TOP_LEVEL_DEFAULTS[key]) for key in TOP_LEVEL_DEFAULTS}
+            return {key: checked_setting(data, key) for key in TOP_LEVEL_DEFAULTS}
 
         return self._mutate(change)
 
@@ -528,7 +555,7 @@ def profile_from_server(base_url: str, *, urlopen: Callable[..., Any],
             "options": {"num_ctx": _capped_num_ctx(chosen_show)}}
 
 
-def probe_local_ollama(ports: Sequence[int] = (11435, 11434), timeout: float = 0.3) -> List[Dict[str, Any]]:
+def probe_local_ollama(ports: Sequence[int] = LOCAL_OLLAMA_PORTS, timeout: float = 0.3) -> List[Dict[str, Any]]:
     """Ask 127.0.0.1:<port>/api/version on each port, in order, ``timeout`` s each.
 
     A responder is listed as {base_url, version, models}; a refused, reset

@@ -53,6 +53,7 @@ from .settings_store import (
     TOP_LEVEL_DEFAULTS,
     SettingsError,
     SettingsStore,
+    checked_setting,
     normalize_provider,
     resolve_profile,
 )
@@ -155,7 +156,6 @@ class RuntimeApp:
             if openrouter_key:
                 env_provider = "openrouter"
             else:
-                from .provider import resolve_anthropic_api_key
                 anthropic_key, _src = resolve_anthropic_api_key()
                 if anthropic_key:
                     env_provider = "anthropic-direct"
@@ -345,10 +345,11 @@ class RuntimeApp:
         return ""
 
     def _setting(self, name: str) -> Any:
-        """A top-level settings.json value, or its default when there is no store."""
+        """A top-level settings.json value, or its default when there is no store
+        or the stored value is malformed (M1)."""
         if self.settings_store is None:
             return TOP_LEVEL_DEFAULTS[name]
-        return self.settings_store.load().get(name, TOP_LEVEL_DEFAULTS[name])
+        return checked_setting(self.settings_store.load(), name)
 
     def _profile_summary(self, state) -> Optional[Dict[str, Any]]:
         profile = self.profile_for_session(state)
@@ -482,15 +483,51 @@ class RuntimeApp:
             return RpcError("INVALID_PARAMS", exc.message, {"reason": "read_only", "settings_source": source})
         return RpcError("INVALID_PARAMS", exc.message)
 
-    def _provider_set_profile(self, state, params: Dict[str, Any]) -> Dict[str, Any]:
-        """provider.set for a token session: persist into the active or named profile.
+    @staticmethod
+    def _apply_target(store: SettingsStore, provider_name: str) -> str:
+        """The profile name a provider *switch* (no explicit ``profile``) lands on (I1).
 
-        Applies to the next request. Without a profile name it edits the
-        active profile in place (M1 ui.tcl Apply, §2f). With no active
-        profile it edits (or creates) the provider's default-named profile and
-        activates it: first run may have seeded ``claude``/``openrouter`` from
-        last_provider.txt without activating it, and applying it is the
-        user's explicit choice.
+        Prefers an existing profile of ``provider_name`` — the default-named
+        one, else the first one found — over creating a fresh profile, so
+        switching providers and back restores that profile's base_url and
+        options untouched instead of overwriting the active profile in place.
+        Only when no profile of this provider exists does it fall back to
+        creating one, trying ``<default>``, ``<default>-2``, ``<default>-3``, ...
+        """
+        profiles = store.load()["profiles"]
+        same = [n for n, p in profiles.items()
+                if isinstance(p, dict) and normalize_provider(p.get("provider")) == provider_name]
+        default_name = DEFAULT_PROFILE_NAMES[provider_name]
+        if default_name in same:
+            return default_name
+        if same:
+            return same[0]
+        name = default_name
+        suffix = 2
+        while name in profiles:
+            name = "%s-%d" % (default_name, suffix)
+            suffix += 1
+        return name
+
+    def _provider_set_profile(self, state, params: Dict[str, Any]) -> Dict[str, Any]:
+        """provider.set for a token session: persist into the active, named or
+        provider-matching profile.
+
+        Applies to the next request. With an explicit ``profile`` name it
+        edits (or creates) that profile in place, unchanged from before.
+        Without a name:
+          - if the active profile already runs the requested provider, it is
+            edited in place (M1 ui.tcl Apply, §2f) — a plain model change
+            never disturbs another profile;
+          - otherwise this is a provider *switch*: ``_apply_target`` picks
+            (or creates) a profile of that provider and activates it, so a
+            round trip through another provider and back restores the
+            original profile's base_url and options (whole-branch review I1)
+            instead of overwriting the active profile in place;
+          - with no active profile at all, the provider's default-named
+            profile is edited (or created) and activated: first run may have
+            seeded ``claude``/``openrouter`` from last_provider.txt without
+            activating it, and applying it is the user's explicit choice.
         """
         store = self.settings_store
         provider_name = normalize_provider(params.get("provider"))
@@ -502,20 +539,25 @@ class RuntimeApp:
         base_url = str(params.get("base_url") or "").strip() or None
         options = params.get("options")
         name = str(params.get("profile") or "").strip()
+        switch = False
         try:
-            active_name, _active = store.active_profile()
+            active_name, active = store.active_profile()
             if not name:
-                name = active_name or DEFAULT_PROFILE_NAMES[provider_name]
+                if active is not None and normalize_provider(active.get("provider")) == provider_name:
+                    name = active_name
+                else:
+                    name = self._apply_target(store, provider_name)
+                    switch = True
             if store.get_profile(name) is None:
                 profile: Dict[str, Any] = {"provider": provider_name, "model": model or "",
                                            "options": dict(options or {})}
                 url = base_url or DEFAULT_BASE_URLS.get(provider_name)
                 if url:
                     profile["base_url"] = url
-                store.save_profile(name, profile, activate=active_name is None)
+                store.save_profile(name, profile, activate=(active_name is None or switch))
             else:
                 store.update_profile(name, provider=provider_name, model=model, base_url=base_url, options=options)
-                if active_name is None:
+                if active_name is None or switch:
                     store.activate(name)
         except SettingsError as exc:
             raise self._settings_rpc_error(exc)
@@ -682,9 +724,10 @@ class RuntimeApp:
 
         if method == "session.stop":
             state = self._get_session(params["session_id"], session_token)
-            self._cancel_active_request(state)
-            self._release_chat_lock(state)
-            self.sessions.remove(state.session_id)
+            with state.lock:
+                self._cancel_active_request(state)
+                self._release_chat_lock(state)
+                self.sessions.remove(state.session_id)
             return {"ok": True}
 
         # ---- Chat ----
@@ -703,6 +746,10 @@ class RuntimeApp:
             # chat is captured here, so the worker keeps writing to it even if
             # the session later resumes another chat.
             with state.lock:
+                if self.sessions.get(state.session_id) is not state:
+                    # M4: a request that raced _get_session before session.stop
+                    # released this session's lock and removed it (§3).
+                    raise RpcError("AUTH_FAILED", "invalid session or token")
                 if self._request_running(state):
                     raise RpcError("REQUEST_CONFLICT", "an active request is already running")
                 # A fresh loop for this request (None: mock mode).
@@ -1327,6 +1374,10 @@ class RuntimeApp:
     def _resume_token_session(self, state, chat_id: str) -> Dict[str, Any]:
         """chat.resume for a token session: conflicts, per-chat lock, last_seq."""
         with state.lock:
+            if self.sessions.get(state.session_id) is not state:
+                # M4: a request that raced _get_session before session.stop
+                # released this session's lock and removed it (§3).
+                raise RpcError("AUTH_FAILED", "invalid session or token")
             if self._request_running(state):
                 raise RpcError("REQUEST_CONFLICT",
                                "a request is running; stop it before switching chats",
@@ -1390,7 +1441,8 @@ class RuntimeApp:
             return prior or None
         if conv_mode in ("hybrid_resume", "resume_only", "full"):
             events = self.store.read_events(chat_id, limit=conversation.ALL_EVENTS)
-            return conversation.legacy_prior(events) or None
+            return conversation.trim_text_prior(
+                conversation.legacy_prior(events), self._run_budget_for(loop, system_prompt)) or None
         return None
 
     @staticmethod

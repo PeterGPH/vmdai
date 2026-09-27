@@ -171,6 +171,31 @@ def test_hybrid_resume_no_duplicate_prompt(tmp_path):
     ]
 
 
+def test_legacy_text_prior_within_budget(tmp_path):
+    """M2: the legacy text prior (hybrid_resume/resume_only, and tokenless
+    "full") is trimmed to PRIOR_FRACTION x the run budget, not sent whole."""
+    app = make_token_app(tmp_path)
+    loop = ScriptedLoop([("second answer", [])], provider_name="ollama", api_key="http://127.0.0.1:9")
+    app.claude_loop = loop
+    session = start(app, tmp_path, token="")
+    chat_id = session.result["chat_id"]
+    events = []
+    for i in range(20):
+        events.append({"role": "user", "type": "message", "text": "U" * 310 + str(i), "metadata": {}})
+        events.append({"role": "assistant", "type": "message", "text": "A" * 310 + str(i), "metadata": {}})
+    app.store.append_events(chat_id, events)
+    result(send(app, session, "new question", conversation_mode="hybrid_resume"))
+    wait_idle(app, session)
+    state = state_of(app, session)
+    budget = app._run_budget_for(loop, app._system_prompt_for_request(state))
+    prior = loop.calls[0][:-1]
+    assert loop.calls[0][-1] == {"role": "user", "content": "new question"}
+    assert prior          # the trim kept something to test the invariants against
+    assert conversation.messages_chars(prior) <= 0.6 * budget
+    assert prior[0]["role"] == "user"
+    assert prior[-1] == {"role": "assistant", "content": "A" * 310 + "19"}
+
+
 def test_token_resume_legacy_chat_imports_history(tmp_path):
     app = make_token_app(tmp_path)
     legacy = app.store.create_chat("old chat")
@@ -192,6 +217,29 @@ def test_token_resume_legacy_chat_imports_history(tmp_path):
     ]
     ids = [line["request_id"] for line in conversation.read_lines(app.store.chat_dir(legacy))]
     assert ids[:2] == ["legacy_1", "legacy_1"] and ids[2].startswith("req_")
+
+
+def test_stopped_session_cannot_open_or_resume_chat(tmp_path, monkeypatch):
+    """M4: session.stop takes the session lock, and chat.send/chat.resume
+    re-check under it that the session is still registered, so a request
+    that raced past _get_session before the stop cannot open or resume a
+    chat with a session the runtime no longer tracks."""
+    app = make_token_app(tmp_path)
+    app.claude_loop = ScriptedLoop([("hi", [])])
+    session = start(app, tmp_path)
+    existing_chat = app.store.create_chat("existing")
+    before_chats = {row["chat_id"] for row in app.store.list_chats()}
+    state = state_of(app, session)
+    result(call(app, "session.stop", {}, session))
+    assert state.chat_lock is None
+    # Simulate a request that already passed _get_session before the stop:
+    # sessions.verify would normally fail now, but this request's state
+    # reference is still the live (stale) object.
+    monkeypatch.setattr(app.sessions, "verify", lambda sid, tok: state)
+    assert error_code(send(app, session, "hello")) == "AUTH_FAILED"
+    assert error_code(call(app, "chat.resume", {"chat_id": existing_chat}, session)) == "AUTH_FAILED"
+    assert state.chat_lock is None
+    assert {row["chat_id"] for row in app.store.list_chats()} == before_chats
 
 
 def test_event_queue_last_seq():
