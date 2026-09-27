@@ -1034,6 +1034,58 @@ def _ollama_body_options(opts: Any) -> Dict[str, Any]:
     return options
 
 
+# ---------------------------------------------------------------------------
+# Usage parsing (spec 2c "Usage semantics"): a value the provider did not
+# report is None, never 0. Emitted once per turn through on_meta.
+# ---------------------------------------------------------------------------
+
+def _usage_int(value: Any) -> Optional[int]:
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _usage_meta(source: str, evaluated: Any, output: Any, cache_read: Any) -> Dict[str, Any]:
+    return {
+        "kind": "usage",
+        "input_tokens_evaluated": _usage_int(evaluated),
+        "output_tokens": _usage_int(output),
+        "cache_read_tokens": _usage_int(cache_read),
+        "source": source,
+    }
+
+
+def _anthropic_usage_update(event: Dict[str, Any], etype: str, acc: Dict[str, Any]) -> None:
+    """message_start carries input and cache-read tokens; message_delta the
+    final output count."""
+    if etype == "message_start":
+        usage = (event.get("message") or {}).get("usage") or {}
+        acc["input"] = usage.get("input_tokens")
+        acc["cache_read"] = usage.get("cache_read_input_tokens")
+    elif etype == "message_delta":
+        usage = event.get("usage") or {}
+        if "output_tokens" in usage:
+            acc["output"] = usage.get("output_tokens")
+
+
+def _openai_usage_meta(usage: Any) -> Dict[str, Any]:
+    """The final chunk's usage (stream_options.include_usage). Cached prompt
+    tokens are reported separately and left out of input_tokens_evaluated."""
+    if not isinstance(usage, dict):
+        return _usage_meta("openai", None, None, None)
+    prompt = usage.get("prompt_tokens")
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    evaluated = prompt
+    if isinstance(prompt, int) and isinstance(cached, int):
+        evaluated = prompt - cached
+    return _usage_meta("openai", evaluated, usage.get("completion_tokens"), cached)
+
+
+def _ollama_usage_meta(done_event: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Ollama's prompt_eval_count leaves out the cached prefix, so it is
+    input_tokens_evaluated, never context used."""
+    event = done_event or {}
+    return _usage_meta("ollama", event.get("prompt_eval_count"), event.get("eval_count"), None)
+
+
 def _stream_anthropic_direct(
     messages: List[Dict],
     model: str,
@@ -1114,6 +1166,7 @@ def _anthropic_consume(
     """Open one Anthropic request and consume its SSE stream."""
     text_parts: List[str] = []
     blocks_in_progress: Dict[int, Dict[str, Any]] = {}
+    usage_acc: Dict[str, Any] = {"input": None, "output": None, "cache_read": None}
     final_tool_blocks: List[Dict[str, Any]] = []
     raise_errors = opts is not None and opts.raise_stream_errors
 
@@ -1125,6 +1178,9 @@ def _anthropic_consume(
                 break
 
             etype = str(event.get("type") or "")
+
+            if on_meta is not None:
+                _anthropic_usage_update(event, etype, usage_acc)
 
             if etype == "content_block_start":
                 idx = int(event.get("index") or 0)
@@ -1184,6 +1240,9 @@ def _anthropic_consume(
             if etype == "message_stop":
                 break
 
+    if on_meta is not None:
+        on_meta(_usage_meta("anthropic", usage_acc["input"], usage_acc["output"],
+                            usage_acc["cache_read"]))
     return "".join(text_parts), final_tool_blocks
 
 
@@ -1237,6 +1296,7 @@ def _stream_openrouter(
     # tool_calls_acc keyed by integer index; OpenAI streams arguments
     # as small string fragments we have to concatenate before json.loads.
     tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+    usage_seen: Any = None
 
     with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
         for event in _iter_sse_events(resp):
@@ -1245,6 +1305,8 @@ def _stream_openrouter(
             if should_cancel():
                 break
 
+            if on_meta is not None and isinstance(event.get("usage"), dict):
+                usage_seen = event["usage"]
             choices = event.get("choices") or []
             if not choices:
                 continue
@@ -1253,6 +1315,12 @@ def _stream_openrouter(
                 if finish:
                     on_meta({"kind": "stop_reason", "value": str(finish)})
             delta = (choices[0] or {}).get("delta") or {}
+            if on_meta is not None:
+                reasoning = delta.get("reasoning_content")
+                if not isinstance(reasoning, str) or not reasoning:
+                    reasoning = delta.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    on_meta({"kind": "reasoning", "text": reasoning})
 
             content = delta.get("content")
             if isinstance(content, str) and content:
@@ -1286,6 +1354,9 @@ def _stream_openrouter(
                     slot["function"]["name"] = str(fn["name"])
                 if isinstance(fn.get("arguments"), str):
                     slot["function"]["arguments"] += fn["arguments"]
+
+    if on_meta is not None:
+        on_meta(_openai_usage_meta(usage_seen))
 
     final_tool_blocks: List[Dict[str, Any]] = []
     for idx in sorted(tool_calls_acc.keys()):
@@ -1733,6 +1804,7 @@ def _stream_ollama(
     final_tool_blocks: List[Dict[str, Any]] = []
     tool_call_counter = 0
     got_event = False
+    done_event: Optional[Dict[str, Any]] = None
 
     try:
         with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
@@ -1745,6 +1817,12 @@ def _stream_ollama(
                         f"Ollama error: {event['error']}"
                     )
                 msg = event.get("message") or {}
+                if on_meta is not None:
+                    thinking = msg.get("thinking")
+                    if isinstance(thinking, str) and thinking:
+                        on_meta({"kind": "reasoning", "text": thinking})
+                    if event.get("done"):
+                        done_event = event
                 # Text content — stream it.
                 content = msg.get("content")
                 if isinstance(content, str) and content:
@@ -1831,6 +1909,9 @@ def _stream_ollama(
         ):
             raise _ollama_unreachable_error(base_url, exc, opts) from exc
         raise ClaudeLoopError(f"Ollama stream failed: {exc}") from exc
+
+    if on_meta is not None:
+        on_meta(_ollama_usage_meta(done_event))
 
     text = "".join(text_parts)
 
@@ -2194,6 +2275,9 @@ class ClaudeToolLoop:
         self.wiki_store = wiki_store
         # Set from the Ollama preflight's /api/ps entry (C6); None elsewhere.
         self.last_model_digest: Optional[str] = None
+        # Summed over the request's turns; None until a turn reports it.
+        self.last_usage: Dict[str, Optional[int]] = {
+            "input_tokens_evaluated": None, "output_tokens": None}
         # Behaviour flags (§2a). None keeps today's benchmark behaviour
         # byte-for-byte; the product passes LoopOptions.product(profile).
         self.options = options
@@ -2572,6 +2656,11 @@ class ClaudeToolLoop:
         if kind == "model_digest":
             value = item.get("value")
             self.last_model_digest = str(value) if value else None
+        if kind == "usage":
+            for key in ("input_tokens_evaluated", "output_tokens"):
+                value = item.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    self.last_usage[key] = (self.last_usage.get(key) or 0) + value
         if kind in _LOOP_ONLY_META:
             self._turn_meta[kind] = dict(item)
             return
@@ -2854,6 +2943,7 @@ class ClaudeToolLoop:
 
         self._ctx = ctx
         self.last_model_digest = None
+        self.last_usage = {"input_tokens_evaluated": None, "output_tokens": None}
         self._turn = 0
         self._turn_meta = {}
         self.last_status = None
