@@ -44,6 +44,21 @@ def _make_tga_1x1() -> bytes:
     return bytes(header) + bytes([255, 0, 0])  # BGR
 
 
+def _wait_for_tool_start(q: EventQueue, tool_call_id: str, timeout: float = 3.0) -> None:
+    """Poll until execute_tool has registered ``tool_call_id`` and is waiting.
+
+    It registers the call and then pushes the tool_start event, so once the
+    event is in the queue the call can be resolved or cancelled.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for ev in q.poll(after_seq=0, limit=50)["events"]:
+            if ev["metadata"].get("tool_call_id") == tool_call_id:
+                return
+        time.sleep(0.01)
+    raise AssertionError(f"no tool_start for {tool_call_id}")
+
+
 # ------------------------------------------------------------------
 # Tests: basic lifecycle
 # ------------------------------------------------------------------
@@ -110,7 +125,7 @@ class ToolBridgeResolveTests(unittest.TestCase):
 
         t = threading.Thread(target=run_exec)
         t.start()
-        time.sleep(0.3)
+        _wait_for_tool_start(q, "tc_r1")
 
         ok = bridge.resolve("tc_r1", {"ok": True, "output": "0 1 2", "error": ""})
         t.join(timeout=3.0)
@@ -197,7 +212,7 @@ class ToolBridgeCancelTests(unittest.TestCase):
 
         t = threading.Thread(target=run_exec)
         t.start()
-        time.sleep(0.3)
+        _wait_for_tool_start(q, "tc_cx")
         cancel.set()
         t.join(timeout=3.0)
 
@@ -229,7 +244,7 @@ class ToolBridgeSnapshotTests(unittest.TestCase):
 
         try:
             def resolve_later():
-                time.sleep(0.2)
+                _wait_for_tool_start(q, tcid)
                 bridge.resolve(tcid, {
                     "ok": True,
                     "output": "Snapshot captured",
@@ -266,7 +281,7 @@ class ToolBridgeSnapshotTests(unittest.TestCase):
         tcid = "tc_snap_" + uuid.uuid4().hex[:8]
 
         def resolve_later():
-            time.sleep(0.2)
+            _wait_for_tool_start(q, tcid)
             bridge.resolve(tcid, {
                 "ok": True,
                 "output": "Snapshot",
@@ -296,7 +311,7 @@ class ToolBridgeSnapshotTests(unittest.TestCase):
         cancel = threading.Event()
 
         def resolve_later():
-            time.sleep(0.2)
+            _wait_for_tool_start(q, "tc_cmd")
             bridge.resolve("tc_cmd", {
                 "ok": True,
                 "output": "done",
@@ -347,7 +362,8 @@ class ToolBridgeConcurrencyTests(unittest.TestCase):
         t2 = threading.Thread(target=execute, args=("tc_b",))
         t1.start()
         t2.start()
-        time.sleep(0.3)
+        _wait_for_tool_start(q, "tc_a")
+        _wait_for_tool_start(q, "tc_b")
 
         # Resolve in reverse order
         bridge.resolve("tc_b", {"ok": True, "output": "b_out", "error": ""})
