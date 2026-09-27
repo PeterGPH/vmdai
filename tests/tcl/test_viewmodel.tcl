@@ -259,4 +259,52 @@ test request_ended_local {local.request_ended ends a busy request with a note} -
     list [lindex $ops 0] [lrange [lindex [only $ops run.close] 0] 0 2] [lindex $ops end] [dict get $S busy]
 } -result {{notice info {Request ended (details may be missing)}} {run.close r1 ended} {status idle} 0}
 
+# ---- P08-T03 ---------------------------------------------------------------
+
+test status_text_phases {status_text: phase plus a timer; retry text has no timer; idle is empty} -body {
+    ::vmdai::vm::init S
+    set r [list [::vmdai::vm::status_text S 100]]
+    feed S [started req_a]
+    lappend r [::vmdai::vm::status_text S 105]
+    feed S [tstart req_a k1]
+    lappend r [::vmdai::vm::status_text S 112]
+    feed S [st status {request_id req_a phase loading_model} 120]
+    lappend r [::vmdai::vm::status_text S 141]
+    feed S [st status {request_id req_a phase retrying attempt 2 max_attempts 5 wait_s 8}]
+    lappend r [::vmdai::vm::status_text S 999]
+    lappend r [::vmdai::vm::stop_requested S] [::vmdai::vm::status_text S 999] [::vmdai::vm::stop_requested S]
+    feed S [st request.finished {request_id req_a status cancelled tool_calls 1 duration_ms 4000}]
+    lappend r [::vmdai::vm::status_text S 1000]
+} -result {{} {Thinking · 00:05} {Step 1 · running VMD command · 00:12} {Loading qwen3.8:27b · 00:21} {Retrying 2/5 in 8 s} {{status busy Stopping… {}}} Stopping… {} {}}
+
+test run_summary_strings {run header summaries (Part B V4)} -body {
+    list [::vmdai::vm::run_summary complete 5 0 0 16 28] \
+         [::vmdai::vm::run_summary complete 1 0 0 3 28] \
+         [::vmdai::vm::run_summary complete 5 1 1 16 28] \
+         [::vmdai::vm::run_summary complete 5 1 0 16 28] \
+         [::vmdai::vm::run_summary error 2 0 0 75 28] \
+         [::vmdai::vm::run_summary cancelled 3 0 0 9 28] \
+         [::vmdai::vm::run_summary stuck 4 3 0 8 28] \
+         [::vmdai::vm::run_summary max_turns 28 0 0 300 28] \
+         [::vmdai::vm::run_summary lost 1 0 0 0 28]
+} -result {{5 steps · 16 s} {1 step · 3 s} {1 failed, recovered · 16 s} {1 failed · 16 s} {Error · 1 min 15 s} {Stopped · 3 steps} {Stopped (stuck) · 4 steps} {Stopped at 28 turns} {Connection lost · 1 step}}
+
+test finished_after_n_steps {an empty final turn gets "Finished after N steps" from tool_calls} -body {
+    ::vmdai::vm::init S
+    feed S [started req_a] [tstart req_a k1] [tfin req_a k1]
+    only [::vmdai::vm::apply S [st request.finished {request_id req_a status complete wrapped_up false turns 3 tool_calls 4 final_text_empty true duration_ms 5000}]] {notice run.close}
+} -result {{notice info {Finished after 4 steps}} {run.close r1 complete 1 0 0 5 1 28}}
+
+test max_turns_uses_request_started {the max-turns note and run.close use request.started.max_turns, never request.finished.turns} -body {
+    ::vmdai::vm::init S
+    feed S [started req_a {max_turns 12}]
+    only [::vmdai::vm::apply S [st request.finished {request_id req_a status max_turns wrapped_up true turns 13 tool_calls 12 final_text_empty false duration_ms 60000}]] {notice run.close}
+} -result {{notice warn {Stopped after 12 turns — reply 'continue'}} {run.close r1 max_turns 0 0 0 60 0 12}}
+
+test stuck_notes {stuck: the stop note; a failed wrap-up adds a muted note, never a card} -body {
+    ::vmdai::vm::init S
+    feed S [started req_a]
+    only [::vmdai::vm::apply S [st request.finished {request_id req_a status stuck wrapped_up false turns 5 tool_calls 4 final_text_empty true duration_ms 8000 error {HTTP 500: boom}}]] {notice error.card}
+} -result {{notice info {The summary could not be written: HTTP 500: boom}} {notice warn {Stopped: the model kept repeating the same step}}}
+
 cleanupTests

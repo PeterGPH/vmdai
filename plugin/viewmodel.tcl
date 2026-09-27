@@ -495,7 +495,11 @@ proc ::vmdai::vm::_on_request_finished {sv md ts} {
         set secs [expr {[_secs $ts] - [dict get $S runs $req t0]}]
     }
     set empty [_bool [_get $md final_text_empty false]]
-    return [_close_run S $req $status $empty $secs]
+    set calls [_get $md tool_calls [dict get $S runs $req steps]]
+    set ops [_finish_notes [dict get $S runs $req] $status $calls $empty \
+        [_bool [_get $md wrapped_up false]] [_get $md error]]
+    lappend ops {*}[_close_run S $req $status $empty $secs]
+    return $ops
 }
 
 # ---- entry point ------------------------------------------------------------
@@ -670,4 +674,77 @@ proc ::vmdai::vm::_on_local {sv kind md ts} {
         }
     }
     return {}
+}
+
+proc ::vmdai::vm::_plural {n word} {
+    if {$n == 1} { return "1 $word" }
+    return "$n ${word}s"
+}
+
+proc ::vmdai::vm::_finish_notes {run status tool_calls final_text_empty wrapped_up error} {
+    set ops {}
+    if {$status in {stuck max_turns} && !$wrapped_up && [_first_line $error] ne ""} {
+        lappend ops [list notice info "The summary could not be written: [_first_line $error]"]
+    }
+    switch -- $status {
+        cancelled { lappend ops [list notice info "Stopped"] }
+        stuck     { lappend ops [list notice warn "Stopped: the model kept repeating the same step"] }
+        max_turns {
+            lappend ops [list notice warn "Stopped after [dict get $run max_turns] turns — reply 'continue'"]
+        }
+        complete {
+            if {$final_text_empty} {
+                lappend ops [list notice info "Finished after [_plural $tool_calls step]"]
+            }
+        }
+    }
+    return $ops
+}
+
+# ---- texts for the status bar and run header (P08-T03) ---------------------
+
+proc ::vmdai::vm::_mmss {secs} {
+    if {$secs < 0} { set secs 0 }
+    return [format "%02d:%02d" [expr {$secs / 60}] [expr {$secs % 60}]]
+}
+
+proc ::vmdai::vm::status_text {stateVar now} {
+    upvar 1 $stateVar S
+    if {![dict get $S busy]} { return "" }
+    set t0 [dict get $S phase_t0]
+    if {$t0 eq ""} { return [dict get $S phase] }
+    return "[dict get $S phase] · [_mmss [expr {[_secs $now] - $t0}]]"
+}
+
+proc ::vmdai::vm::_duration_text {secs} {
+    if {$secs < 60} { return "$secs s" }
+    return [format "%d min %d s" [expr {$secs / 60}] [expr {$secs % 60}]]
+}
+
+proc ::vmdai::vm::run_summary {status steps failed recovered duration_s max_turns} {
+    set dur [_duration_text $duration_s]
+    switch -- $status {
+        cancelled { return "Stopped · [_plural $steps step]" }
+        stuck     { return "Stopped (stuck) · [_plural $steps step]" }
+        max_turns { return "Stopped at $max_turns turns" }
+        lost      { return "Connection lost · [_plural $steps step]" }
+        ended     { return "Ended · [_plural $steps step]" }
+        running   { return "" }
+        error {
+            if {$failed > 0} { return "$failed failed · $dur" }
+            return "Error · $dur"
+        }
+    }
+    if {$failed > 0 && $recovered} { return "$failed failed, recovered · $dur" }
+    if {$failed > 0} { return "$failed failed · $dur" }
+    return "[_plural $steps step] · $dur"
+}
+
+proc ::vmdai::vm::stop_requested {stateVar} {
+    upvar 1 $stateVar S
+    if {![dict get $S busy] || [dict get $S stopping]} { return {} }
+    dict set S stopping 1
+    dict set S phase "Stopping…"
+    dict set S phase_t0 ""
+    return [list [list status busy "Stopping…" ""]]
 }

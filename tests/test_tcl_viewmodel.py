@@ -52,6 +52,14 @@ UNIT_TESTS += [
     "request_ended_local",
 ]
 
+UNIT_TESTS += [
+    "status_text_phases",
+    "run_summary_strings",
+    "finished_after_n_steps",
+    "max_turns_uses_request_started",
+    "stuck_notes",
+]
+
 REPLAY = r"""
 source [file join $env(VMDAI_PLUGIN_DIR) viewmodel.tcl]
 set in [open $env(CHATVMD_EVENTS) r]
@@ -127,6 +135,22 @@ def test_error_card_actions_and_no_model(vm_result):
 
 def test_local_events(vm_result):
     assert_tcltests(vm_result, ["local_connection_notices", "request_ended_local"])
+
+
+def test_status_text_phases(vm_result):
+    assert_tcltests(vm_result, ["status_text_phases"])
+
+
+def test_run_summary_strings(vm_result):
+    assert_tcltests(vm_result, ["run_summary_strings"])
+
+
+def test_finished_after_n_steps(vm_result):
+    assert_tcltests(vm_result, ["finished_after_n_steps", "stuck_notes"])
+
+
+def test_max_turns_uses_request_started(vm_result):
+    assert_tcltests(vm_result, ["max_turns_uses_request_started"])
 
 
 def replay_ops(name: str, tmp_path: Path) -> str:
@@ -232,6 +256,15 @@ def _lost_runtime_notices(ops):
     assert not any(op[0] == "run.close" and op[2] == "complete" for op in ops)
     notices = [op[2] for op in ops if op[0] == "notice"]
     assert any(n.startswith("Connection lost at ") for n in notices), notices
+
+
+@scenario("loop_guard")
+def _stuck_note(ops):
+    notes = [op[2] for op in ops if op[0] == "notice"]
+    assert "Stopped: the model kept repeating the same step" in notes, notes
+    note_at = max(i for i, op in enumerate(ops) if op[0] == "notice")
+    close_at = max(i for i, op in enumerate(ops) if op[0] == "run.close")
+    assert note_at < close_at
 
 
 def run_scenario_checks(name: str, ops: List[List[str]]) -> None:
