@@ -27,11 +27,13 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import provider_catalog
 from .provider import (
     ProviderError,
     resolve_anthropic_api_key,
@@ -846,6 +848,15 @@ def _stream_request(
                 _retry_status(on_meta, attempt, net_limit, wait, None)
                 _backoff_sleep(wait, opts, should_cancel)
                 continue
+            if (
+                opts is not None
+                and opts.classify_unreachable
+                and provider_catalog.classify_unreachable(exc) in ("refused", "reset")
+            ):
+                raise ProviderUnreachableError(
+                    f"network error: {exc}",
+                    hint=_generic_unreachable_hint(req.full_url),
+                ) from exc
             raise ClaudeLoopError(f"network error: {exc}") from exc
 
 
@@ -860,6 +871,134 @@ def _open_stream(
     if opts is None:
         return _stream_request(req, timeout)
     return _stream_request(req, timeout, opts=opts, should_cancel=should_cancel, on_meta=on_meta)
+
+
+# ---------------------------------------------------------------------------
+# Unreachable classification and the Ollama preflight (spec 2f). Only the
+# options path reaches this code; options=None never does.
+# ---------------------------------------------------------------------------
+
+
+def _url_base(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _unreachable_case(exc: BaseException) -> Optional[str]:
+    """'refused', 'reset' or 'timeout' when ``exc``, or an exception it was
+    raised from, is a connection failure; None for anything else.
+
+    provider_catalog.classify_unreachable judges each exception in the chain.
+    A URLError whose reason is only text (for example a DNS failure, or
+    ``URLError("Connection refused")``) is read by its words and counts as
+    'refused' when they say nothing more specific."""
+    current: Optional[BaseException] = exc
+    for _ in range(8):
+        if current is None:
+            return None
+        case = provider_catalog.classify_unreachable(current)
+        if case is not None:
+            return case
+        if isinstance(current, urllib.error.URLError) and not isinstance(
+            current, urllib.error.HTTPError
+        ):
+            text = str(current.reason).lower()
+            if "timed out" in text:
+                return "timeout"
+            if "reset" in text or "closed" in text:
+                return "reset"
+            return "refused"
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _reason_text(exc: BaseException) -> str:
+    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
+        return str(exc.reason)
+    return str(exc) or exc.__class__.__name__
+
+
+def _generic_unreachable_hint(url: str) -> str:
+    """Hint for a refused or reset connection when the provider is unknown
+    (the wording provider_catalog.test_provider uses for non-Ollama servers)."""
+    return f"Could not reach {_url_base(url)}. Check that the server is running."
+
+
+def _http_status_of(exc: BaseException) -> Optional[int]:
+    """The HTTP status behind a ClaudeLoopError: its http_status (plan 02
+    sets it when classify_errors is on), else the HTTPError it came from."""
+    status = getattr(exc, "http_status", None)
+    if isinstance(status, int):
+        return status
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, urllib.error.HTTPError):
+        return int(cause.code)
+    return None
+
+
+def _ollama_unreachable_error(
+    base_url: str,
+    exc: BaseException,
+    opts: Any,
+    case: Optional[str] = None,
+) -> "ClaudeLoopError":
+    """Error for an Ollama server that cannot be reached. The message keeps
+    today's wording; ``hint`` carries the case-specific advice (2f table)."""
+    case = case or _unreachable_case(exc) or "refused"
+    message = f"Ollama unreachable at {base_url!r}: {_reason_text(exc)}."
+    if case == "refused":
+        message += " Is `ollama serve` running?"
+    hint = provider_catalog.unreachable_hint(base_url, case)
+    if opts is not None and (opts.classify_unreachable or opts.classify_errors):
+        return ProviderUnreachableError(message, hint=hint)
+    return ClaudeLoopError(message, hint=hint)
+
+
+def _ps_entry(models: Any, model: str) -> Optional[Dict[str, Any]]:
+    """The /api/ps entry for ``model`` ('name' and 'name:latest' match)."""
+    def _norm(name: Any) -> str:
+        text = str(name or "")
+        return text if ":" in text else text + ":latest"
+
+    want = _norm(model)
+    for entry in models or []:
+        if isinstance(entry, dict) and want in (_norm(entry.get("name")), _norm(entry.get("model"))):
+            return entry
+    return None
+
+
+def _ollama_preflight(
+    base_url: str,
+    model: str,
+    opts: Any,
+    on_meta: Optional[Callable[[Dict[str, Any]], None]],
+) -> None:
+    """GET /api/version (2 s, cached 30 s by provider_catalog), then GET
+    /api/ps (2 s, never cached) before every /api/chat, so a dead or stale
+    server fails in about 2 s even with a warm version cache (S6). Emits
+    status 'loading_model' when the model is not resident, else the resident
+    model's digest (C6)."""
+    timeout = provider_catalog.PREFLIGHT_TIMEOUT_S
+    try:
+        provider_catalog.ollama_version(base_url, timeout=timeout)
+        running = provider_catalog.ollama_ps(base_url, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        raise ClaudeLoopError(
+            f"Ollama preflight failed at {base_url!r}: HTTP {exc.code}",
+            http_status=int(exc.code),
+        ) from exc
+    except Exception as exc:
+        case = _unreachable_case(exc)
+        if case is None:
+            raise ClaudeLoopError(f"Ollama preflight failed at {base_url!r}: {exc}") from exc
+        raise _ollama_unreachable_error(base_url, exc, opts, case) from exc
+    if on_meta is None:
+        return
+    entry = _ps_entry(running, model)
+    if entry is None:
+        on_meta({"kind": "status", "phase": "loading_model", "message": f"Loading {model}…"})
+    elif entry.get("digest"):
+        on_meta({"kind": "model_digest", "value": str(entry["digest"])})
 
 
 def _stream_anthropic_direct(
@@ -1480,6 +1619,8 @@ def _stream_ollama(
       * We synthesize ``tool_call_id``s when Ollama doesn't provide
         them, so downstream code can correlate tool_use ↔ tool_result.
     """
+    if opts is not None and opts.preflight:
+        _ollama_preflight(base_url, model, opts, on_meta)
     ol_messages: List[Dict] = []
     if system_prompt:
         ol_messages.append({"role": "system", "content": system_prompt})
@@ -1527,10 +1668,12 @@ def _stream_ollama(
     text_parts: List[str] = []
     final_tool_blocks: List[Dict[str, Any]] = []
     tool_call_counter = 0
+    got_event = False
 
     try:
         with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
             for event in _iter_ndjson_events(resp):
+                got_event = True
                 if should_cancel():
                     break
                 if "error" in event:
@@ -1566,7 +1709,19 @@ def _stream_ollama(
                         on_meta({"kind": "stop_reason",
                                  "value": str(event.get("done_reason") or "stop")})
                     break
-    except (ClaudeLoopError, RunCancelled):
+    except RunCancelled:
+        raise
+    except ClaudeLoopError as exc:
+        if opts is not None:
+            cause = exc.__cause__
+            if isinstance(cause, urllib.error.URLError) and not isinstance(
+                cause, urllib.error.HTTPError
+            ):
+                raise _ollama_unreachable_error(base_url, cause, opts) from cause
+            if _http_status_of(exc) == 404:
+                # On /api/chat a 404 always means the model is not pulled;
+                # plan 02's generic "Choose a model..." hint is replaced.
+                exc.hint = f"ollama pull {model}"
         raise
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -1589,6 +1744,13 @@ def _stream_ollama(
             f"Is `ollama serve` running?"
         ) from exc
     except Exception as exc:
+        if (
+            opts is not None
+            and opts.classify_unreachable
+            and not got_event
+            and isinstance(exc, (ConnectionRefusedError, ConnectionResetError))
+        ):
+            raise _ollama_unreachable_error(base_url, exc, opts) from exc
         raise ClaudeLoopError(f"Ollama stream failed: {exc}") from exc
 
     text = "".join(text_parts)
@@ -1951,6 +2113,8 @@ class ClaudeToolLoop:
         # FIRST on most turns to look up prior knowledge before
         # rediscovering it from raw docs.
         self.wiki_store = wiki_store
+        # Set from the Ollama preflight's /api/ps entry (C6); None elsewhere.
+        self.last_model_digest: Optional[str] = None
         # Behaviour flags (§2a). None keeps today's benchmark behaviour
         # byte-for-byte; the product passes LoopOptions.product(profile).
         self.options = options
@@ -2326,6 +2490,9 @@ class ClaudeToolLoop:
         if not isinstance(item, dict):
             return
         kind = str(item.get("kind") or "")
+        if kind == "model_digest":
+            value = item.get("value")
+            self.last_model_digest = str(value) if value else None
         if kind in _LOOP_ONLY_META:
             self._turn_meta[kind] = dict(item)
             return
@@ -2607,6 +2774,7 @@ class ClaudeToolLoop:
             )
 
         self._ctx = ctx
+        self.last_model_digest = None
         self._turn = 0
         self._turn_meta = {}
         self.last_status = None
