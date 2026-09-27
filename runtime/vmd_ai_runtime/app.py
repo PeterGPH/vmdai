@@ -113,6 +113,63 @@ def _remove_snapshot_dirs(dirs: Dict[str, str], lock: threading.Lock) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _wants_v2(state: Any) -> bool:
+    """True when this session negotiated the v2 display events (§2c).
+
+    Only a token-authenticated session.start can ask for event_protocol 2,
+    so a tokenless (v1) session never gets here.
+    """
+    try:
+        return int(getattr(state, "event_protocol", 1) or 1) >= 2
+    except (TypeError, ValueError):
+        return False
+
+
+class _EventMapper:
+    """The ``ctx.on_event`` sink of one request (§2a Legacy callbacks, §2c).
+
+    Every loop item keeps ``RequestState.turn`` current for runtime.info.
+    For a v2 session the item also becomes a queue event (``push``); for a
+    v1 session it is dropped, because v1 events come from the legacy
+    callbacks. A failure here is logged and never reaches the loop.
+    """
+
+    def __init__(self, app: "RuntimeApp", state: "SessionState", request: "RequestState") -> None:
+        self.app = app
+        self.state = state
+        self.request = request
+        self.request_id = str(request.request_id)
+        self.chat_id: Optional[str] = state.chat_id
+        self.v2 = _wants_v2(state)
+
+    def __call__(self, item: Dict[str, Any]) -> None:
+        try:
+            self._handle(item)
+        except Exception:
+            if self.app.logger:
+                self.app.logger.warning("v2 event mapping failed for %s", self.request_id, exc_info=True)
+
+    def _handle(self, item: Dict[str, Any]) -> None:
+        metadata = dict(item.get("metadata") or {})
+        if metadata.get("kind") == "turn.started":
+            try:
+                self.request.turn = int(metadata.get("turn") or 0)
+            except (TypeError, ValueError):
+                pass
+        if self.v2:
+            self.push(str(item.get("role") or ""), str(item.get("type") or ""),
+                      str(item.get("text") or ""), metadata)
+
+    def push(self, role: str, event_type: str, text: str = "",
+             metadata: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """Push one v2 event of this request; does nothing for a v1 session."""
+        if not self.v2:
+            return None
+        meta = dict(metadata or {})
+        meta.setdefault("request_id", self.request_id)
+        return self.app._push_v2(self.state, role, event_type, text, meta)
+
+
 class RuntimeApp:
     def __init__(
         self,
@@ -420,22 +477,6 @@ class RuntimeApp:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _turn_tracker(request) -> Callable[[Dict[str, Any]], None]:
-        """on_event for v1 sessions: keeps RequestState.turn current for runtime.info.
-
-        v1 sessions get no queue events from on_event (§2a Legacy callbacks);
-        P07-T01 replaces this with _make_on_event for v2 sessions.
-        """
-        def on_event(item: Dict[str, Any]) -> None:
-            metadata = item.get("metadata") or {}
-            if request is not None and metadata.get("kind") == "turn.started":
-                try:
-                    request.turn = int(metadata.get("turn") or 0)
-                except (TypeError, ValueError):
-                    pass
-        return on_event
-
-    @staticmethod
     def _vision_for(loop: Optional[ClaudeToolLoop]) -> bool:
         """runtime.info.vision: the loop's resolved supports_vision (spec 2f).
 
@@ -736,8 +777,9 @@ class RuntimeApp:
                 cwd=params["cwd"],
                 chat_id=chat_id,
                 authenticated=authenticated,
-                # M1 speaks display protocol 1 only; plan 07 negotiates 2.
-                event_protocol=1,
+                # §2c: a token session may negotiate display protocol 2; a
+                # tokenless session always gets today's v1 events.
+                event_protocol=int(params.get("event_protocol") or 1) if authenticated else 1,
                 vmd_env=params.get("vmd_env") if authenticated else None,
             )
             state.queue.push("system", "lifecycle", "session_started", {"chat_id": chat_id})
@@ -824,9 +866,15 @@ class RuntimeApp:
                 request = RequestState(request_id=request_id)
                 state.active_request = request
                 try:
-                    user_event = state.queue.push(
-                        "user", "message", params["text"], {"request_id": request_id}
-                    )
+                    if _wants_v2(state):
+                        # A v2 display event (§2c): _push_v2 adds v: 2.
+                        user_event = self._push_v2(
+                            state, "user", "message", params["text"], {"request_id": request_id}
+                        )
+                    else:
+                        user_event = state.queue.push(
+                            "user", "message", params["text"], {"request_id": request_id}
+                        )
                     self.store.append_events(chat_id, [user_event])
 
                     # Auto-set chat title from the first user message
@@ -1113,8 +1161,9 @@ class RuntimeApp:
                         {"call_key": call_key},
                     )
                 reply = self.tool_bridge.post_result(state.session_id, params)
-                if reply.get("accepted") and not reply.get("duplicate"):
-                    # v1 transcript entry, as for tool_call_id results.
+                if reply.get("accepted") and not reply.get("duplicate") and not _wants_v2(state):
+                    # v1 transcript entry, as for tool_call_id results. A v2
+                    # session gets tool.finished from the loop instead (§2c).
                     ok = bool(params["ok"]) and params.get("executed") != "no"
                     label = (
                         params.get("output", "")[:120]
@@ -1132,8 +1181,12 @@ class RuntimeApp:
                             "late": bool(reply.get("late")),
                         },
                     )
-                    if state.chat_id:
-                        self.store.append_events(state.chat_id, [result_event])
+                    # M7: stored in the chat that issued the call — not the
+                    # session's current chat, which chat.resume may since
+                    # have switched away from.
+                    target_chat_id = self.tool_bridge.get_call_chat_id(call_key) or state.chat_id
+                    if target_chat_id:
+                        self.store.append_events(target_chat_id, [result_event])
                 return dict(reply)
 
             tool_call_id = params["tool_call_id"]
@@ -1167,19 +1220,21 @@ class RuntimeApp:
                         "tool.command_result for unknown/timed-out id=%s", tool_call_id
                     )
 
-            # Persist a tool_result event for transcript history
-            label = (
-                result["output"][:120]
-                if result["ok"]
-                else f"Error: {result['error'][:120]}"
-            )
-            result_event = state.queue.push(
-                "tool_result",
-                "message",
-                label,
-                {"tool_call_id": tool_call_id, "ok": result["ok"]},
-            )
-            self.store.append_events(state.chat_id, [result_event])
+            # Persist a tool_result event for transcript history (v1 only; a
+            # v2 session gets tool.finished from the loop instead, §2c).
+            if not _wants_v2(state):
+                label = (
+                    result["output"][:120]
+                    if result["ok"]
+                    else f"Error: {result['error'][:120]}"
+                )
+                result_event = state.queue.push(
+                    "tool_result",
+                    "message",
+                    label,
+                    {"tool_call_id": tool_call_id, "ok": result["ok"]},
+                )
+                self.store.append_events(state.chat_id, [result_event])
 
             return {"ok": True, "resolved": resolved}
 
@@ -1388,6 +1443,22 @@ class RuntimeApp:
     # Background thread: Claude agent loop
     # ------------------------------------------------------------------
 
+    def _make_on_event(self, state: SessionState, request: RequestState) -> "_EventMapper":
+        """The on_event sink of one request (§2a, §2c); an ``_EventMapper``.
+
+        It is a Callable[[Dict[str, Any]], None]. A v2 session gets every
+        loop item as a queue event; a v1 session gets none (its events come
+        from the legacy callbacks), and the turn is tracked for both.
+        """
+        return _EventMapper(self, state, request)
+
+    def _push_v2(self, state: SessionState, role: str, event_type: str, text: str,
+                 metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Push one v2 display event (§2c): the metadata gains ``v: 2``."""
+        meta = dict(metadata or {})
+        meta["v"] = 2
+        return state.queue.push(role, event_type, text, meta)
+
     def _run_claude_loop_response(
         self,
         session_id: str,
@@ -1399,26 +1470,37 @@ class RuntimeApp:
         chat_id: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ) -> None:
-        """Full agentic response on a daemon thread.
+        """Full agentic response on a daemon thread (§4).
 
-        chat.send passes the loop it built for this request, the chat it
-        captured when the request started, and the system prompt the prior
-        was budgeted for. Token sessions also get a messages.jsonl Appender
-        (full memory, §2b).
+        chat.send passes the per-request loop, the chat captured when the
+        request started, and the system prompt the prior was budgeted for.
+        Token sessions also get a messages.jsonl Appender (full memory, §2b).
+        The loop's on_event items go to _make_on_event: a v2 session gets
+        them as queue events and the legacy callbacks below do nothing; a v1
+        session keeps today's chunk/message/error events (§2a, §2c).
         """
         state = self.sessions.get(session_id)
         if state is None:
             return
         if loop is None:
+            # chat.send always passes the request's loop (P03-T04); building
+            # one here could raise PROVIDER_INIT_FAILED on this thread.
             self._clear_active(state, request_id)
             return
         if chat_id is None:
             chat_id = state.chat_id
-        if system_prompt is None:
-            system_prompt = self._system_prompt_for_request(state, loop)
+        request = state.active_request
+        if request is None or request.request_id != request_id:
+            request = RequestState(request_id=request_id)
+        mapper = self._make_on_event(state, request)
+        mapper.chat_id = chat_id
+        v2 = mapper.v2
         chunk_events: List[Dict[str, Any]] = []
+        events_to_persist: List[Dict[str, Any]] = []
 
         def on_chunk(chunk: str) -> None:
+            if v2:
+                return  # the loop's assistant chunk items carry the text (§2a)
             chunk_events.append(
                 state.queue.push("assistant", "chunk", chunk, {"request_id": request_id})
             )
@@ -1428,14 +1510,12 @@ class RuntimeApp:
             pass
 
         def on_tool_result(tool_id: str, tool_name: str, result: dict) -> None:
-            # Transcript entry for tool results is written in tool.command_result handler
+            # v1: tool.command_result writes the transcript entry; v2: tool.finished
             pass
 
-        # The session's model setting overrides the loop's model (plan 02).
-        # A per-request loop is adjusted in place; an assigned loop is shared
-        # between requests, so it gets a copy that keeps the wiki store.
         # Token sessions always run their profile's model (§2h); the session
-        # model override stays for tokenless clients only.
+        # model override stays for tokenless clients only (P03-T04/T08). A
+        # tokenless session is always v1, so this never touches a v2 request.
         model = str(state.settings.get("model") or DEFAULT_SETTINGS["model"])
         if not state.authenticated and model and model != loop.model:
             if loop is self._assigned_loop:
@@ -1450,29 +1530,24 @@ class RuntimeApp:
             else:
                 loop.model = model
 
-        messages_out = None
-        if state.authenticated and chat_id:
-            messages_out = conversation.Appender(self.store.chat_dir(chat_id), request_id)
-        request = state.active_request
-        if request is not None and request.request_id != request_id:
-            request = None
-        ctx = RunContext(request_id=request_id, chat_id=chat_id or "",
-                         on_event=self._turn_tracker(request), messages_out=messages_out)
-
-        # Per-request recorder; restored afterwards so an assigned (shared)
-        # loop never carries it into the next request.
         prev_recorder = loop.recorder
-        meta = None
-        if getattr(state, "authenticated", False):
-            try:
-                meta = self._recorder_meta(state, loop, request_id)
-            except Exception:
-                meta = None
-                if self.logger:
-                    self.logger.warning("recorder provenance failed", exc_info=True)
-        loop.recorder = self._build_recorder_for_session(state, meta)
-        events_to_persist: List[Dict[str, Any]] = []
         try:
+            if system_prompt is None:
+                system_prompt = self._system_prompt_for_request(state, loop)
+            meta = None
+            if getattr(state, "authenticated", False):
+                try:
+                    meta = self._recorder_meta(state, loop, request_id)
+                except Exception:
+                    meta = None
+                    if self.logger:
+                        self.logger.warning("recorder provenance failed", exc_info=True)
+            loop.recorder = self._build_recorder_for_session(state, meta)
+            messages_out = None
+            if getattr(state, "authenticated", False) and chat_id:
+                messages_out = conversation.Appender(self.store.chat_dir(chat_id), request_id)
+            ctx = RunContext(request_id=request_id, chat_id=chat_id or "",
+                             on_event=mapper, messages_out=messages_out)
             output = loop.run(
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -1496,13 +1571,14 @@ class RuntimeApp:
                 "error", "message", f"Unexpected error: {exc}", {"request_id": request_id},
             ))
         else:
-            events_to_persist.extend(chunk_events)
-            if cancel_event.is_set():
-                events_to_persist.append(state.queue.push(
-                    "system", "lifecycle", "cancelled", {"request_id": request_id}))
-            else:
-                events_to_persist.append(state.queue.push(
-                    "assistant", "message", output, {"request_id": request_id}))
+            if not v2:
+                events_to_persist.extend(chunk_events)
+                if cancel_event.is_set():
+                    events_to_persist.append(state.queue.push(
+                        "system", "lifecycle", "cancelled", {"request_id": request_id}))
+                else:
+                    events_to_persist.append(state.queue.push(
+                        "assistant", "message", output, {"request_id": request_id}))
         finally:
             loop.recorder = prev_recorder
             if events_to_persist and chat_id:
