@@ -13,8 +13,10 @@ against fresh VMD — locally, on a cluster, or in CI.
 Design contract:
     * One run directory per *task* (one ``chat.send`` turn that may
       issue many tool calls).
-    * Only successful commands are written to ``transcript.tcl``.
-      Failed commands are counted in the manifest but never persisted.
+    * Successful commands, and the applied part of a partly failed one,
+      are written to ``transcript.tcl``; the unapplied rest is commented
+      out. A command that fails outright is counted in the manifest but
+      never persisted.
     * Snapshots captured via ``capture_vmd_snapshot`` are saved under
       ``snapshots/turn_NN.png`` and added to ``transcript.tcl`` as
       ``render snapshot snapshots/turn_NN.png`` lines, so replay

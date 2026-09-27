@@ -201,3 +201,21 @@ def test_options_none_benchmark_bridge_output_over_6000_unchanged():
     assert block["content"] == big_output
     assert "output truncated" not in block["content"]
     assert "Full text:" not in block["content"]
+
+
+def test_output_save_failure_still_cuts(tmp_path):
+    """M3 (final review): a disk problem writing outputs/ must still cut the
+    model's copy — VMD already ran the command — just without a file to
+    read the rest from."""
+    chat = tmp_path / "chat"
+    chat.mkdir()
+    (chat / "outputs").write_text("not a directory")
+    full = "\n".join("line %05d" % i for i in range(20000))
+    result = {"output": full}
+    tb._cut_output_in_place(result, chat, "k1")
+    assert result["output_path"] is None
+    assert result["truncated"] is True
+    assert "The full text could not be saved" in result["output"]
+    assert result["output"].startswith("line 00000")
+    assert result["output"].endswith("line 19999")
+    assert len(result["output"]) <= tb.MODEL_OUTPUT_CAP + 300

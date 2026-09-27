@@ -234,3 +234,11 @@ def test_options_none_no_guard_no_wrapup():
     assert loop.last_wrapped_up is False
     assert loop.last_turns == 28
     assert text == ""
+
+
+def test_wrap_up_attrs_defined_before_run():
+    # M8: a caller (plan 07's getattr defaults notwithstanding) must see
+    # real values on a fresh loop, not an AttributeError, before any run().
+    loop = ClaudeToolLoop(provider_name="ollama", api_key="http://ollama.test", model="m")
+    assert loop.last_wrapped_up is False
+    assert loop.last_wrap_up_error is None

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import pytest
@@ -161,3 +162,132 @@ def test_bridge_session_for_token_session(tmp_path):
     bare_sess = start_token_session(bare, TOKEN)
     bs_bare = bare._bridge_session(bare_sess["session_id"])
     assert (bs_bare.exec_timeout_s, bs_bare.cancel_grace_s) == (None, None), "no store: bridge defaults"
+
+
+# ----------------------------------------------------------------------
+# Final-review fix wave: I1 (ack/deadline race), M6 (session-scoped compat
+# lookup), M8 (an abandoned call must retire, not leak in the registry).
+# ----------------------------------------------------------------------
+
+def test_ack_racing_pickup_deadline_wins(tmp_path):
+    """I1: an ack that lands right at the pickup deadline must win — the
+    call must not be given up on as 'not picked up' once it has been."""
+    session = make_session(tmp_path)
+    bridge = make_bridge(session, pickup_timeout_s=0.2, exec_timeout_s=5)
+    call = BridgeCall(bridge)
+    call.tool_start()
+
+    acks = []
+    original = bridge._give_up
+    fired = []
+
+    def wrapper(pending, executed, error, expect_state=None):
+        if not fired:
+            fired.append(1)
+            acks.append(bridge.ack(SESSION_ID, call.call_key, "running"))
+        return original(pending, executed, error, expect_state=expect_state)
+
+    bridge._give_up = wrapper
+
+    time.sleep(0.4)
+    assert acks == [{"proceed": True}]
+    assert call.alive(), "the racing ack must keep the call running, not give up on it"
+
+    reply = bridge.post_result(SESSION_ID, {
+        "call_key": call.call_key, "ok": True, "output": "done", "error": "",
+    })
+    assert reply == {"accepted": True, "late": False, "duplicate": False}
+
+    result = call.join()
+    assert result["ok"] is True
+    assert result["executed"] == "yes"
+    assert result["output"] == "done"
+
+
+def test_reack_racing_exec_deadline_wins(tmp_path):
+    """A keep-alive re-ack of 'running' that lands right at the exec
+    deadline must also win — the stale deadline must not fire once a
+    fresh one has been set."""
+    session = make_session(tmp_path)
+    bridge = make_bridge(session, exec_timeout_s=0.5)
+    call = BridgeCall(bridge)
+    call.tool_start()
+    assert bridge.ack(SESSION_ID, call.call_key, "running") == {"proceed": True}
+
+    original = bridge._give_up
+    fired = []
+
+    def wrapper(pending, executed, error, expect_state=None):
+        if not fired:
+            fired.append(1)
+            bridge.ack(SESSION_ID, call.call_key, "running")
+        return original(pending, executed, error, expect_state=expect_state)
+
+    bridge._give_up = wrapper
+
+    time.sleep(0.7)
+    assert call.alive(), "the racing re-ack must extend the exec deadline"
+
+    reply = bridge.post_result(SESSION_ID, {
+        "call_key": call.call_key, "ok": True, "output": "done", "error": "",
+    })
+    result = call.join()
+    assert result["executed"] == "yes"
+    assert reply["late"] is False
+
+
+def test_push_failure_retires_call(tmp_path):
+    """M8: a push failure inside _execute_token must retire the call it
+    just registered, not leave it live in the registry forever."""
+    session = make_session(tmp_path)
+    bridge = make_bridge(session)
+    key = "k_push_fail01"
+
+    class BoomQueue:
+        def push(self, *args, **kwargs):
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        bridge.execute_tool(
+            session_id=SESSION_ID,
+            tool_call_id="tc_push_fail",
+            tool_name="run_vmd_command",
+            tool_input={"command": "mol list"},
+            session_queue=BoomQueue(),
+            cancel_event=threading.Event(),
+            call_key=key,
+            request_id="req_push_fail01",
+        )
+
+    assert bridge.ack(SESSION_ID, key, "running") == {"proceed": False, "reason": "cancelled"}
+
+
+def test_compat_tool_call_id_scoped_to_session(tmp_path):
+    """M6: two sessions with a pending call under the same model-issued
+    tool_call_id must never resolve or read each other's call."""
+    other_id = "sess_other0000b"
+    session_a = make_session(tmp_path / "a")
+    session_b = make_session(tmp_path / "b")
+    sessions = {SESSION_ID: session_a, other_id: session_b}
+    bridge = VmdToolBridge(session_lookup=lambda sid: sessions.get(sid))
+
+    call_a = BridgeCall(bridge, call_key="k_compat_a001", tool_call_id="tc_0",
+                        session_id=SESSION_ID)
+    call_b = BridgeCall(bridge, call_key="k_compat_b001", tool_call_id="tc_0",
+                        session_id=other_id)
+    call_a.tool_start()
+    call_b.tool_start()
+
+    assert bridge.get_pending_session("tc_0", session_id=SESSION_ID) == SESSION_ID
+    assert bridge.get_pending_session("tc_0", session_id=other_id) == other_id
+
+    resolved = bridge.resolve(
+        "tc_0", {"ok": True, "output": "a-done", "error": ""}, session_id=SESSION_ID,
+    )
+    assert resolved is True
+    result_a = call_a.join()
+    assert result_a["output"] == "a-done"
+
+    assert call_b.alive(), "resolving A's call must never touch B's"
+    call_b.cancel.set()
+    call_b.join()

@@ -49,6 +49,11 @@ MODEL_OUTPUT_CAP = 6000
 MODEL_HEAD_CHARS = 3000
 MODEL_TAIL_CHARS = 2500
 
+# Extensions save_path may overwrite without an explicit --force (M1): an
+# existing file with any other extension is presumed to be user data, not a
+# prior snapshot, and is refused.
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tga", ".bmp", ".gif")
+
 
 @dataclass
 class BridgeSession:
@@ -115,17 +120,19 @@ class VmdToolBridge:
         self.session_lookup = session_lookup
         self.on_late_result: Optional[Callable[[str, str, Dict[str, Any]], None]] = None
 
-    def get_pending_session(self, tool_call_id: str) -> Optional[str]:
+    def get_pending_session(self, tool_call_id: str,
+                            session_id: Optional[str] = None) -> Optional[str]:
         """Return the session_id that owns a pending call, or None if unknown.
 
         Used by the RPC handler to verify that a tool.command_result POST
-        belongs to the session that originated the tool call.
+        belongs to the session that originated the tool call. ``session_id``
+        scopes the compat (call_key-less) lookup to that session (M6).
         """
         tcid = str(tool_call_id or "")
         with self._lock:
             pending = self._pending.get(tcid)
         if pending is None:
-            pending = self._token_call_by_tool_call_id(tcid)
+            pending = self._token_call_by_tool_call_id(tcid, session_id=session_id)
         return pending.session_id if pending else None
 
     def get_call_session(self, call_key: str) -> Optional[str]:
@@ -310,48 +317,63 @@ class VmdToolBridge:
         with self._lock:
             self._calls[call_key] = pending
 
-        session_queue.push(
-            "tool_start",
-            "message",
-            _format_tool_label(tool_name, tool_input),
-            {
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "tool_input": tool_input,
-                "session_id": session_id,
-                "call_key": call_key,
-                "request_id": request_id,
-                "approval": "auto",
-                "snapshot_path": snapshot_path,
-            },
-        )
-        pickup_deadline = time.monotonic() + self.pickup_timeout_s
+        try:
+            session_queue.push(
+                "tool_start",
+                "message",
+                _format_tool_label(tool_name, tool_input),
+                {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                    "session_id": session_id,
+                    "call_key": call_key,
+                    "request_id": request_id,
+                    "approval": "auto",
+                    "snapshot_path": snapshot_path,
+                },
+            )
+            pickup_deadline = time.monotonic() + self.pickup_timeout_s
 
-        while not pending.done.is_set():
-            if cancel_event.is_set():
-                return self._cancel(pending, grace_s)
-            now = time.monotonic()
+            while not pending.done.is_set():
+                if cancel_event.is_set():
+                    return self._cancel(pending, grace_s)
+                now = time.monotonic()
+                with pending.lock:
+                    state = pending.state
+                    exec_deadline = pending.exec_deadline
+                if state == "pending" and now >= pickup_deadline:
+                    out = self._give_up(
+                        pending, "no",
+                        "VMD did not pick up the command (no reply within %g s)." % self.pickup_timeout_s,
+                        expect_state="pending",
+                    )
+                    if out is not None:
+                        return out
+                    continue
+                if state == "running" and exec_deadline is not None and now >= exec_deadline:
+                    out = self._give_up(
+                        pending, "unknown",
+                        "VMD did not finish the command within %g s; outcome unknown." % exec_s,
+                        expect_state="running",
+                    )
+                    if out is not None:
+                        return out
+                    continue
+                pending.done.wait(timeout=_POLL_S)
+            return self._take_result(pending)
+        except BaseException:
+            # An abandoned call (e.g. session_queue.push raised) must never
+            # stay live in the registry: retire it so a later ack() reports
+            # it cancelled instead of the caller's exception leaking a
+            # call nobody will ever resolve or clean up (M8).
             with pending.lock:
-                state = pending.state
-                exec_deadline = pending.exec_deadline
-            if state == "pending" and now >= pickup_deadline:
-                out = self._give_up(
-                    pending, "no",
-                    "VMD did not pick up the command (no reply within %g s)." % self.pickup_timeout_s,
-                )
-                if out is not None:
-                    return out
-                continue
-            if state == "running" and exec_deadline is not None and now >= exec_deadline:
-                out = self._give_up(
-                    pending, "unknown",
-                    "VMD did not finish the command within %g s; outcome unknown." % exec_s,
-                )
-                if out is not None:
-                    return out
-                continue
-            pending.done.wait(timeout=_POLL_S)
-        return self._take_result(pending)
+                already_done = pending.done.is_set()
+                if not already_done:
+                    pending.cancelled = True
+            if not already_done:
+                self._retire(call_key)
+            raise
 
     def _cancel(self, pending: _PendingCall, grace_s: float) -> Dict[str, Any]:
         """Stop (spec 2d): not acked or awaiting_user -> 'no' at once; running -> grace."""
@@ -364,10 +386,19 @@ class VmdToolBridge:
         out = self._give_up(pending, "unknown", "stopped while running; outcome unknown")
         return out if out is not None else self._take_result(pending)
 
-    def _give_up(self, pending: _PendingCall, executed: str, error: str) -> Optional[Dict[str, Any]]:
-        """Stop waiting. Returns None if a result slipped in first."""
+    def _give_up(self, pending: _PendingCall, executed: str, error: str,
+                expect_state: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Stop waiting. Returns None when a result already arrived, the ack
+        moved the call on from ``expect_state`` before this ran (I1: the
+        pickup deadline must not fire on a call an ack just accepted), or —
+        for the exec deadline — a fresh keep-alive ack has since pushed
+        ``exec_deadline`` into the future, racing the old deadline.
+        """
         with pending.lock:
-            if pending.done.is_set():
+            if pending.done.is_set() or (expect_state and pending.state != expect_state):
+                return None
+            if (expect_state == "running" and pending.exec_deadline is not None
+                    and pending.exec_deadline > time.monotonic()):
                 return None
             pending.cancelled = True
             return self._finish_without_result(pending, executed, error)
@@ -444,12 +475,15 @@ class VmdToolBridge:
         expected = pending.snapshot_path
         posted = str(raw.get("snapshot_file") or "")
         try:
+            if not result["ok"]:
+                # A failed render's own error must survive even when the
+                # plugin also posted a foreign path (T03): don't let the
+                # rejection message below replace it.
+                return
             if posted and os.path.realpath(posted) != os.path.realpath(expected):
                 logger.warning("rejected snapshot_file %r (expected %r)", posted, expected)
                 result["ok"] = False
                 result["error"] = "snapshot file rejected: not the path the runtime chose"
-                return
-            if not result["ok"]:
                 return
             png = read_image_as_png_bytes(expected) if os.path.isfile(expected) else None
             if not png:
@@ -470,19 +504,26 @@ class VmdToolBridge:
             }
             if pending.chat_dir is not None:
                 images = Path(pending.chat_dir) / "images"
-                images.mkdir(parents=True, exist_ok=True)
-                full = images / ("%s.png" % pending.call_key)
-                thumb = images / ("%s_thumb.png" % pending.call_key)
-                full.write_bytes(png)
-                thumb_png, _thumb_w, _thumb_h = make_thumbnail(png, 256, 192)
-                thumb.write_bytes(thumb_png)
-                image["path"] = str(full)
-                image["thumb_path"] = str(thumb)
+                try:
+                    images.mkdir(parents=True, exist_ok=True)
+                    full = images / ("%s.png" % pending.call_key)
+                    full.write_bytes(png)
+                    image["path"] = str(full)
+                    thumb = images / ("%s_thumb.png" % pending.call_key)
+                    thumb_png, _thumb_w, _thumb_h = make_thumbnail(png, 256, 192)
+                    thumb.write_bytes(thumb_png)
+                    image["thumb_path"] = str(thumb)
+                except OSError:
+                    # The render still reaches the model as image_b64 (M3);
+                    # only the on-disk copy is missing.
+                    logger.warning("failed to write snapshot image files under %s",
+                                   images, exc_info=True)
             result["image"] = image
             note = "Snapshot rendered (%d×%d)." % (width, height)
             save_path = str(pending.tool_input.get("save_path") or "").strip()
             if save_path:
-                saved, message = _write_save_path(png, save_path, pending.cwd)
+                saved, message = _write_save_path(png, save_path, pending.cwd,
+                                                  checkout_root=_CHECKOUT_ROOT)
                 if saved is None:
                     result["ok"] = False
                     result["error"] = message
@@ -497,14 +538,25 @@ class VmdToolBridge:
             except OSError:
                 pass
 
-    def _token_call_by_tool_call_id(self, tool_call_id: str) -> Optional[_PendingCall]:
-        """Compat: an unresolved token call that a client names by tool_call_id."""
+    def _token_call_by_tool_call_id(self, tool_call_id: str,
+                                    session_id: Optional[str] = None) -> Optional[_PendingCall]:
+        """Compat: an unresolved token call that a client names by tool_call_id.
+
+        Model-issued tool_call_ids repeat across sessions (``tc_0``,
+        ``otc_1``); when the caller knows which session it is acting for,
+        scope the match to it so two sessions can never resolve or read
+        each other's pending call (M6) — a mismatch is simply "not pending"
+        rather than falling back to a stranger's call.
+        """
         with self._lock:
-            for pending in reversed(list(self._calls.values())):
-                if (pending.tool_call_id == tool_call_id and not pending.finished
-                        and pending.raw is None):
-                    return pending
-        return None
+            candidates = [
+                p for p in reversed(list(self._calls.values()))
+                if p.tool_call_id == tool_call_id and not p.finished and p.raw is None
+            ]
+        if session_id is not None:
+            sid = str(session_id)
+            return next((p for p in candidates if p.session_id == sid), None)
+        return candidates[0] if candidates else None
 
     # ------------------------------------------------------------------
     # Called by the RPC handler
@@ -572,16 +624,18 @@ class VmdToolBridge:
                 logger.warning("on_late_result failed for %s", call_key, exc_info=True)
         return {"accepted": True, "late": True, "duplicate": False}
 
-    def resolve(self, tool_call_id: str, result: Dict[str, Any]) -> bool:
+    def resolve(self, tool_call_id: str, result: Dict[str, Any],
+               session_id: Optional[str] = None) -> bool:
         """
         Called when the Tcl bridge POSTs tool.command_result by tool_call_id.
         Unblocks the waiting execute_tool() call.
-        Returns True if the call was found, False if it was already gone/timed-out.
+        Returns True if the call was found, False if it was already gone/timed
+        out, or (M6) it belongs to another session than ``session_id``.
         """
         with self._lock:
             pending = self._pending.get(tool_call_id)
         if pending is None:
-            token_call = self._token_call_by_tool_call_id(str(tool_call_id or ""))
+            token_call = self._token_call_by_tool_call_id(str(tool_call_id or ""), session_id=session_id)
             if token_call is not None:
                 with token_call.lock:
                     if token_call.raw is None and not token_call.finished:
@@ -638,12 +692,18 @@ def _legacy_snapshot_allowed(path: str, tool_call_id: str) -> bool:
     return os.path.realpath(path) == os.path.realpath(allowed)
 
 
-def _write_save_path(png: bytes, save_path: str, cwd: str):
+def _write_save_path(png: bytes, save_path: str, cwd: str, *,
+                     checkout_root: str = _CHECKOUT_ROOT):
     """Write the save_path deliverable (S10). Returns (absolute path, note) or (None, error).
 
     Relative paths resolve against the session cwd. JPEG needs Pillow;
     without it the image is written as .png and the note says so. A missing
-    directory or a '..' component is refused; nothing is ever deleted.
+    directory or a '..' component is refused. So is a destination under a
+    protected tree (M1: checked both literally and after realpath, since a
+    symlink or a HOME resolved through another symlink can point there
+    without the literal path looking protected) or an existing file whose
+    extension says it isn't one of ours to overwrite. Nothing is ever
+    deleted.
     """
     raw = os.path.expanduser(save_path)
     if ".." in Path(raw).parts:
@@ -663,6 +723,13 @@ def _write_save_path(png: bytes, save_path: str, cwd: str):
             note = " (JPEG needs Pillow; saved as PNG instead.)"
         else:
             data = jpeg
+    real_home = os.path.realpath(os.path.expanduser("~"))
+    if (tcl_policy.is_protected_path(dest, checkout_root=checkout_root)
+            or tcl_policy.is_protected_path(os.path.realpath(dest),
+                                            checkout_root=checkout_root, home=real_home)):
+        return None, "save_path is a protected location: %s" % dest
+    if os.path.exists(dest) and os.path.splitext(dest)[1].lower() not in _IMAGE_EXTS:
+        return None, "save_path would overwrite a file that is not an image: %s" % dest
     try:
         with open(dest, "wb") as fh:
             fh.write(data)
@@ -679,6 +746,17 @@ def truncation_note(n_lines: int, n_bytes: int, path: str, executor_cut: bool) -
         "[output truncated: %d lines, %d KB. %s. Don't print it again: compute what you "
         "need (measure, a narrower selection), or read a slice of that file with Tcl.]"
         % (n_lines, kb, where)
+    )
+
+
+def unsaved_truncation_note(n_lines: int, n_bytes: int, reason: str) -> str:
+    """The C5 line used when the full text could not be saved to disk (M3):
+    the model still gets head + tail, but no ``output_path`` to read more from."""
+    kb = max(1, int(round(n_bytes / 1024.0)))
+    return (
+        "[output truncated: %d lines, %d KB. The full text could not be saved (%s). "
+        "Don't print it again: compute what you need (measure, a narrower selection).]"
+        % (n_lines, kb, reason)
     )
 
 
@@ -724,11 +802,21 @@ def _cut_output_in_place(result: Dict[str, Any], chat_dir: Path, call_key: str) 
         return
     safe_key = re.sub(r"[^A-Za-z0-9_\-]", "_", str(call_key or "call"))
     outputs = Path(chat_dir) / "outputs"
-    outputs.mkdir(parents=True, exist_ok=True)
     path = outputs / ("%s.txt" % safe_key)
-    path.write_bytes(data)
+    n_lines = output.count("\n") + 1
+    try:
+        outputs.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    except OSError as exc:
+        # VMD already ran the command; a disk problem here must cut the
+        # model's copy same as ever, just without a file to point at (M3).
+        note = unsaved_truncation_note(n_lines, len(data), str(exc))
+        result["output"] = cut_for_model(output, note=note)
+        result["output_path"] = None
+        result["truncated"] = True
+        return
     executor_cut = bool(result.get("truncated"))
-    note = truncation_note(output.count("\n") + 1, len(data), str(path), executor_cut)
+    note = truncation_note(n_lines, len(data), str(path), executor_cut)
     result["output"] = cut_for_model(output, note=note)
     result["output_path"] = str(path)
     result["truncated"] = True

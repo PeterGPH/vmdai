@@ -55,6 +55,28 @@ def _slug(text: str, max_len: int = 40) -> str:
     return s[:max_len] or "task"
 
 
+def _tcl_word(s: str) -> str:
+    """A single Tcl word that parses back to exactly ``s`` (M8: the old
+    ``{...}`` wrapping produced invalid Tcl for a path containing an
+    unbalanced brace). Brace-quoting is used whenever ``s`` has no brace at
+    all — the common case, and what earlier transcripts already look like —
+    since VMD 8.6's Tcl performs no substitution inside braces. Otherwise a
+    backslash-escaped double-quoted word is used instead; braces need no
+    escaping there, only the characters double-quoting itself is special
+    about.
+    """
+    if "{" not in s and "}" not in s:
+        return "{%s}" % s
+    escaped = (
+        s.replace("\\", "\\\\")
+         .replace("\"", "\\\"")
+         .replace("$", "\\$")
+         .replace("[", "\\[")
+         .replace("]", "\\]")
+    )
+    return "\"%s\"" % escaped
+
+
 def _atomic_write(path: Path, data: str) -> None:
     """Write ``data`` to ``path`` atomically (write-temp-then-rename).
 
@@ -441,11 +463,14 @@ class RunRecorder:
                 out.append(f"# purpose   : {p_line}")
         out.append(f"# saved to  : snapshots/{snap_name}")
         if saved_path:
-            out.append(f"# save_path : {saved_path}")
+            # A comment runs to end of line; collapse any embedded CR/LF so
+            # a saved_path can never split it into unterminated Tcl source.
+            comment_path = re.sub(r"\r\n|\r|\n", " ", saved_path)
+            out.append(f"# save_path : {comment_path}")
         out.append("")
         out.append(f"render {renderer} snapshots/{snap_name}")
         if saved_path:
-            out.append(f"render {renderer} {{{saved_path}}}")
+            out.append(f"render {renderer} {_tcl_word(saved_path)}")
         out.append("")
         return "\n".join(out)
 
@@ -464,7 +489,8 @@ class RunRecorder:
             f"# prompt     : {prompt_one_line}\n"
             f"{self._provenance_header()}"
             f"#\n"
-            f"# Only successful commands are recorded; this file is replayable:\n"
+            f"# Successful commands, and the applied part of a partly failed one, "
+            f"are recorded; this file is replayable:\n"
             f"#   vmd -e {s.task_id}/transcript.tcl\n"
             f"#   vmd -dispdev text -e {s.task_id}/transcript.tcl   (headless)\n"
         )

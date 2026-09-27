@@ -10,6 +10,7 @@ Key additions over the skeleton:
 """
 from __future__ import annotations
 
+import atexit
 import copy
 import dataclasses
 import hashlib
@@ -100,6 +101,18 @@ def _tools_as_sent(loop) -> List[Dict[str, Any]]:
     return _openrouter_tools(tools)
 
 
+def _remove_snapshot_dirs(dirs: Dict[str, str], lock: threading.Lock) -> None:
+    """atexit hook (M2): sweep any per-session snapshot temp dirs still open
+    when the process exits (SIGTERM, ``--watch-stdin`` EOF, a session that
+    never called session.stop). ``dirs`` is the live ``_snapshot_dirs`` map —
+    cleared here, under ``lock``, before the directories are removed."""
+    with lock:
+        paths = list(dirs.values())
+        dirs.clear()
+    for path in paths:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 class RuntimeApp:
     def __init__(
         self,
@@ -139,6 +152,7 @@ class RuntimeApp:
         self.logger = logger
         self._snapshot_lock = threading.Lock()
         self._snapshot_dirs: Dict[str, str] = {}
+        atexit.register(_remove_snapshot_dirs, self._snapshot_dirs, self._snapshot_lock)
         self.tool_bridge = VmdToolBridge(session_lookup=self._bridge_session)
         self.tool_bridge.on_late_result = self._on_late_result
         # Round-2 hook (spec 1, 2g): each callable returns extra per-request
@@ -1123,7 +1137,8 @@ class RuntimeApp:
                 return dict(reply)
 
             tool_call_id = params["tool_call_id"]
-            pending_session = self.tool_bridge.get_pending_session(tool_call_id)
+            pending_session = self.tool_bridge.get_pending_session(
+                tool_call_id, session_id=state.session_id)
             if pending_session is None:
                 raise RpcError(
                     "TOOL_CALL_UNKNOWN",
@@ -1144,7 +1159,7 @@ class RuntimeApp:
                 "snapshot_file": params.get("snapshot_file") or "",
             }
 
-            resolved = self.tool_bridge.resolve(tool_call_id, result)
+            resolved = self.tool_bridge.resolve(tool_call_id, result, session_id=state.session_id)
             if not resolved:
                 # Already timed out — log and ignore
                 if self.logger:

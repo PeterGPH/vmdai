@@ -4,10 +4,13 @@ from __future__ import annotations
 import base64
 import os
 import tempfile
+import uuid
 from pathlib import Path
 
 from helpers.bridge_harness import SESSION_ID, BridgeCall, make_bridge, make_session, write_tga
 from helpers.runtime_fixture import make_app, start_token_session
+from helpers.tcl import requires_tcl, run_tcl
+from vmd_ai_runtime import app as app_module
 from vmd_ai_runtime import tool_bridge as tb
 from vmd_ai_runtime.claude_loop import ClaudeToolLoop
 from vmd_ai_runtime.recorder import RunRecorder
@@ -53,7 +56,9 @@ def test_foreign_snapshot_file_rejected_not_deleted(tmp_path):
 
 def test_tokenless_tmp_path_accepted_after_realpath(tmp_path):
     bridge = make_bridge(make_session(tmp_path, authenticated=False))
-    tcid = "tc_snapT1"
+    # Unique per run (I2): a fixed id would collide with another suite
+    # writing/reading/deleting the same /tmp path on the same host.
+    tcid = "tc_snap_" + uuid.uuid4().hex[:8]
     legacy = Path("/tmp/vmdai_snap_%s.tga" % tcid)
     write_tga(legacy)
     try:
@@ -69,14 +74,15 @@ def test_tokenless_tmp_path_accepted_after_realpath(tmp_path):
         if legacy.exists():
             legacy.unlink()
 
+    tcid2 = "tc_snap_" + uuid.uuid4().hex[:8]
     fd, other = tempfile.mkstemp(suffix=".tga")
     os.close(fd)
     write_tga(Path(other))
     try:
         call = BridgeCall(bridge, tool_name="capture_vmd_snapshot", tool_input={"purpose": "x"},
-                          tool_call_id="tc_snapT2", timeout=3)
+                          tool_call_id=tcid2, timeout=3)
         call.tool_start()
-        bridge.resolve("tc_snapT2", {"ok": True, "output": "ok", "error": "", "snapshot_file": other})
+        bridge.resolve(tcid2, {"ok": True, "output": "ok", "error": "", "snapshot_file": other})
         result = call.join()
         assert result["ok"] is False and "rejected" in result["error"]
         assert os.path.exists(other)
@@ -205,3 +211,126 @@ def test_session_stop_removes_snapshot_dir(tmp_path):
                           session_token=sess["session_token"])
     assert resp["result"]["ok"] is True
     assert not snap_dir.exists()
+
+
+# ----------------------------------------------------------------------
+# Final-review fix wave: M1 (save_path protection), M3 (guarded disk
+# writes), T03 (ok before the foreign-path check), M2 (exit sweep), M8
+# (recorder quoting for a save_path with a brace in it).
+# ----------------------------------------------------------------------
+
+def test_save_path_protected_refused(tmp_path):
+    session = make_session(tmp_path)
+    bridge = make_bridge(session)
+    home = Path(os.path.expanduser("~"))
+
+    dest = home / ".vmdrc"
+    call, snap = _snapshot_call(bridge, {"save_path": "~/.vmdrc"}, call_key="k5a5a5a5a5c1")
+    write_tga(Path(snap))
+    _post(bridge, call.call_key, snap)
+    result = call.join()
+    assert result["ok"] is False
+    assert result["error"] == "save_path is a protected location: %s" % dest
+    assert not dest.exists()
+
+    ssh_dir = home / ".ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    target = ssh_dir / "authorized_keys"
+    link = Path(session.cwd) / "link.png"
+    link.symlink_to(target)
+
+    call2, snap2 = _snapshot_call(bridge, {"save_path": "link.png"}, call_key="k5a5a5a5a5c2")
+    write_tga(Path(snap2))
+    _post(bridge, call2.call_key, snap2)
+    result2 = call2.join()
+    assert result2["ok"] is False
+    assert result2["error"] == "save_path is a protected location: %s" % link
+    assert not target.exists()
+
+
+def test_save_path_existing_non_image_refused(tmp_path):
+    session = make_session(tmp_path)
+    bridge = make_bridge(session)
+    work = Path(session.cwd)
+
+    pdb = work / "structure.pdb"
+    pdb.write_bytes(b"HEADER    some pdb content\n")
+    original = pdb.read_bytes()
+    call, snap = _snapshot_call(bridge, {"save_path": "structure.pdb"}, call_key="k5a5a5a5a5d1")
+    write_tga(Path(snap))
+    _post(bridge, call.call_key, snap)
+    result = call.join()
+    assert result["ok"] is False
+    assert result["error"] == "save_path would overwrite a file that is not an image: %s" % pdb
+    assert pdb.read_bytes() == original
+
+    fig = work / "fig.png"
+    fig.write_bytes(b"stale png bytes")
+    call2, snap2 = _snapshot_call(bridge, {"save_path": "fig.png"}, call_key="k5a5a5a5a5d2")
+    write_tga(Path(snap2))
+    _post(bridge, call2.call_key, snap2)
+    result2 = call2.join()
+    assert result2["ok"] is True
+    assert fig.read_bytes().startswith(PNG_MAGIC)
+
+
+def test_snapshot_image_write_failure_keeps_image_b64(tmp_path):
+    session = make_session(tmp_path)
+    (session.chat_dir / "images").write_text("not a directory")
+    bridge = make_bridge(session)
+    call, snap = _snapshot_call(bridge, call_key="k5a5a5a5a5e1")
+    write_tga(Path(snap))
+    _post(bridge, call.call_key, snap)
+    result = call.join()
+    assert result["ok"] is True
+    assert result["image_b64"]
+    assert result["image"]["path"] is None
+    assert result["image"]["thumb_path"] is None
+    assert not Path(snap).exists(), "the temp TGA is still deleted"
+
+
+def test_failed_render_keeps_its_error_with_foreign_path(tmp_path):
+    session = make_session(tmp_path)
+    bridge = make_bridge(session)
+    call, snap = _snapshot_call(bridge, call_key="k5a5a5a5a5f1")
+    foreign = write_tga(tmp_path / "foreign.tga")
+    bridge.post_result(SESSION_ID, {
+        "call_key": call.call_key, "ok": False, "output": "", "error": "render failed: disk",
+        "snapshot_file": str(foreign),
+    })
+    result = call.join()
+    assert result["error"] == "render failed: disk"
+    assert foreign.exists()
+
+
+@requires_tcl()
+def test_save_path_with_braces_replays_in_tclsh(tmp_path):
+    rec = RunRecorder.for_cwd(tmp_path)
+    tid = rec.start_task("odd")
+    rec.record_snapshot(ok=True, purpose="odd", image_bytes=PNG_MAGIC,
+                        renderer="TachyonInternal", saved_path="/w/odd}name {x.png")
+    rec.end_task()
+    transcript = rec.runs_root / tid / "transcript.tcl"
+    proc = run_tcl(
+        "set CALLS {}\n"
+        "proc render {args} {global CALLS; lappend CALLS $args}\n"
+        "proc unknown {args} {error \"unexpected: $args\"}\n"
+        "source {%s}\n"
+        "puts [lindex $CALLS 1 1]\n" % transcript.as_posix()
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "/w/odd}name {x.png"
+
+
+def test_snapshot_dirs_swept_at_exit(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app_module.atexit, "register",
+                        lambda fn, *args: calls.append((fn, args)))
+    app = make_app(tmp_path)
+    snap_dir = app._snapshot_dir_for("sess_x")
+    assert snap_dir.is_dir()
+    fn, args = calls[-1]
+    assert fn is app_module._remove_snapshot_dirs
+    fn(*args)
+    assert not snap_dir.exists()
+    assert app._snapshot_dirs == {}

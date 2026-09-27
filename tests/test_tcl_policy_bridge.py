@@ -58,6 +58,14 @@ def test_recorder_untouched_when_blocked(tmp_path):
     manifest = loop.recorder.read_manifest(tid)
     assert (manifest["turn_count"], manifest["failed_count"], manifest["successful_count"]) == (0, 0, 0)
     assert "exec ls" not in loop.recorder.read_transcript(tid)
+    # M5 (final review): a blocked call never reached VMD, so it must not
+    # count toward the C6 manifest's counts.tool_calls either.
+    assert getattr(loop, "_prov_tool_calls", 0) == 0
+
+    allowed = {"ok": True, "output": "0 1", "executed": "yes", "error": ""}
+    loop._recorder_record(tool_name="run_vmd_command", tool_input={"command": "mol list"},
+                          result=allowed, duration_ms=1.0)
+    assert loop._prov_tool_calls == 1
 
 
 def test_tool_started_and_finished_still_emitted(tmp_path):

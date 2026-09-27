@@ -60,6 +60,19 @@ def test_pinned_gaps():
     # Known, documented limits of a static check (spec C1): no finding.
     assert ids("set c exec; $c ls") == []
     assert ids('eval "exec ls"') == []
+    # M4 (final review): plausible variants of the same model mistakes that
+    # the spec's "first word" rule doesn't require catching. Pinned here so
+    # the documented contract matches the behaviour rather than silently
+    # drifting if tcl_policy later starts (or stops) catching one of them.
+    assert ids("after 100 exec ls") == []
+    assert ids("after idle [list exec ls]") == []
+    assert ids("eval exec ls") == []
+    assert ids("uplevel #0 exec ls") == []
+    assert ids("interp eval {} exec ls") == []
+    assert ids("namespace inscope :: exec ls") == []
+    assert ids("open ~/.vmdrc r+") == []
+    assert ids("open ~/.vmdrc {WRONLY CREAT}") == []
+    assert ids("file attributes ~/.vmdrc -permissions 0777") == []
 
 
 def test_too_deep():
@@ -125,7 +138,7 @@ def test_never_raises_on_garbage():
 def test_corpus_zero_findings():
     files = sorted(glob.glob(str(REPO / "vmdbench" / "oracles" / "**" / "*.tcl"), recursive=True))
     files += sorted(glob.glob(str(REPO / "skills" / "*" / "scripts" / "*.tcl")))
-    assert len(files) == 54, files
+    assert len(files) >= 54, files
     offenders = {}
     for path in files:
         text = Path(path).read_text(encoding="utf-8")

@@ -2638,6 +2638,11 @@ class ClaudeToolLoop:
         self.last_turns = 0
         self.last_tool_calls = 0
         self.last_final_text_empty = False
+        # Set only in run()'s wrap-up (C4); declared here too so a caller
+        # that reads them before any run() (or plan 07's getattr callers)
+        # sees defined values rather than an AttributeError (M8).
+        self.last_wrapped_up: bool = False
+        self.last_wrap_up_error: Optional[str] = None
 
     @property
     def _is_anthropic_direct(self) -> bool:
@@ -3424,8 +3429,9 @@ class ClaudeToolLoop:
                                     None keeps today's behaviour.
 
         Returns the final assistant text. The outcome is also left on
-        ``last_status`` ('complete' | 'cancelled' | 'error' | 'max_turns'),
-        ``last_turns``, ``last_tool_calls`` and ``last_final_text_empty``.
+        ``last_status`` ('complete' | 'cancelled' | 'error' | 'max_turns' |
+        'stuck'), ``last_turns``, ``last_tool_calls`` and
+        ``last_final_text_empty``.
         """
         # Conversation history maintained in Anthropic-style format internally.
         # If resuming a prior chat, inject the history before the new prompt.
@@ -3678,11 +3684,13 @@ class ClaudeToolLoop:
     ) -> None:
         if self.recorder is None:
             return
-        self._prov_tool_calls = getattr(self, "_prov_tool_calls", 0) + 1
         if result.get("blocked"):
             # C1: a blocked call never reached VMD; it changes neither
-            # transcript.tcl nor the manifest counts.
+            # transcript.tcl nor the manifest counts. The counter below is
+            # one of those counts (C6's counts.tool_calls, M5/final review),
+            # so it must not see calls that never reached VMD either.
             return
+        self._prov_tool_calls = getattr(self, "_prov_tool_calls", 0) + 1
         try:
             if tool_name == "run_vmd_command":
                 command = str(tool_input.get("command") or "")
