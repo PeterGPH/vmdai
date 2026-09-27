@@ -37,6 +37,7 @@ from .claude_loop import (
     WIKI_SYSTEM_PROMPT_ADDENDUM,
     _ollama_tools,
     _openrouter_tools,
+    _tool_finished_meta,
     build_claude_loop,
 )
 from .locks import ChatLock
@@ -1432,25 +1433,56 @@ class RuntimeApp:
         return _number("tool_exec_timeout_s", 1.0), _number("cancel_grace_s", 0.0)
 
     def _on_late_result(self, session_id: str, call_key: str, info: Dict[str, Any]) -> None:
-        """A tool result arrived after its request gave up (spec 2b Late results).
+        """A tool result arrived after its request gave up on it (§2b Late results, §2d).
 
-        Stored as a ``late_result`` line in the chat the call belonged to, so
-        build_prior can note it before the next prompt.
+        It is stored as a ``late_result`` line in the chat the call belonged
+        to, so build_prior can note it before the next prompt. A v2 session
+        still on that chat also gets a second ``tool.finished`` with
+        ``late: true`` for the call_key. VmdToolBridge calls this once per
+        accepted late result (duplicates are refused), even after the run's
+        request.finished or after the next request has started.
         """
         chat_dir = info.get("chat_dir")
-        if not chat_dir:
-            return
+        if chat_dir:
+            try:
+                conversation.Appender(Path(chat_dir), str(info.get("request_id") or "")).append_late_result(
+                    call_key,
+                    bool(info.get("ok", False)),
+                    str(info.get("executed") or "yes"),
+                    str(info.get("output") or ""),
+                    str(info.get("error") or ""),
+                )
+            except Exception:
+                if self.logger:
+                    self.logger.warning("could not store late result %s", call_key, exc_info=True)
         try:
-            conversation.Appender(Path(chat_dir), str(info.get("request_id") or "")).append_late_result(
-                call_key,
-                bool(info.get("ok", False)),
-                str(info.get("executed") or "yes"),
-                str(info.get("output") or ""),
-                str(info.get("error") or ""),
-            )
+            self._push_late_finished(session_id, call_key, info)
         except Exception:
             if self.logger:
-                self.logger.warning("could not store late result %s", call_key, exc_info=True)
+                self.logger.warning("could not emit the late tool.finished %s", call_key, exc_info=True)
+
+    def _push_late_finished(self, session_id: str, call_key: str,
+                            info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The late ``tool.finished`` for a v2 session still on the call's chat (§2c, §2d).
+
+        It carries the original request_id and call_key, so the view-model
+        updates that row in place (state "late"). v1 sessions get only the
+        late_result line.
+        """
+        state = self.sessions.get(session_id)
+        if state is None or not _wants_v2(state):
+            return None
+        chat_dir = info.get("chat_dir")
+        chat_id = Path(str(chat_dir)).name if chat_dir else None
+        if not chat_id or chat_id != state.chat_id:
+            return None
+        duration = info.get("duration_ms")
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            duration = 0
+        meta = _tool_finished_meta(call_key, str(info.get("tool_name") or ""), "tcl", info,
+                                   float(duration), late=True)
+        meta["request_id"] = str(info.get("request_id") or "")
+        return self._push_v2(state, "system", "state", "", meta)
 
     # ------------------------------------------------------------------
     # Background thread: Claude agent loop
