@@ -1,9 +1,9 @@
 namespace eval ::vmdai {}
 
 set _vmdai_here [file dirname [info script]]
-source [file join $_vmdai_here config.tcl]
-source [file join $_vmdai_here ui.tcl]
-source [file join $_vmdai_here bridge.tcl]
+foreach _vmdai_m {config sched net runtime bridge ui} {
+    source [file join $_vmdai_here $_vmdai_m.tcl]
+}
 
 proc ::vmdai::start {} {
     ::vmdai::ui::show_panel

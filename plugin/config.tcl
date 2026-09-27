@@ -14,23 +14,6 @@ namespace eval ::vmdai::config {
     # plugin.json defaults (spec 2f Files).
     variable plugin_defaults [dict create version 1 python "" appearance system \
         expand_steps 0 geometry ""]
-
-    # Legacy names read by the M1 bridge.tcl until P06-T07 rewrites it.
-    variable host "127.0.0.1"
-    variable port 8765
-    variable poll_limit 80
-    variable runtime_log [file normalize [file join $plugin_dir .. runtime runtime.log]]
-    if {[info exists ::env(VMD_AI_PYTHON)]} {
-        variable python_exec $::env(VMD_AI_PYTHON)
-    } else {
-        variable python_exec "python3"
-    }
-}
-
-proc ::vmdai::config::runtime_url {} {
-    variable host
-    variable port
-    return "http://${host}:${port}"
 }
 
 proc ::vmdai::config::home {} {

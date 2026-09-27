@@ -1,788 +1,819 @@
+# bridge.tcl - session, poll pump, request state, routing and the working
+# directory (spec 2c, 2d, 3). No Tk, no nested event loops.
+#
+# The panel is reached only through ::vmdai::ui::render_event, notify,
+# set_busy and status; the executor through ::vmdai::executor::run. Every
+# RPC outcome is fed to the connection state machine (P06-T06 contract).
+
 namespace eval ::vmdai::bridge {
-    variable runtime_pid ""
-    variable session_id ""
-    variable session_token ""
-    variable chat_id ""
-    variable after_seq 0
-    variable active_request_id ""
-    variable poll_after_id ""
-    variable req_counter 0
-    variable has_json 0
-    variable initialized 0
-    variable is_resumed_chat 0
+    # The display events this plugin asks for (spec 2c). M1 renders v1.
+    variable event_protocol 1
+    variable session_id
+    if {![info exists session_id]} { set session_id "" }
+    variable session_token
+    if {![info exists session_token]} { set session_token "" }
+    variable chat_id
+    if {![info exists chat_id]} { set chat_id "" }
+    variable after_seq
+    if {![info exists after_seq]} { set after_seq 0 }
+    variable busy
+    if {![info exists busy]} { set busy 0 }
+    variable request_id
+    if {![info exists request_id]} { set request_id "" }
+    variable workdir
+    if {![info exists workdir]} { set workdir "" }
+    # Poll pump: one timer and at most one poll outstanding.
+    variable poll_timer
+    if {![info exists poll_timer]} { set poll_timer "" }
+    variable polling
+    if {![info exists polling]} { set polling 0 }
+    # tool_start events held back while the executor runs model Tcl.
+    variable deferred
+    if {![info exists deferred]} { set deferred {} }
+    variable drain_timer
+    if {![info exists drain_timer]} { set drain_timer "" }
+    # Session changes (start, new chat, resume, recover) run one at a time.
+    variable op_busy
+    if {![info exists op_busy]} { set op_busy 0 }
+    variable op_queue
+    if {![info exists op_queue]} { set op_queue {} }
+    variable recovering
+    if {![info exists recovering]} { set recovering 0 }
+    # Set after a reconnect while busy: check runtime.info once drained.
+    variable reconcile_pending
+    if {![info exists reconcile_pending]} { set reconcile_pending 0 }
+    # Requests whose end event arrived before chat.send answered.
+    variable finished
+    if {![info exists finished]} { set finished {} }
+    variable ready_timer
+    if {![info exists ready_timer]} { set ready_timer "" }
+    variable poll_limit 80
+    variable client_version "vmd_ai 2.0"
 }
 
-proc ::vmdai::bridge::_current_conv_mode {} {
-    variable is_resumed_chat
-    if {$is_resumed_chat} {
-        return "hybrid_resume"
+proc ::vmdai::bridge::_log {msg} {
+    catch {::vmdai::config::log "bridge: $msg"}
+}
+
+proc ::vmdai::bridge::_ignore {args} {}
+
+proc ::vmdai::bridge::_dget {d key default} {
+    if {[catch {dict get $d $key} value] || $value eq "null"} {
+        return $default
     }
-    return "local_first"
+    return $value
 }
 
-proc ::vmdai::bridge::init {} {
-    variable initialized
-    variable has_json
-    if {$initialized} {
+proc ::vmdai::bridge::state {} {
+    variable session_id
+    variable chat_id
+    variable busy
+    variable request_id
+    variable after_seq
+    return [dict create session_id $session_id chat_id $chat_id busy $busy \
+        request_id $request_id after_seq $after_seq epoch [::vmdai::net::epoch]]
+}
+
+# Feed one RPC outcome to the connection state machine: a transport error
+# may start a reconnect, any answer ends one, and AUTH_FAILED (except from
+# session.start itself) makes the runtime recover the session.
+proc ::vmdai::bridge::note_outcome {method kind args} {
+    if {![llength [info commands ::vmdai::runtime::on_transport_ok]]} {
         return
     }
-    package require http
-    if {[catch {package require json}]} {
-        set has_json 0
-    } else {
-        set has_json 1
+    switch -- $kind {
+        transport {
+            ::vmdai::runtime::on_transport_error [lindex $args 0]
+        }
+        rpc_error {
+            ::vmdai::runtime::on_transport_ok
+            if {[lindex $args 0] eq "AUTH_FAILED" && $method ne "session.start"} {
+                ::vmdai::runtime::on_auth_failed
+            }
+        }
+        default {
+            ::vmdai::runtime::on_transport_ok
+        }
     }
-    set initialized 1
 }
 
-proc ::vmdai::bridge::_json_escape {value} {
-    # Produce a pure-ASCII JSON string. Three reasons we don't just
-    # string-map the common escapes and call it done:
-    #   1. JSON forbids ALL control chars (U+0000-U+001F) inside a
-    #      string. Python's strict json.loads rejects any that leak in.
-    #   2. Tcl's http::geturl doesn't always send non-ASCII as UTF-8
-    #      bytes — depending on channel encoding, a stray "▎" or other
-    #      Unicode char from a pasted prompt can corrupt the body.
-    #   3. \uXXXX escapes are ASCII-only and universally interpretable,
-    #      so the wire format is the same regardless of platform.
-    set out ""
-    foreach ch [split $value ""] {
-        scan $ch %c code
-        switch -- $ch {
-            "\\" { append out "\\\\" }
-            "\"" { append out "\\\"" }
-            "\b" { append out "\\b" }
-            "\f" { append out "\\f" }
-            "\n" { append out "\\n" }
-            "\r" { append out "\\r" }
-            "\t" { append out "\\t" }
-            default {
-                if {$code < 32 || $code > 126} {
-                    append out [format "\\u%04x" $code]
-                } else {
-                    append out $ch
+# Note the outcome, then hand it to the caller's callback (net forms).
+proc ::vmdai::bridge::_relay {method callback kind args} {
+    note_outcome $method $kind {*}$args
+    if {$callback ne ""} {
+        ::vmdai::net::deliver $callback $kind {*}$args
+    }
+}
+
+proc ::vmdai::bridge::_runtime_ready {} {
+    if {![llength [info commands ::vmdai::runtime::state]]} {
+        return 1
+    }
+    return [expr {[::vmdai::runtime::state] eq "ready"}]
+}
+
+# C6: {vmd_version, arch, tcl_patchlevel, tk_patchlevel}, each in catch.
+proc ::vmdai::bridge::vmd_env_json {} {
+    set parts {}
+    foreach {key script} {
+        vmd_version {vmdinfo version}
+        arch {vmdinfo arch}
+        tcl_patchlevel {info patchlevel}
+        tk_patchlevel {package present Tk}
+    } {
+        if {![catch {uplevel #0 $script} value] && $value ne ""} {
+            lappend parts "[::vmdai::net::json_string $key]:[::vmdai::net::json_string $value]"
+        }
+    }
+    return "\{[join $parts ,]\}"
+}
+
+# --- one session change at a time -----------------------------------------
+
+proc ::vmdai::bridge::_op {script} {
+    variable op_busy
+    variable op_queue
+    if {$op_busy} {
+        lappend op_queue $script
+        return
+    }
+    set op_busy 1
+    if {[catch {uplevel #0 $script} err]} {
+        _log "operation failed: $::errorInfo"
+        _op_done
+    }
+}
+
+proc ::vmdai::bridge::_op_done {} {
+    variable op_busy
+    variable op_queue
+    set op_busy 0
+    if {[llength $op_queue]} {
+        set next [lindex $op_queue 0]
+        set op_queue [lrange $op_queue 1 end]
+        ::vmdai::sched::after 0 [list ::vmdai::bridge::_op $next]
+        return
+    }
+    _schedule_poll 0
+}
+
+# --- session ------------------------------------------------------------------
+
+proc ::vmdai::bridge::start_session {{callback ""}} {
+    _op [list ::vmdai::bridge::_start_session $callback]
+}
+
+proc ::vmdai::bridge::_start_session {callback} {
+    variable event_protocol
+    variable workdir
+    variable client_version
+    variable polling
+    variable session_id
+    variable session_token
+    variable after_seq
+    variable deferred
+    _stop_pump
+    ::vmdai::net::bump_epoch
+    set polling 0
+    set deferred {}
+    catch {::vmdai::executor::reset}
+    set session_id ""
+    set session_token ""
+    set after_seq 0
+    ::vmdai::net::configure -session_id "" -session_token ""
+    if {$workdir eq ""} {
+        _load_workdir
+    }
+    set params [list cwd s $workdir ui_mode s tk client_version s $client_version \
+        platform s $::tcl_platform(os) event_protocol i $event_protocol \
+        vmd_env j [vmd_env_json]]
+    set token ""
+    catch {set token [dict get [::vmdai::runtime::info] launch_token]}
+    if {$token ne ""} {
+        lappend params launch_token s $token
+    }
+    ::vmdai::net::call session.start $params \
+        [list ::vmdai::bridge::_on_session_started $callback]
+}
+
+proc ::vmdai::bridge::_on_session_started {callback kind args} {
+    variable session_id
+    variable session_token
+    variable chat_id
+    variable after_seq
+    variable recovering
+    note_outcome session.start $kind {*}$args
+    if {$kind eq "ok"} {
+        set result [lindex $args 0]
+        set session_id [_dget $result session_id ""]
+        set session_token [_dget $result session_token ""]
+        ::vmdai::net::configure -session_id $session_id -session_token $session_token
+        # A new chat takes the runtime's chat id (null until the first send
+        # for a token session); a recovered session keeps its chat.
+        if {$chat_id eq ""} {
+            set chat_id [_dget $result chat_id ""]
+        }
+        set after_seq 0
+    } else {
+        set recovering 0
+        set message [lindex $args [expr {$kind eq "rpc_error" ? 1 : 0}]]
+        if {[catch {::vmdai::ui::notify error "Could not start a chat session: $message"} err]} {
+            _log "ui: $err"
+        }
+    }
+    _op_done
+    if {$callback ne ""} {
+        ::vmdai::net::deliver $callback $kind {*}$args
+    }
+}
+
+# The runtime came back with a new pid or answered AUTH_FAILED (P06-T06):
+# start a new session, resume the current chat, and report a lost request.
+proc ::vmdai::bridge::recover {} {
+    variable recovering
+    variable busy
+    variable request_id
+    if {$recovering} {
+        return
+    }
+    set recovering 1
+    if {$busy} {
+        _request_ended $request_id
+        if {[catch {::vmdai::ui::status "The request in progress was lost when the AI runtime restarted."} err]} {
+            _log "ui: $err"
+        }
+    }
+    _op [list ::vmdai::bridge::_start_session ::vmdai::bridge::_recovered]
+}
+
+proc ::vmdai::bridge::_recovered {kind args} {
+    variable recovering
+    variable chat_id
+    if {$kind ne "ok" || $chat_id eq ""} {
+        set recovering 0
+        return
+    }
+    _op [list ::vmdai::bridge::_resume $chat_id "" ::vmdai::bridge::_on_recover_resume]
+}
+
+proc ::vmdai::bridge::_on_recover_resume {target callback kind args} {
+    variable recovering
+    variable chat_id
+    note_outcome chat.resume $kind {*}$args
+    set recovering 0
+    if {$kind eq "ok"} {
+        _resumed $target [lindex $args 0]
+    } else {
+        # The chat stays on disk; this session starts a new one.
+        _log "recover: chat.resume $target failed: $args"
+        set chat_id ""
+    }
+    _op_done
+}
+
+# New Chat: cancel a running request, stop the old session (which releases
+# its chat lock), then start a new session with no chat.
+proc ::vmdai::bridge::new_chat {} {
+    _op ::vmdai::bridge::_new_chat
+}
+
+proc ::vmdai::bridge::_new_chat {} {
+    variable session_id
+    variable busy
+    variable request_id
+    variable chat_id
+    if {$busy && $request_id ne ""} {
+        catch {::vmdai::executor::note_cancelled $request_id}
+        ::vmdai::net::call chat.cancel [list request_id s $request_id] ::vmdai::bridge::_ignore
+    }
+    _request_ended $request_id
+    set chat_id ""
+    if {$session_id eq ""} {
+        _start_session ""
+        return
+    }
+    _stop_pump
+    ::vmdai::net::call session.stop {} ::vmdai::bridge::_on_session_stopped
+}
+
+proc ::vmdai::bridge::_on_session_stopped {kind args} {
+    # The old session is gone either way; only a transport error says
+    # something about the runtime.
+    if {$kind eq "transport"} {
+        note_outcome session.stop $kind {*}$args
+    }
+    _start_session ""
+}
+
+# Resume a stored chat in this session. The callback gets the net forms:
+# ok <result> | rpc_error <code> <message> <data> | transport <reason>.
+proc ::vmdai::bridge::resume {target {callback ""}} {
+    _op [list ::vmdai::bridge::_resume $target $callback ::vmdai::bridge::_on_resume]
+}
+
+proc ::vmdai::bridge::_resume {target callback handler} {
+    variable session_id
+    if {$session_id eq ""} {
+        ::vmdai::sched::after 0 [list $handler $target $callback \
+            rpc_error NOT_CONNECTED "Not connected to the AI runtime yet." {}]
+        return
+    }
+    _stop_pump
+    ::vmdai::net::call chat.resume [list chat_id s $target] [list $handler $target $callback]
+}
+
+proc ::vmdai::bridge::_on_resume {target callback kind args} {
+    note_outcome chat.resume $kind {*}$args
+    if {$kind eq "ok"} {
+        _resumed $target [lindex $args 0]
+    } else {
+        _resume_failed $kind {*}$args
+    }
+    _op_done
+    if {$callback ne ""} {
+        ::vmdai::net::deliver $callback $kind {*}$args
+    }
+}
+
+# chat.resume succeeded: switch chat_id and after_seq (the runtime's
+# last_seq; older runtimes restart at 0), drop replies meant for the old
+# chat, and apply the folder again.
+proc ::vmdai::bridge::_resumed {target result} {
+    variable chat_id
+    variable after_seq
+    variable polling
+    variable deferred
+    variable request_id
+    ::vmdai::net::bump_epoch
+    set polling 0
+    set deferred {}
+    _request_ended $request_id
+    set chat_id $target
+    set after_seq [_dget $result last_seq 0]
+    if {![string is integer -strict $after_seq]} {
+        set after_seq 0
+    }
+    _send_cwd
+}
+
+proc ::vmdai::bridge::_resume_failed {kind args} {
+    if {$kind eq "transport"} {
+        set text "Could not resume the chat: the AI runtime did not answer."
+    } else {
+        lassign $args code message
+        switch -- $code {
+            CHAT_LOCKED { set text "This chat is open in another VMD window." }
+            REQUEST_CONFLICT { set text "Stop the running request before switching chats." }
+            NOT_FOUND { set text "That chat no longer exists." }
+            default { set text "Could not resume the chat: $message" }
+        }
+    }
+    if {[catch {::vmdai::ui::notify error $text} err]} {
+        _log "ui: $err"
+    }
+}
+
+# --- requests -----------------------------------------------------------------
+
+# Send a prompt. Returns 1 when chat.send was issued. The panel turns busy
+# only after the runtime accepted the request (spec 2h, 4).
+proc ::vmdai::bridge::send {text} {
+    variable session_id
+    variable busy
+    variable chat_id
+    variable op_busy
+    if {$session_id eq "" || $op_busy || ![_runtime_ready]} {
+        set why "Not connected to the AI runtime yet; try again in a moment."
+    } elseif {$busy} {
+        set why "A request is still running; stop it first."
+    } else {
+        set params [list text s $text conversation_mode s full]
+        if {$chat_id ne ""} {
+            lappend params chat_id s $chat_id
+        }
+        ::vmdai::net::call chat.send $params ::vmdai::bridge::_on_send
+        return 1
+    }
+    if {[catch {::vmdai::ui::notify warn $why} err]} {
+        _log "ui: $err"
+    }
+    return 0
+}
+
+proc ::vmdai::bridge::_on_send {kind args} {
+    variable busy
+    variable request_id
+    variable chat_id
+    variable finished
+    note_outcome chat.send $kind {*}$args
+    switch -- $kind {
+        ok {
+            set result [lindex $args 0]
+            set rid [_dget $result request_id ""]
+            set cid [_dget $result chat_id ""]
+            if {$cid ne ""} {
+                set chat_id $cid
+            }
+            if {$rid ne "" && [lsearch -exact $finished $rid] < 0} {
+                set request_id $rid
+                set busy 1
+                if {[catch {::vmdai::ui::set_busy 1} err]} {
+                    _log "ui: $err"
                 }
             }
+            _schedule_poll 0
         }
-    }
-    return $out
-}
-
-proc ::vmdai::bridge::_json_quote {value} {
-    return "\"[::vmdai::bridge::_json_escape $value]\""
-}
-
-proc ::vmdai::bridge::_json_kv {key value_json} {
-    return "[::vmdai::bridge::_json_quote $key]:$value_json"
-}
-
-proc ::vmdai::bridge::_json_object {kvs} {
-    return "\{[join $kvs ,]\}"
-}
-
-proc ::vmdai::bridge::_rpc {method params_json} {
-    variable req_counter
-    variable session_token
-    ::vmdai::bridge::init
-
-    set req_counter [expr {$req_counter + 1}]
-    set request_id "tcl_[format %06d $req_counter]"
-    set payload [::vmdai::bridge::_json_object [list \
-        [::vmdai::bridge::_json_kv jsonrpc [::vmdai::bridge::_json_quote "2.0"]] \
-        [::vmdai::bridge::_json_kv id [::vmdai::bridge::_json_quote $request_id]] \
-        [::vmdai::bridge::_json_kv method [::vmdai::bridge::_json_quote $method]] \
-        [::vmdai::bridge::_json_kv params $params_json] \
-    ]]
-
-    set headers [list Content-Type application/json]
-    if {$session_token ne ""} {
-        lappend headers X-Session-Token $session_token
-    }
-
-    set url "[::vmdai::config::runtime_url]/rpc"
-
-    # Guard against socket-level failures (connection reset, channel closed).
-    if {[catch {
-        set token [http::geturl $url -method POST -headers $headers -query $payload -timeout $::vmdai::config::request_timeout_ms]
-    } sock_err]} {
-        error "RPC transport error ($method): $sock_err"
-    }
-
-    # Read + cleanup — also guarded so a partial response doesn't leak the token.
-    set http_status [http::status $token]
-    if {$http_status ne "ok"} {
-        set http_error [http::error $token]
-        http::cleanup $token
-        error "RPC HTTP error ($method): status=$http_status $http_error"
-    }
-
-    set data [http::data $token]
-    http::cleanup $token
-    return $data
-}
-
-proc ::vmdai::bridge::_response_error {body} {
-    ::vmdai::bridge::init
-    variable has_json
-
-    if {$has_json} {
-        if {[catch {set parsed [::json::json2dict $body]}]} {
-            return ""
-        }
-        if {![dict exists $parsed error]} {
-            return ""
-        }
-        set err [dict get $parsed error]
-        if {[catch {dict size $err}]} {
-            if {[string trim $err] ne ""} {
-                return [string trim $err]
+        rpc_error {
+            lassign $args code message
+            if {[catch {::vmdai::ui::notify error "Could not send: $message"} err]} {
+                _log "ui: $err"
             }
-            return "Unknown RPC error"
+            catch {::vmdai::ui::set_busy 0}
         }
-        if {[dict exists $err message]} {
-            set msg [dict get $err message]
-            if {[string trim $msg] ne ""} {
-                return $msg
+        default {
+            if {[catch {::vmdai::ui::notify error "Could not send: the AI runtime did not answer."} err]} {
+                _log "ui: $err"
             }
+            catch {::vmdai::ui::set_busy 0}
         }
-        return "Unknown RPC error"
     }
-
-    # Regex fallback (no json package).
-    # A successful JSON-RPC response has "result"; an error has "error" at top level.
-    # We must NOT false-positive on event data like {"role":"error",...} inside "result".
-    if {[regexp {"result"\s*:} $body]} {
-        return ""
-    }
-    if {![regexp {"error"\s*:} $body]} {
-        return ""
-    }
-    if {[regexp {"message"\s*:\s*"((?:\\.|[^"])*)"} $body -> msg]} {
-        return [string map [list "\\n" "\n" "\\r" "\r" "\\t" "\t" "\\\"" "\"" "\\\\" "\\"] $msg]
-    }
-    return "Unknown RPC error"
 }
 
-proc ::vmdai::bridge::_extract_string {body key} {
-    set pattern [format {"%s"\s*:\s*"((?:\\.|[^"])*)"} $key]
-    if {[regexp $pattern $body -> out]} {
-        set out [string map [list "\\n" "\n" "\\r" "\r" "\\t" "\t" "\\\"" "\"" "\\\\" "\\"] $out]
-        return $out
-    }
-    return ""
-}
-
-proc ::vmdai::bridge::_extract_int {body key default} {
-    set pattern [format {"%s"\s*:\s*(\d+)} $key]
-    if {[regexp $pattern $body -> out]} {
-        return $out
-    }
-    return $default
-}
-
-proc ::vmdai::bridge::_parse_events_fallback {body} {
-    set events [list]
-    set matches [regexp -inline -all {\{[^\{\}]*"seq"[^\{\}]*\}} $body]
-    foreach item $matches {
-        set role [::vmdai::bridge::_extract_string $item role]
-        set etype [::vmdai::bridge::_extract_string $item type]
-        set text [::vmdai::bridge::_extract_string $item text]
-        set request_id [::vmdai::bridge::_extract_string $item request_id]
-        set ev [dict create role $role type $etype text $text metadata [dict create request_id $request_id]]
-        lappend events $ev
-    }
-    return $events
-}
-
-proc ::vmdai::bridge::_parse_events {body} {
-    variable has_json
-    if {$has_json} {
-        if {[catch {set parsed [::json::json2dict $body]} parse_err]} {
-            # Non-JSON body (e.g. "END", empty, or corrupted) — fall through to regex
-            return [::vmdai::bridge::_parse_events_fallback $body]
-        }
-        if {![dict exists $parsed result events]} {
-            return [list]
-        }
-        set out [list]
-        foreach ev [dict get $parsed result events] {
-            set metadata [dict create]
-            if {[dict exists $ev metadata]} {
-                set metadata [dict get $ev metadata]
-            }
-            lappend out [dict create \
-                role [dict get $ev role] \
-                type [dict get $ev type] \
-                text [dict get $ev text] \
-                metadata $metadata]
-        }
-        return $out
-    }
-    return [::vmdai::bridge::_parse_events_fallback $body]
-}
-
-proc ::vmdai::bridge::_health_ok {} {
-    ::vmdai::bridge::init
-    set token [http::geturl "[::vmdai::config::runtime_url]/health" -timeout 600]
-    set data [http::data $token]
-    set status [http::status $token]
-    http::cleanup $token
-    if {$status ne "ok"} {
+proc ::vmdai::bridge::cancel {} {
+    variable busy
+    variable request_id
+    if {!$busy || $request_id eq ""} {
         return 0
     }
-    return [expr {[string first "\"ok\": true" $data] >= 0 || [string first "\"ok\":true" $data] >= 0}]
+    catch {::vmdai::executor::note_cancelled $request_id}
+    ::vmdai::net::call chat.cancel [list request_id s $request_id] \
+        [list ::vmdai::bridge::_relay chat.cancel ""]
+    return 1
 }
 
-proc ::vmdai::bridge::ensure_runtime {} {
+proc ::vmdai::bridge::_request_ended {rid} {
+    variable busy
+    variable request_id
+    variable finished
+    if {$rid ne ""} {
+        lappend finished $rid
+        set finished [lrange $finished end-19 end]
+    }
+    if {$rid ne $request_id || $request_id eq ""} {
+        return
+    }
+    set busy 0
+    set request_id ""
+    if {[catch {::vmdai::ui::set_busy 0} err]} {
+        _log "ui: $err"
+    }
+}
+
+# --- poll pump (spec 2d) ------------------------------------------------------
+
+proc ::vmdai::bridge::_schedule_poll {ms} {
+    variable poll_timer
+    ::vmdai::sched::cancel $poll_timer
+    set poll_timer [::vmdai::sched::after $ms ::vmdai::bridge::_poll]
+}
+
+proc ::vmdai::bridge::_stop_pump {} {
+    variable poll_timer
+    ::vmdai::sched::cancel $poll_timer
+    set poll_timer ""
+}
+
+proc ::vmdai::bridge::poll_now {} {
+    _schedule_poll 0
+}
+
+proc ::vmdai::bridge::_poll {} {
+    variable poll_timer
+    variable polling
     variable session_id
-    if {$session_id ne ""} {
+    variable after_seq
+    variable poll_limit
+    variable op_busy
+    set poll_timer ""
+    if {$polling || $session_id eq "" || $op_busy || ![_runtime_ready]} {
         return
     }
-    ::vmdai::bridge::start_runtime
-    ::vmdai::bridge::start_session
-    ::vmdai::bridge::schedule_poll
+    set polling 1
+    ::vmdai::net::call chat.events.poll [list after_seq i $after_seq limit i $poll_limit] \
+        [list ::vmdai::bridge::_on_poll $session_id] -timeout $::vmdai::config::request_timeout_ms
 }
 
-proc ::vmdai::bridge::start_runtime {} {
-    variable runtime_pid
-    if {[catch {::vmdai::bridge::_health_ok} ok] == 0 && $ok} {
+proc ::vmdai::bridge::_on_poll {sid kind args} {
+    variable polling
+    variable session_id
+    variable after_seq
+    variable op_busy
+    variable reconcile_pending
+    set polling 0
+    if {$sid ne $session_id} {
         return
     }
-
-    set cmd [list $::vmdai::config::python_exec $::vmdai::config::runtime_main --host $::vmdai::config::host --port $::vmdai::config::port]
-    set runtime_pid [exec {*}$cmd >> $::vmdai::config::runtime_log 2>> $::vmdai::config::runtime_log &]
-
-    set started 0
-    for {set i 0} {$i < 40} {incr i} {
-        after 100
-        if {[catch {::vmdai::bridge::_health_ok} ok] == 0 && $ok} {
-            set started 1
-            break
+    note_outcome chat.events.poll $kind {*}$args
+    if {$kind eq "transport"} {
+        # The state machine reconnects; _after_ready restarts the pump.
+        return
+    }
+    if {$kind eq "rpc_error"} {
+        if {[lindex $args 0] ne "AUTH_FAILED"} {
+            _log "poll: [lindex $args 0] [lindex $args 1]"
+            _schedule_poll $::vmdai::config::poll_ms
         }
-    }
-    if {!$started} {
-        ::vmdai::ui::append_message error "Runtime failed to become healthy."
-    }
-}
-
-proc ::vmdai::bridge::start_session {} {
-    variable session_id
-    variable session_token
-    variable chat_id
-    variable after_seq
-
-    set params [::vmdai::bridge::_json_object [list \
-        [::vmdai::bridge::_json_kv cwd [::vmdai::bridge::_json_quote [pwd]]] \
-        [::vmdai::bridge::_json_kv ui_mode [::vmdai::bridge::_json_quote "qt"]] \
-        [::vmdai::bridge::_json_kv client_version [::vmdai::bridge::_json_quote "vmd-plugin-skeleton"]] \
-        [::vmdai::bridge::_json_kv platform [::vmdai::bridge::_json_quote $::tcl_platform(os)]] \
-    ]]
-    if {[catch {set body [::vmdai::bridge::_rpc "session.start" $params]} rpc_err]} {
-        ::vmdai::ui::append_message error "session.start transport failed: $rpc_err"
         return
     }
-    set err [::vmdai::bridge::_response_error $body]
-    if {$err ne ""} {
-        ::vmdai::ui::append_message error "session.start failed: $err"
+    set result [lindex $args 0]
+    if {[catch {dict get $result events} events] || [catch {llength $events}]} {
+        # Undecodable poll body: a transport error; after_seq stays (spec 5).
+        catch {::vmdai::runtime::on_transport_error "malformed poll result"}
         return
     }
-    set session_id [::vmdai::bridge::_extract_string $body session_id]
-    set session_token [::vmdai::bridge::_extract_string $body session_token]
-    set chat_id [::vmdai::bridge::_extract_string $body chat_id]
-    set after_seq 0
-}
-
-proc ::vmdai::bridge::send_chat {text} {
-    variable session_id
-    variable chat_id
-    variable active_request_id
-
-    if {$session_id eq ""} {
-        ::vmdai::bridge::ensure_runtime
-    }
-
-    # Pull the current model from the UI's provider picker so the
-    # runtime sees whichever model the user selected. Falls back to the
-    # historical default if the UI hasn't initialized yet (e.g. headless
-    # smoke tests calling send_chat directly).
-    set picked_model "anthropic/claude-sonnet-4.6"
-    if {[info exists ::vmdai::ui::model_name] \
-            && [string trim $::vmdai::ui::model_name] ne ""} {
-        set picked_model $::vmdai::ui::model_name
-    }
-
-    set params [::vmdai::bridge::_json_object [list \
-        [::vmdai::bridge::_json_kv session_id [::vmdai::bridge::_json_quote $session_id]] \
-        [::vmdai::bridge::_json_kv chat_id [::vmdai::bridge::_json_quote $chat_id]] \
-        [::vmdai::bridge::_json_kv text [::vmdai::bridge::_json_quote $text]] \
-        [::vmdai::bridge::_json_kv model [::vmdai::bridge::_json_quote $picked_model]] \
-        [::vmdai::bridge::_json_kv mode [::vmdai::bridge::_json_quote "work"]] \
-        [::vmdai::bridge::_json_kv conversation_mode [::vmdai::bridge::_json_quote [::vmdai::bridge::_current_conv_mode]]] \
-    ]]
-
-    if {[catch {set body [::vmdai::bridge::_rpc "chat.send" $params]} err]} {
-        ::vmdai::ui::append_message error "chat.send transport failed: $err"
-        return
-    }
-    set rpcerr [::vmdai::bridge::_response_error $body]
-    if {$rpcerr ne ""} {
-        ::vmdai::ui::append_message error "chat.send failed: $rpcerr"
-        return
-    }
-    set active_request_id [::vmdai::bridge::_extract_string $body request_id]
-}
-
-proc ::vmdai::bridge::cancel_active {} {
-    variable session_id
-    variable active_request_id
-    if {$session_id eq "" || $active_request_id eq ""} {
-        return
-    }
-    set params [::vmdai::bridge::_json_object [list \
-        [::vmdai::bridge::_json_kv session_id [::vmdai::bridge::_json_quote $session_id]] \
-        [::vmdai::bridge::_json_kv request_id [::vmdai::bridge::_json_quote $active_request_id]] \
-    ]]
-    catch {::vmdai::bridge::_rpc "chat.cancel" $params}
-}
-
-proc ::vmdai::bridge::poll_once {} {
-    variable session_id
-    variable after_seq
-    variable active_request_id
-
-    if {$session_id eq ""} {
-        ::vmdai::bridge::schedule_poll
-        return
-    }
-
-    set params [::vmdai::bridge::_json_object [list \
-        [::vmdai::bridge::_json_kv session_id [::vmdai::bridge::_json_quote $session_id]] \
-        [::vmdai::bridge::_json_kv after_seq $after_seq] \
-        [::vmdai::bridge::_json_kv limit $::vmdai::config::poll_limit] \
-    ]]
-
-    if {[catch {set body [::vmdai::bridge::_rpc "chat.events.poll" $params]} err]} {
-        ::vmdai::ui::append_message error "poll failed: $err"
-        ::vmdai::bridge::schedule_poll
-        return
-    }
-
-    set rpcerr [::vmdai::bridge::_response_error $body]
-    if {$rpcerr ne ""} {
-        ::vmdai::ui::append_message error "poll rpc error: $rpcerr"
-        ::vmdai::bridge::schedule_poll
-        return
-    }
-
-    set events [::vmdai::bridge::_parse_events $body]
     foreach ev $events {
-        set role [::vmdai::ui::_dict_get_or $ev role system]
-        # Dispatch tool_start events to the VMD executor; pass all others to the UI.
-        if {$role eq "tool_start"} {
-            ::vmdai::bridge::_handle_tool_start $ev
-        } else {
-            ::vmdai::ui::render_event $ev
-        }
-    }
-
-    set last_seq [::vmdai::bridge::_extract_int $body last_seq $after_seq]
-    set after_seq $last_seq
-
-    if {[regexp {"cancelled"} $body]} {
-        set active_request_id ""
-    }
-
-    ::vmdai::bridge::schedule_poll
-}
-
-# ---------------------------------------------------------------------------
-# VMD tool execution
-# ---------------------------------------------------------------------------
-
-proc ::vmdai::bridge::_handle_tool_start {event} {
-    # Extract metadata fields
-    set tool_call_id [::vmdai::ui::_dict_get_or \
-        [::vmdai::ui::_dict_get_or $event metadata [dict create]] \
-        tool_call_id ""]
-    set tool_name [::vmdai::ui::_dict_get_or \
-        [::vmdai::ui::_dict_get_or $event metadata [dict create]] \
-        tool_name ""]
-    set tool_input [::vmdai::ui::_dict_get_or \
-        [::vmdai::ui::_dict_get_or $event metadata [dict create]] \
-        tool_input [dict create]]
-
-    if {$tool_call_id eq ""} {
-        ::vmdai::ui::append_message error "tool_start: missing tool_call_id"
-        return
-    }
-
-    # Show what we're doing in the transcript
-    set label [::vmdai::ui::_dict_get_or $event text ""]
-    if {$label ne ""} {
-        ::vmdai::ui::append_message system $label
-    }
-
-    if {$tool_name eq "run_vmd_command"} {
-        ::vmdai::bridge::_exec_vmd_command $tool_call_id $tool_input
-    } elseif {$tool_name eq "capture_vmd_snapshot"} {
-        ::vmdai::bridge::_exec_capture_snapshot $tool_call_id $tool_input
-    } else {
-        ::vmdai::bridge::_post_command_result $tool_call_id 0 "" \
-            "Unknown tool: $tool_name" ""
-    }
-}
-
-proc ::vmdai::bridge::_exec_vmd_command {tool_call_id tool_input} {
-    variable session_id
-
-    # Extract command string from tool_input dict
-    set command ""
-    if {[dict exists $tool_input command]} {
-        set command [dict get $tool_input command]
-    }
-
-    if {[string trim $command] eq ""} {
-        ::vmdai::bridge::_post_command_result $tool_call_id 0 "" \
-            "Empty command" ""
-        return
-    }
-
-    # Execute the command, treating it as a sequence of complete Tcl
-    # statements. Multi-line constructs (foreach, for, proc, while, etc.)
-    # span newlines and have braces that close on later lines; we must NOT
-    # evaluate line-by-line. Instead, accumulate lines in a buffer and use
-    # `info complete` to detect when the buffer forms a balanced statement
-    # — the same pattern an interactive Tcl REPL uses. This handles single
-    # one-liners, multiple `;`-separated statements on a line, and arbitrary
-    # multi-line blocks.
-    set lines [split $command "\n"]
-    set all_output ""
-    set had_error 0
-    set error_msg ""
-    set buf ""
-
-    foreach raw_line $lines {
-        if {$buf eq ""} {
-            set trimmed [string trim $raw_line]
-            # Skip blank lines and full-line comments only between statements.
-            if {$trimmed eq "" || [string index $trimmed 0] eq "#"} {
-                continue
-            }
-        }
-        append buf $raw_line "\n"
-        if {![info complete $buf]} {
-            # Brace/quote still unclosed — keep accumulating.
+        set seq ""
+        catch {set seq [dict get $ev seq]}
+        if {![string is integer -strict $seq] || $seq <= $after_seq} {
             continue
         }
-        # Buffer is a complete Tcl statement (or sequence of statements).
-        set stmt [string trim $buf]
-        set buf ""
-        if {$stmt eq ""} { continue }
-
-        if {[catch {uplevel #0 $stmt} result]} {
-            set had_error 1
-            # Truncate huge statements in the error message so we don't
-            # blow up the chat transcript.
-            set preview $stmt
-            if {[string length $preview] > 200} {
-                set preview "[string range $preview 0 197]..."
-            }
-            set error_msg "Command '$preview' failed: $result"
-            break
-        } else {
-            if {$result ne ""} {
-                append all_output "$result\n"
-            }
+        set after_seq $seq
+        if {[catch {_dispatch $ev} err]} {
+            _log "dispatch of seq $seq failed: $::errorInfo"
+        }
+        if {$sid ne $session_id} {
+            return
         }
     }
-
-    # Leftover unbalanced buffer is a syntax error — surface it instead of
-    # silently dropping the trailing block.
-    if {!$had_error && [string trim $buf] ne ""} {
-        set had_error 1
-        set preview [string trim $buf]
-        if {[string length $preview] > 200} {
-            set preview "[string range $preview 0 197]..."
-        }
-        set error_msg "Incomplete Tcl statement (unclosed braces or quotes): '$preview'"
+    set more 0
+    catch {set more [string is true -strict [dict get $result has_more]]}
+    if {!$more && $reconcile_pending} {
+        set reconcile_pending 0
+        _reconcile
     }
+    if {$op_busy} {
+        return
+    }
+    _schedule_poll [expr {$more ? 0 : $::vmdai::config::poll_ms}]
+}
 
-    if {$had_error} {
-        ::vmdai::bridge::_post_command_result $tool_call_id 0 $all_output \
-            $error_msg ""
-    } else {
-        # Capture the successful Tcl into the session log so the user
-        # can save it via "Save Tcl…". Only the success path records —
-        # failed attempts never make it into the replayable artifact.
-        catch {::vmdai::ui::record_tcl_turn command $command}
-        ::vmdai::bridge::_post_command_result $tool_call_id 1 $all_output \
-            "" ""
+proc ::vmdai::bridge::_executing {} {
+    return [expr {[info exists ::vmdai::executor::executing] && $::vmdai::executor::executing}]
+}
+
+# One event: tool_start goes to the executor (held back while model Tcl is
+# running, e.g. when it calls update or vwait); everything else to the panel.
+proc ::vmdai::bridge::_dispatch {ev} {
+    variable deferred
+    set role ""
+    catch {set role [dict get $ev role]}
+    if {$role eq "tool_start"} {
+        if {[_executing] || [llength $deferred]} {
+            _defer $ev
+            return
+        }
+        ::vmdai::executor::run $ev
+        return
+    }
+    if {[catch {::vmdai::ui::render_event $ev} err]} {
+        _log "render_event: $err"
+    }
+    _check_end $ev
+}
+
+proc ::vmdai::bridge::_defer {ev} {
+    variable deferred
+    variable drain_timer
+    lappend deferred $ev
+    if {$drain_timer eq ""} {
+        set drain_timer [::vmdai::sched::after 20 ::vmdai::bridge::_drain]
     }
 }
 
-proc ::vmdai::bridge::_exec_capture_snapshot {tool_call_id tool_input} {
-    # Generate a unique temp file path
-    set snap_file "/tmp/vmdai_snap_${tool_call_id}.tga"
-
-    # Try TachyonInternal first (better quality); fall back to snapshot
-    set ok 0
-    set err_msg ""
-
-    if {[catch {render TachyonInternal $snap_file} render_err]} {
-        # TachyonInternal failed — try the basic snapshot renderer
-        if {[catch {render snapshot $snap_file} snap_err]} {
-            set err_msg "Snapshot failed: $render_err / $snap_err"
-        } else {
-            set ok 1
-        }
-    } else {
-        set ok 1
+proc ::vmdai::bridge::_drain {} {
+    variable deferred
+    variable drain_timer
+    set drain_timer ""
+    if {[_executing]} {
+        set drain_timer [::vmdai::sched::after 20 ::vmdai::bridge::_drain]
+        return
     }
-
-    # Update display to ensure framebuffer is current before capturing
-    catch {display update}
-
-    if {$ok} {
-        # Record the successful render in the session log; the file
-        # path makes the saved Tcl reproducible against the same
-        # working directory.
-        catch {::vmdai::ui::record_tcl_turn snapshot "render snapshot $snap_file"}
-        ::vmdai::bridge::_post_command_result $tool_call_id 1 \
-            "Snapshot written to $snap_file" "" $snap_file
-    } else {
-        ::vmdai::bridge::_post_command_result $tool_call_id 0 "" $err_msg ""
+    set batch $deferred
+    set deferred {}
+    foreach ev $batch {
+        if {[catch {::vmdai::executor::run $ev} err]} {
+            _log "executor::run failed: $::errorInfo"
+        }
     }
 }
 
-proc ::vmdai::bridge::_post_command_result {tool_call_id ok output error_msg snapshot_file} {
+# v1 end of a request: the final assistant/message, an error event, or the
+# `cancelled` lifecycle event.
+proc ::vmdai::bridge::_check_end {ev} {
+    variable request_id
+    set role [_dget $ev role ""]
+    set type [_dget $ev type ""]
+    set text [_dget $ev text ""]
+    set rid ""
+    catch {set rid [dict get $ev metadata request_id]}
+    set ends [expr {($role eq "assistant" && $type eq "message") || $role eq "error"
+        || ($role eq "system" && $type eq "lifecycle" && $text eq "cancelled")}]
+    if {!$ends} {
+        return
+    }
+    if {$rid eq "" || $rid eq "null"} {
+        set rid $request_id
+    }
+    _request_ended $rid
+}
+
+# --- connection state (P06-T06 contract) --------------------------------------
+
+proc ::vmdai::bridge::_on_runtime_state {old new detail} {
+    variable ready_timer
+    switch -- $new {
+        ready {
+            ::vmdai::sched::cancel $ready_timer
+            set ready_timer [::vmdai::sched::after 0 ::vmdai::bridge::_after_ready]
+        }
+        stopped {
+            _reset_session
+        }
+        default {
+            _stop_pump
+        }
+    }
+}
+
+# Runs after the state machine finished its transition (and any recover).
+proc ::vmdai::bridge::_after_ready {} {
+    variable ready_timer
     variable session_id
-
-    # Build the JSON params for tool.command_result
-    set ok_json [expr {$ok ? "true" : "false"}]
-    set params [::vmdai::bridge::_json_object [list \
-        [::vmdai::bridge::_json_kv session_id    [::vmdai::bridge::_json_quote $session_id]] \
-        [::vmdai::bridge::_json_kv tool_call_id  [::vmdai::bridge::_json_quote $tool_call_id]] \
-        [::vmdai::bridge::_json_kv ok            $ok_json] \
-        [::vmdai::bridge::_json_kv output        [::vmdai::bridge::_json_quote $output]] \
-        [::vmdai::bridge::_json_kv error         [::vmdai::bridge::_json_quote $error_msg]] \
-        [::vmdai::bridge::_json_kv snapshot_file [::vmdai::bridge::_json_quote $snapshot_file]] \
-    ]]
-
-    if {[catch {::vmdai::bridge::_rpc "tool.command_result" $params} rpc_err]} {
-        ::vmdai::ui::append_message error "tool.command_result failed: $rpc_err"
-    }
-}
-
-proc ::vmdai::bridge::schedule_poll {} {
-    variable poll_after_id
-    if {$poll_after_id ne ""} {
-        after cancel $poll_after_id
-    }
-    set poll_after_id [after $::vmdai::config::poll_ms ::vmdai::bridge::poll_once]
-}
-
-proc ::vmdai::bridge::set_provider {provider model} {
-    # Tell the runtime to swap which provider/model powers the agent.
-    # The runtime rebuilds its provider + Claude tool loop in-place.
-    # Safe to call before send_chat — if there's no session yet, we
-    # spin one up first so the RPC has somewhere to land.
-    variable session_id
-    if {$session_id eq ""} {
-        ::vmdai::bridge::ensure_runtime
+    variable op_busy
+    variable busy
+    variable reconcile_pending
+    set ready_timer ""
+    if {![_runtime_ready] || $op_busy} {
+        return
     }
     if {$session_id eq ""} {
-        # Runtime never came up — nothing we can do. Caller (the UI)
-        # already surfaced ensure_runtime errors, so stay quiet here.
+        start_session
         return
     }
-    set params [::vmdai::bridge::_json_object [list \
-        [::vmdai::bridge::_json_kv session_id [::vmdai::bridge::_json_quote $session_id]] \
-        [::vmdai::bridge::_json_kv provider   [::vmdai::bridge::_json_quote $provider]] \
-        [::vmdai::bridge::_json_kv model      [::vmdai::bridge::_json_quote $model]] \
-    ]]
-    if {[catch {set body [::vmdai::bridge::_rpc "provider.set" $params]} err]} {
-        ::vmdai::ui::append_message error "provider.set transport failed: $err"
+    if {$busy} {
+        set reconcile_pending 1
+    }
+    _schedule_poll 0
+}
+
+# Busy after a reconnect (spec 2c): once the events are drained, a request
+# the runtime no longer runs is ended locally.
+proc ::vmdai::bridge::_reconcile {} {
+    variable busy
+    variable request_id
+    if {!$busy} {
         return
     }
-    set rpcerr [::vmdai::bridge::_response_error $body]
-    if {$rpcerr ne ""} {
-        ::vmdai::ui::append_message error "provider.set failed: $rpcerr"
+    ::vmdai::net::call runtime.info {} [list ::vmdai::bridge::_on_info $request_id]
+}
+
+proc ::vmdai::bridge::_on_info {rid kind args} {
+    variable busy
+    variable request_id
+    note_outcome runtime.info $kind {*}$args
+    if {$kind ne "ok" || !$busy || $request_id ne $rid} {
         return
+    }
+    set active ""
+    catch {set active [dict get [lindex $args 0] active_request request_id]}
+    if {$active eq $rid} {
+        return
+    }
+    _request_ended $rid
+    if {[catch {::vmdai::ui::notify info "Request ended (details may be missing)."} err]} {
+        _log "ui: $err"
     }
 }
 
-proc ::vmdai::bridge::new_chat {} {
+proc ::vmdai::bridge::_reset_session {} {
     variable session_id
     variable session_token
     variable chat_id
     variable after_seq
-    variable active_request_id
-
-    if {$session_id ne ""} {
-        set params [::vmdai::bridge::_json_object [list \
-            [::vmdai::bridge::_json_kv session_id [::vmdai::bridge::_json_quote $session_id]] \
-        ]]
-        catch {::vmdai::bridge::_rpc "session.stop" $params}
-    }
-
+    variable polling
+    variable deferred
+    variable drain_timer
+    variable op_busy
+    variable op_queue
+    variable recovering
+    variable reconcile_pending
+    variable request_id
+    variable ready_timer
+    _stop_pump
+    ::vmdai::sched::cancel $drain_timer
+    ::vmdai::sched::cancel $ready_timer
+    _request_ended $request_id
+    set drain_timer ""
+    set ready_timer ""
     set session_id ""
     set session_token ""
     set chat_id ""
     set after_seq 0
-    set active_request_id ""
-    variable is_resumed_chat
-    set is_resumed_chat 0
-
-    ::vmdai::bridge::ensure_runtime
+    set polling 0
+    set deferred {}
+    set op_busy 0
+    set op_queue {}
+    set recovering 0
+    set reconcile_pending 0
+    catch {::vmdai::net::configure -session_id "" -session_token ""}
 }
 
-proc ::vmdai::bridge::show_history {} {
+# ::vmdai::stop: end the session (an attached runtime keeps running and must
+# release the chat lock), then forget it.
+proc ::vmdai::bridge::shutdown {} {
     variable session_id
-    if {$session_id eq ""} {
-        ::vmdai::bridge::ensure_runtime
-    }
-
-    set params [::vmdai::bridge::_json_object [list \
-        [::vmdai::bridge::_json_kv session_id [::vmdai::bridge::_json_quote $session_id]] \
-        [::vmdai::bridge::_json_kv offset 0] \
-        [::vmdai::bridge::_json_kv limit 20] \
-    ]]
-
-    if {[catch {set body [::vmdai::bridge::_rpc "chat.history.list" $params]} err]} {
-        ::vmdai::ui::append_message error "history failed: $err"
-        return
-    }
-    if {[::vmdai::bridge::_response_error $body] ne ""} {
-        ::vmdai::ui::append_message error "history rpc failed"
-        return
-    }
-
-    # Parse the items array.  Each row has chat_id, title, updated_at, message_count.
-    set items [::vmdai::bridge::_parse_history_items $body]
-    ::vmdai::ui::show_history_picker $items
-}
-
-proc ::vmdai::bridge::_parse_history_items {body} {
-    variable has_json
-    if {$has_json} {
-        if {[catch {set parsed [::json::json2dict $body]} parse_err]} {
-            return [list]
-        }
-        if {![dict exists $parsed result items]} {
-            return [list]
-        }
-        return [dict get $parsed result items]
-    }
-    # Regex fallback: extract chat_id + title + message_count objects
-    set items [list]
-    set matches [regexp -inline -all {\{[^\{\}]*"chat_id"[^\{\}]*\}} $body]
-    foreach m $matches {
-        set cid [::vmdai::bridge::_extract_string $m chat_id]
-        set title [::vmdai::bridge::_extract_string $m title]
-        set mc [::vmdai::bridge::_extract_int $m message_count 0]
-        set updated [::vmdai::bridge::_extract_string $m updated_at]
-        if {$cid ne ""} {
-            lappend items [dict create chat_id $cid title $title message_count $mc updated_at $updated]
-        }
-    }
-    return $items
-}
-
-proc ::vmdai::bridge::resume_chat {target_chat_id} {
-    variable session_id
-    variable chat_id
-    variable after_seq
-
-    if {$session_id eq ""} {
-        ::vmdai::bridge::ensure_runtime
-    }
-
-    # Tell the backend to switch the session to the target chat
-    set params [::vmdai::bridge::_json_object [list \
-        [::vmdai::bridge::_json_kv session_id [::vmdai::bridge::_json_quote $session_id]] \
-        [::vmdai::bridge::_json_kv chat_id [::vmdai::bridge::_json_quote $target_chat_id]] \
-    ]]
-
-    if {[catch {set body [::vmdai::bridge::_rpc "chat.resume" $params]} err]} {
-        ::vmdai::ui::append_message error "resume failed: $err"
-        return
-    }
-    set rpcerr [::vmdai::bridge::_response_error $body]
-    if {$rpcerr ne ""} {
-        ::vmdai::ui::append_message error "resume rpc failed: $rpcerr"
-        return
-    }
-
-    set chat_id $target_chat_id
-    set after_seq 0
-    variable is_resumed_chat
-    set is_resumed_chat 1
-
-    # Now fetch and display the prior transcript
-    ::vmdai::bridge::_load_chat_transcript $target_chat_id
-}
-
-proc ::vmdai::bridge::_load_chat_transcript {target_chat_id} {
-    variable session_id
-
-    set params [::vmdai::bridge::_json_object [list \
-        [::vmdai::bridge::_json_kv session_id [::vmdai::bridge::_json_quote $session_id]] \
-        [::vmdai::bridge::_json_kv chat_id [::vmdai::bridge::_json_quote $target_chat_id]] \
-        [::vmdai::bridge::_json_kv limit 200] \
-    ]]
-
-    if {[catch {set body [::vmdai::bridge::_rpc "chat.history.get" $params]} err]} {
-        ::vmdai::ui::append_message error "load transcript failed: $err"
-        return
-    }
-    set rpcerr [::vmdai::bridge::_response_error $body]
-    if {$rpcerr ne ""} {
-        ::vmdai::ui::append_message error "load transcript rpc failed: $rpcerr"
-        return
-    }
-
-    # Parse events and replay them in the UI
-    variable has_json
-    set events [list]
-    if {$has_json} {
-        if {![catch {set parsed [::json::json2dict $body]}]} {
-            if {[dict exists $parsed result events]} {
-                set events [dict get $parsed result events]
-            }
-        }
-    }
-
-    foreach ev $events {
-        set role [::vmdai::ui::_dict_get_or $ev role ""]
-        set etype [::vmdai::ui::_dict_get_or $ev type ""]
-        set text [::vmdai::ui::_dict_get_or $ev text ""]
-        # Only show user and assistant messages (skip chunks, lifecycle, tool events)
-        if {($role eq "user" || $role eq "assistant") && $etype eq "message" && $text ne ""} {
-            ::vmdai::ui::append_message $role $text
-        }
-    }
-}
-
-proc ::vmdai::bridge::shutdown_runtime {} {
-    variable session_id
-    variable runtime_pid
-    variable poll_after_id
-
-    if {$poll_after_id ne ""} {
-        after cancel $poll_after_id
-        set poll_after_id ""
-    }
-
     if {$session_id ne ""} {
-        set params [::vmdai::bridge::_json_object [list \
-            [::vmdai::bridge::_json_kv session_id [::vmdai::bridge::_json_quote $session_id]] \
-        ]]
-        catch {::vmdai::bridge::_rpc "session.stop" $params}
-        set session_id ""
+        catch {::vmdai::net::call session.stop {} ::vmdai::bridge::_ignore}
     }
+    _reset_session
+}
 
-    if {$runtime_pid ne ""} {
-        catch {exec kill $runtime_pid}
-        set runtime_pid ""
+# --- working directory (spec 2d) ----------------------------------------------
+
+proc ::vmdai::bridge::_workdir_file {} {
+    return [file join [::vmdai::config::home] .vmdai last_workdir.txt]
+}
+
+# The folder from last time, else VMD's current directory.
+proc ::vmdai::bridge::_load_workdir {} {
+    variable workdir
+    set dir ""
+    catch {
+        set fh [open [_workdir_file] r]
+        fconfigure $fh -encoding utf-8
+        set dir [string trim [read $fh]]
+        close $fh
     }
+    if {$dir ne "" && [file isdirectory $dir] && ![catch {cd $dir}]} {
+        set workdir [file normalize $dir]
+        return
+    }
+    set workdir [pwd]
+}
+
+# Apply a folder: cd VMD there (model Tcl resolves relative paths against
+# VMD's cwd), remember it, and tell the runtime (save_path resolves against
+# the session cwd). Returns 1 on success.
+proc ::vmdai::bridge::apply_workdir {dir} {
+    variable workdir
+    set dir [file normalize $dir]
+    if {![file isdirectory $dir] || [catch {cd $dir} err]} {
+        if {[catch {::vmdai::ui::notify error "Can't use the folder $dir."} err]} {
+            _log "ui: $err"
+        }
+        return 0
+    }
+    set workdir $dir
+    catch {
+        set path [_workdir_file]
+        file mkdir [file dirname $path]
+        set fh [open $path w]
+        fconfigure $fh -encoding utf-8
+        puts -nonewline $fh $dir
+        close $fh
+    }
+    _send_cwd
+    return 1
+}
+
+proc ::vmdai::bridge::_send_cwd {} {
+    variable session_id
+    variable workdir
+    if {$session_id eq "" || $workdir eq ""} {
+        return
+    }
+    ::vmdai::net::call session.set_cwd [list cwd s $workdir] \
+        [list ::vmdai::bridge::_relay session.set_cwd ""]
+}
+
+# --- other RPCs the M1 panel uses ----------------------------------------------
+
+proc ::vmdai::bridge::history_list {callback} {
+    ::vmdai::net::call chat.history.list [list offset i 0 limit i 50] \
+        [list ::vmdai::bridge::_relay chat.history.list $callback]
+}
+
+proc ::vmdai::bridge::history_get {target callback} {
+    ::vmdai::net::call chat.history.get [list chat_id s $target limit i 200] \
+        [list ::vmdai::bridge::_relay chat.history.get $callback]
+}
+
+# M1 Apply: provider.set {provider, model}, no profile (spec 2h).
+proc ::vmdai::bridge::set_provider {provider model {callback ""}} {
+    ::vmdai::net::call provider.set [list provider s $provider model s $model] \
+        [list ::vmdai::bridge::_relay provider.set $callback]
+}
+
+if {[llength [info commands ::vmdai::runtime::subscribe]]} {
+    ::vmdai::runtime::subscribe ::vmdai::bridge::_on_runtime_state
 }
