@@ -1,4 +1,4 @@
-images 0
+images 1
 001 role rolemeta | You⇥12:00 AM
 002 user | load 1hck and show it as a cartoon
 003 chip chip_err chip_ok runhdr runmodel runsum | ChatVMD  qwen3.8:27b⇥✓ ✗ ✓ ✓  1 failed, recovered · 27 s
@@ -9,13 +9,14 @@ images 0
 010 dcode detail dfail dgut dgutx | ✗ display backgroundcolor white
 011 detail dnote | Statement 1 ran and is kept in Save .tcl; the rest is commented out
 012 detail dlast dlink link | Copy
-016 rule | <rule>
-017 prose | Loaded **1hck** as a cartoon on a white background.
-018 footer link | Copy Tcl · Save .tcl…
-019 role rolemeta | You⇥12:00 AM
-020 user | what is its radius of gyration?
-021 chip chip_ok runhdr runmodel runsum | ChatVMD  qwen3.8:27b⇥✓  1 step · 8 s
-022 chev cmd extra g_ok meta row | ✓⇥… measure rgyr $sel  +1 lines  Radius of gyration of the protein.⇥→ 20.8431  0.5 s  ▸
-023 rule | <rule>
-024 prose | The radius of gyration is 20.84 Å.
-025 footer link | Copy Tcl · Save .tcl…
+016 thumb | <card>
+017 rule | <rule>
+018 prose | Loaded **1hck** as a cartoon on a white background.
+019 footer link | Copy Tcl · Save .tcl…
+020 role rolemeta | You⇥12:00 AM
+021 user | what is its radius of gyration?
+022 chip chip_ok runhdr runmodel runsum | ChatVMD  qwen3.8:27b⇥✓  1 step · 8 s
+023 chev cmd extra g_ok meta row | ✓⇥… measure rgyr $sel  +1 lines  Radius of gyration of the protein.⇥→ 20.8431  0.5 s  ▸
+024 rule | <rule>
+025 prose | The radius of gyration is 20.84 Å.
+026 footer link | Copy Tcl · Save .tcl…

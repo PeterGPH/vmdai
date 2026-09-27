@@ -1383,3 +1383,328 @@ proc ::vmdai::transcript::_do_save_run_tcl {request_id} {
     if {$path eq ""} { return }
     ::vmdai::tclexport::save $path [::vmdai::tclexport::run_tcl $request_id]
 }
+
+# ===========================================================================
+# Snapshot cards, the 30-photo cap (P08-T07).
+#
+# Part B V4 "Snapshot card", §2c "Thumbnails", V7. A card is a canvas
+# embedded on its own line (thumb, snap:$k) after the row's sections: the
+# runtime's thumbnail with its uniform border cropped off (console's
+# snap::autocrop: grid 12, tolerance 36, pad 26) and scaled down by an
+# integer factor to fit 256×192, never cropped to fill; beside it (below it
+# when narrow) the purpose, "W × H · renderer", the file name, "Saved to …",
+# "Open · Reveal · Save PNG…" and whether the model saw it. At most
+# opt(max_photos) photos stay loaded; older cards show "Show image". A PNG
+# that cannot be decoded gives a text card and loads nothing.
+# ===========================================================================
+
+namespace eval ::vmdai::transcript {
+    variable SNAP
+    if {![info exists SNAP]} { array set SNAP {} }
+    variable opt
+    if {![info exists opt(max_photos)]} { set opt(max_photos) 30 }
+}
+
+proc ::vmdai::transcript::loaded_image_count {} {
+    variable S
+    return [llength $S(photos)]
+}
+
+proc ::vmdai::transcript::_tags_snaps {} {
+    variable W
+    variable SNAP
+    $W tag configure thumb -lmargin1 24 -spacing1 6 -spacing3 10
+    foreach key [array names SNAP *,card] { _draw_card [lindex [split $key ,] 0] }
+}
+
+proc ::vmdai::transcript::_clear_snaps {} {
+    variable S
+    variable SNAP
+    foreach key [array names SNAP *,card] { catch {destroy $SNAP($key)} }
+    foreach p $S(photos) { catch {image delete $p} }
+    set S(photos) {}
+    array unset SNAP
+}
+
+proc ::vmdai::transcript::_relayout_snaps {cw narrow} {
+    variable SNAP
+    foreach key [array names SNAP *,card] { _draw_card [lindex [split $key ,] 0] }
+}
+
+# Bounding box {x0 y0 x1 y1} of what differs from the corner colour, sampled
+# on a grid and padded (console prototype, snap::autocrop).
+proc ::vmdai::transcript::autocrop {img {step 12} {tol 36} {pad 26}} {
+    set w [image width $img]
+    set h [image height $img]
+    lassign [$img get [expr {min(2, $w - 1)}] [expr {min(2, $h - 1)}]] br bg bb
+    set x0 $w
+    set y0 $h
+    set x1 -1
+    set y1 -1
+    for {set y 0} {$y < $h} {incr y $step} {
+        for {set x 0} {$x < $w} {incr x $step} {
+            lassign [$img get $x $y] r g b
+            if {abs($r - $br) + abs($g - $bg) + abs($b - $bb) > $tol} {
+                if {$x < $x0} { set x0 $x }
+                if {$x > $x1} { set x1 $x }
+                if {$y < $y0} { set y0 $y }
+                if {$y > $y1} { set y1 $y }
+            }
+        }
+    }
+    if {$x1 < 0} { return [list 0 0 $w $h] }
+    return [list [expr {max(0, $x0 - $pad)}] [expr {max(0, $y0 - $pad)}] \
+                 [expr {min($w, $x1 + $pad)}] [expr {min($h, $y1 + $pad)}]]
+}
+
+# A new photo: src autocropped, then subsampled by one integer factor so
+# that it fits maxw×maxh with its aspect ratio kept.
+proc ::vmdai::transcript::thumb_photo {src {maxw 256} {maxh 192}} {
+    lassign [autocrop $src] x0 y0 x1 y1
+    set cw [expr {$x1 - $x0}]
+    set ch [expr {$y1 - $y0}]
+    set f [expr {max(1, int(ceil(max(double($cw) / $maxw, double($ch) / $maxh))))}]
+    set dst [image create photo]
+    $dst copy $src -from $x0 $y0 $x1 $y1 -subsample $f $f
+    return $dst
+}
+
+# Width and height from a PNG's IHDR (the text card; Tk 8.5 cannot decode PNG).
+proc ::vmdai::transcript::_png_size {path} {
+    set w ?
+    set h ?
+    catch {
+        set fh [open $path rb]
+        set head [read $fh 24]
+        close $fh
+        if {[string range $head 12 15] eq "IHDR"} {
+            binary scan [string range $head 16 23] II w h
+        }
+    }
+    return [list $w $h]
+}
+
+proc ::vmdai::transcript::op_snapshot {k thumb path w h saved_path sent_to_model {renderer TachyonInternal}} {
+    variable W
+    variable T
+    variable S
+    variable ROW
+    variable RUN
+    variable SNAP
+    if {![info exists ROW($k,name)] || [info exists SNAP($k,card)]} { return }
+    set run $ROW($k,run)
+    set model ""
+    if {$run ne "" && [info exists RUN($run,model)]} { set model $RUN($run,model) }
+    array set SNAP [list $k,thumb $thumb $k,path $path $k,w $w $k,h $h $k,saved $saved_path \
+        $k,sent $sent_to_model $k,renderer $renderer $k,run $run $k,model $model \
+        $k,purpose [_first_line $ROW($k,cmd)] $k,photo "" $k,mode text $k,pw 0 $k,ph 0]
+    set c $T.snap[incr S(link)]
+    canvas $c -highlightthickness 0 -borderwidth 0 -width 10 -height 10
+    ::vmdai::theme::paint $c -background surface
+    _embed $c
+    foreach seq [_menu_sequences] {
+        bind $c $seq [list ::vmdai::transcript::_card_menu $k %X %Y]
+    }
+    set SNAP($k,card) $c
+    _snap_load $k
+    _draw_card $k
+    set at rowend:$k
+    foreach section {err prev detail} {
+        set r [$W tag ranges $section:$k]
+        if {[llength $r]} { set at [lindex $r end] }
+    }
+    set at [$W index $at]
+    set tags [concat thumb snap:$k [_row_run_wl $k]]
+    $W window create $at -window $c -align top
+    $W insert "$at +1c" "\n" $tags
+    foreach tag $tags { $W tag add $tag $at }
+    # The run's newest card stays visible when the run collapses.
+    if {$run ne "" && [info exists RUN($run,snaps)]} {
+        foreach old $RUN($run,snaps) {
+            set r [$W tag ranges snap:$old]
+            if {[llength $r]} { $W tag add wl:$run {*}$r }
+        }
+        lappend RUN($run,snaps) $k
+        set r [$W tag ranges snap:$k]
+        $W tag remove wl:$run {*}$r
+    }
+}
+
+# Load the card's photo: the thumbnail, or the full image subsampled when
+# the thumbnail is missing (§2c fallbacks). An undecodable file leaves the
+# card in text mode. Loading may free the oldest photo (the 30-photo cap).
+proc ::vmdai::transcript::_snap_load {k} {
+    variable S
+    variable SNAP
+    set file ""
+    if {$SNAP($k,thumb) ne "" && [file readable $SNAP($k,thumb)]} {
+        set file $SNAP($k,thumb)
+    } elseif {[file readable $SNAP($k,path)]} {
+        set file $SNAP($k,path)
+    }
+    if {$file eq "" || [catch {image create photo -file $file} src]} {
+        set SNAP($k,mode) text
+        return 0
+    }
+    set photo [thumb_photo $src 256 192]
+    image delete $src
+    array set SNAP [list $k,photo $photo $k,mode image \
+        $k,pw [image width $photo] $k,ph [image height $photo]]
+    lappend S(photos) $photo
+    lappend S(photo_keys) $k
+    _enforce_cap
+    return 1
+}
+
+proc ::vmdai::transcript::_enforce_cap {} {
+    variable S
+    variable SNAP
+    variable opt
+    while {[llength $S(photos)] > $opt(max_photos)} {
+        set p [lindex $S(photos) 0]
+        set old [lindex $S(photo_keys) 0]
+        set S(photos) [lrange $S(photos) 1 end]
+        set S(photo_keys) [lrange $S(photo_keys) 1 end]
+        catch {image delete $p}
+        set SNAP($old,photo) ""
+        set SNAP($old,mode) unloaded
+        _draw_card $old
+    }
+}
+
+# "Show image": reload a freed card; the oldest loaded one is freed instead.
+proc ::vmdai::transcript::show_image {k} {
+    variable SNAP
+    if {![info exists SNAP($k,mode)] || $SNAP($k,mode) ne "unloaded"} { return 0 }
+    _snap_load $k
+    _draw_card $k
+    return 1
+}
+
+proc ::vmdai::transcript::_narrow {} {
+    variable T
+    return [expr {[winfo width $T] > 1 && [winfo width $T] < 440}]
+}
+
+proc ::vmdai::transcript::_card_link {c x y text tag cmd} {
+    set id [$c create text $x $y -anchor nw -text $text -font ChatMeta \
+        -fill [::vmdai::theme::c accent] -tags [list link $tag]]
+    $c bind $tag <ButtonRelease-1> $cmd
+    return [lindex [$c bbox $id] 2]
+}
+
+proc ::vmdai::transcript::_draw_card {k} {
+    variable SNAP
+    set c $SNAP($k,card)
+    if {![winfo exists $c]} { return }
+    set C ::vmdai::theme::c
+    $c delete all
+    $c configure -background [$C surface]
+    set path $SNAP($k,path)
+    set mode $SNAP($k,mode)
+    set iw 0
+    set ih 0
+    if {$mode eq "image"} {
+        set iw [expr {$SNAP($k,pw) + 2}]
+        set ih [expr {$SNAP($k,ph) + 2}]
+        $c create rectangle 0 0 [expr {$iw - 1}] [expr {$ih - 1}] -outline [$C hairline] \
+            -fill [$C surface] -tags img
+        $c create image 1 1 -anchor nw -image $SNAP($k,photo) -tags img
+        $c bind img <ButtonRelease-1> [list ::vmdai::transcript::_action view_image $path]
+        $c bind img <Enter> [list $c configure -cursor hand2]
+        $c bind img <Leave> [list $c configure -cursor arrow]
+    } elseif {$mode eq "unloaded"} {
+        set iw [expr {$SNAP($k,pw) + 2}]
+        set ih [expr {$SNAP($k,ph) + 2}]
+        $c create rectangle 0 0 [expr {$iw - 1}] [expr {$ih - 1}] -outline [$C hairline] \
+            -fill [$C code_bg]
+        set tw [font measure ChatMeta "Show image"]
+        _card_link $c [expr {($iw - $tw) / 2}] [expr {$ih / 2 - 8}] "Show image" lk_show \
+            [list ::vmdai::transcript::show_image $k]
+    }
+    set cw [_content_width]
+    if {$mode eq "text" || [_narrow]} {
+        set x 0
+        set y [expr {$ih ? $ih + 8 : 0}]
+    } else {
+        set x [expr {$iw + 14}]
+        set y 0
+    }
+    set capw [expr {max(120, $cw - 24 - $x)}]
+    if {$mode ne "text" && ![_narrow] && $capw > 300} { set capw 300 }
+    if {$mode eq "text"} {
+        lassign [_png_size $path] pw ph
+        set id [$c create text $x $y -anchor nw -width $capw -font ChatBody -fill [$C text] \
+            -text "[file tail $path] · $pw × $ph"]
+    } else {
+        set id [$c create text $x $y -anchor nw -width $capw -font ChatBody -fill [$C text] \
+            -text $SNAP($k,purpose)]
+        set y [expr {[lindex [$c bbox $id] 3] + 2}]
+        set id [$c create text $x $y -anchor nw -font ChatMeta -fill [$C muted] \
+            -text "$SNAP($k,w) × $SNAP($k,h) · $SNAP($k,renderer)"]
+        set y [expr {[lindex [$c bbox $id] 3] + 2}]
+        set id [$c create text $x $y -anchor nw -font ChatCodeSmall -fill [$C text2] \
+            -text [::vmdai::theme::fit_middle ChatCodeSmall $capw [file tail $path]]]
+        if {$SNAP($k,saved) ne ""} {
+            set y [expr {[lindex [$c bbox $id] 3] + 2}]
+            set id [$c create text $x $y -anchor nw -font ChatMeta -fill [$C muted] \
+                -text "Saved to [file tail $SNAP($k,saved)]"]
+        }
+    }
+    set y [expr {[lindex [$c bbox $id] 3] + 6}]
+    set lx [_card_link $c $x $y "Open" lk_open [list ::vmdai::transcript::_action open_file $path]]
+    $c create text [expr {$lx + 4}] $y -anchor nw -text "·" -font ChatMeta -fill [$C muted]
+    set lx [_card_link $c [expr {$lx + 14}] $y "Reveal" lk_reveal \
+        [list ::vmdai::transcript::_action reveal_file $path]]
+    if {$mode ne "text"} {
+        $c create text [expr {$lx + 4}] $y -anchor nw -text "·" -font ChatMeta -fill [$C muted]
+        _card_link $c [expr {$lx + 14}] $y "Save PNG…" lk_save \
+            [list ::vmdai::transcript::_action save_png $path]
+    }
+    set y [expr {[lindex [$c bbox all] 3] + 4}]
+    if {$SNAP($k,sent)} {
+        $c create text $x $y -anchor nw -font ChatMeta -fill [$C ok] -text "✓ Sent to the model"
+    } else {
+        set who [expr {$SNAP($k,model) eq "" ? "this model" : $SNAP($k,model)}]
+        $c create text $x $y -anchor nw -width $capw -font ChatMeta -fill [$C warn] \
+            -text "✗ Not sent — $who is text-only"
+    }
+    $c bind link <Enter> [list $c configure -cursor hand2]
+    $c bind link <Leave> [list $c configure -cursor arrow]
+    lassign [$c bbox all] bx0 by0 bx1 by1
+    $c configure -width [expr {$bx1 + 2}] -height [expr {max($ih, $by1) + 2}]
+}
+
+proc ::vmdai::transcript::card_texts {k} {
+    variable SNAP
+    set out {}
+    set c $SNAP($k,card)
+    foreach id [$c find all] {
+        if {[$c type $id] eq "text"} { lappend out [$c itemcget $id -text] }
+    }
+    return $out
+}
+
+proc ::vmdai::transcript::_snap_menu {k} {
+    variable SNAP
+    set p $SNAP($k,path)
+    return [list Open [list ::vmdai::transcript::_action open_file $p] \
+        Reveal [list ::vmdai::transcript::_action reveal_file $p] \
+        "Save PNG…" [list ::vmdai::transcript::_action save_png $p] \
+        "Copy path" [list ::vmdai::transcript::_clipboard $p]]
+}
+
+proc ::vmdai::transcript::_card_menu {k rx ry} {
+    variable T
+    set m $T.menu
+    catch {destroy $m}
+    menu $m -tearoff 0
+    foreach {label cmd} [_snap_menu $k] { $m add command -label $label -command $cmd }
+    tk_popup $m $rx $ry
+}
+
+# Default targets of the file actions (the viewer module, P08-T07).
+proc ::vmdai::transcript::_do_view_image {path} { _call ::vmdai::viewer::open $path }
+proc ::vmdai::transcript::_do_open_file {path} { _call ::vmdai::viewer::open_external $path }
+proc ::vmdai::transcript::_do_reveal_file {path} { _call ::vmdai::viewer::reveal $path }
+proc ::vmdai::transcript::_do_save_png {path} { _call ::vmdai::viewer::save_copy $path }
