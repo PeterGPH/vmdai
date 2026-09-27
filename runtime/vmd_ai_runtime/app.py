@@ -21,6 +21,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pathlib import Path
@@ -36,13 +37,15 @@ from .claude_loop import (
     WIKI_SYSTEM_PROMPT_ADDENDUM,
     _ollama_tools,
     _openrouter_tools,
+    _tool_finished_meta,
     build_claude_loop,
 )
 from .locks import ChatLock
 from .recorder import RunRecorder
-from .constants import CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_PROTOCOL, RUNTIME_VERSION
+from .constants import ACTION_FOR_CODE, CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_PROTOCOL, RUNTIME_VERSION
 from .docs_search import DocsSearch
 from .errors import RpcError
+from .events import display_log
 from .keys import KeyStore
 from .logging_utils import default_log_path, redact_sensitive
 from .prompts import NON_VISION_TOOL_OVERRIDES, chatvmd_system_prompt, session_block
@@ -111,6 +114,215 @@ def _remove_snapshot_dirs(dirs: Dict[str, str], lock: threading.Lock) -> None:
         dirs.clear()
     for path in paths:
         shutil.rmtree(path, ignore_errors=True)
+
+
+def _wants_v2(state: Any) -> bool:
+    """True when this session negotiated the v2 display events (§2c).
+
+    Only a token-authenticated session.start can ask for event_protocol 2,
+    so a tokenless (v1) session never gets here.
+    """
+    try:
+        return int(getattr(state, "event_protocol", 1) or 1) >= 2
+    except (TypeError, ValueError):
+        return False
+
+
+# §2c Persistence: the system/state kinds events.jsonl keeps. Chunks,
+# turn.started, usage, status and turn.retry are live-only.
+PERSISTED_STATE_KINDS = frozenset({"request.started", "tool.started", "tool.finished", "request.finished"})
+
+
+def is_display_event(event: Dict[str, Any]) -> bool:
+    """True for the events a chat's display log (events.jsonl) keeps (§2c Persistence).
+
+    Kept: user messages, request.started, tool.started, one assistant
+    message per turn, one sealed reasoning/message per turn, tool.finished
+    (late ones too), error, request.finished and lifecycle events.
+    Never kept: chunks and role=tool_start (the execution channel).
+    """
+    role = str(event.get("role") or "")
+    event_type = str(event.get("type") or "")
+    if event_type == "chunk" or role == "tool_start":
+        return False
+    if event_type == "lifecycle":
+        return True
+    if event_type == "state":
+        return (event.get("metadata") or {}).get("kind") in PERSISTED_STATE_KINDS
+    return event_type == "message" and role in ("user", "assistant", "reasoning", "error")
+
+
+def _request_started_payload(*, request_id: str, chat_id: Optional[str], provider: str, model: str,
+                              max_turns: int, vision: bool, think: Any) -> Dict[str, Any]:
+    """request.started metadata (§2c): the one shape both worker paths push (m2)."""
+    return {
+        "kind": "request.started",
+        "request_id": request_id,
+        "chat_id": chat_id,
+        "provider": provider,
+        "model": model,
+        "max_turns": max_turns,
+        "vision": vision,
+        "think": think,
+    }
+
+
+def _request_finished_payload(*, request_id: str, status: str, wrapped_up: bool, turns: int,
+                              tool_calls: int, final_text_empty: bool, duration_ms: int,
+                              usage: Optional[Dict[str, Any]], error: Optional[str],
+                              run_dir: Optional[str]) -> Dict[str, Any]:
+    """request.finished metadata (§2c): the one shape both worker paths push (m2)."""
+    u = usage or {}
+    return {
+        "kind": "request.finished",
+        "request_id": request_id,
+        "status": status,
+        "wrapped_up": wrapped_up,
+        "turns": turns,
+        "tool_calls": tool_calls,
+        "final_text_empty": final_text_empty,
+        "duration_ms": duration_ms,
+        "usage": {"input_tokens_evaluated": u.get("input_tokens_evaluated"),
+                  "output_tokens": u.get("output_tokens")},
+        "error": error,
+        "run_dir": run_dir,
+    }
+
+
+class _EventMapper:
+    """The ``ctx.on_event`` sink of one request (§2a Legacy callbacks, §2c).
+
+    Every loop item keeps ``RequestState.turn`` current for runtime.info.
+    For a v2 session the item also becomes a queue event (``push``); for a
+    v1 session it is dropped, because v1 events come from the legacy
+    callbacks. ``push`` also:
+
+    * collects a turn's reasoning chunks and pushes one sealed
+      ``reasoning/message`` live at once, but writes it to events.jsonl only
+      just before the next persisted display event of this request
+      (assistant/message, tool.started, tool.finished, error,
+      request.finished). ``turn.retry`` for its own turn drops it
+      unpersisted, and drops unsealed reasoning too;
+    * writes the display kinds to events.jsonl (``is_display_event``) and
+      touches the manifest once, at request.finished.
+
+    The recorder's task directory is captured at the first loop event for
+    ``request.finished.run_dir``. A failure here is logged and never
+    reaches the loop.
+    """
+
+    def __init__(self, app: "RuntimeApp", state: "SessionState", request: "RequestState") -> None:
+        self.app = app
+        self.state = state
+        self.request = request
+        self.request_id = str(request.request_id)
+        self.chat_id: Optional[str] = state.chat_id
+        self.v2 = _wants_v2(state)
+        self.recorder: Any = None
+        self.run_dir: Optional[str] = None
+        self._reasoning_open = False
+        self._reasoning_turn: Any = None
+        self._reasoning_parts: List[str] = []
+        self._reasoning_t0 = 0.0
+        self._unpersisted_reasoning: Optional[Dict[str, Any]] = None
+
+    def __call__(self, item: Dict[str, Any]) -> None:
+        try:
+            self._handle(item)
+        except Exception:
+            if self.app.logger:
+                self.app.logger.warning("v2 event mapping failed for %s", self.request_id, exc_info=True)
+
+    def _handle(self, item: Dict[str, Any]) -> None:
+        metadata = dict(item.get("metadata") or {})
+        if metadata.get("kind") == "turn.started":
+            try:
+                self.request.turn = int(metadata.get("turn") or 0)
+            except (TypeError, ValueError):
+                pass
+        self._note_run_dir()
+        if self.v2:
+            self.push(str(item.get("role") or ""), str(item.get("type") or ""),
+                      str(item.get("text") or ""), metadata)
+
+    def _note_run_dir(self) -> None:
+        if self.run_dir is None and self.recorder is not None:
+            task_dir = getattr(self.recorder, "current_task_dir", None)
+            if task_dir:
+                self.run_dir = str(task_dir)
+
+    def push(self, role: str, event_type: str, text: str = "",
+             metadata: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """Push one v2 event of this request; does nothing for a v1 session."""
+        if not self.v2:
+            return None
+        meta = dict(metadata or {})
+        meta.setdefault("request_id", self.request_id)
+        kind = meta.get("kind")
+        if role == "reasoning" and event_type == "chunk":
+            self._buffer_reasoning(meta.get("turn"), text)
+        elif kind == "turn.retry":
+            self._drop_reasoning()
+            self._retry_reasoning(meta.get("turn"))
+        else:
+            self.seal_reasoning()
+        event = self.app._push_v2(self.state, role, event_type, text, meta)
+        if isinstance(event, dict) and is_display_event(event):
+            self._flush_reasoning()
+            self.app._persist_display(self.chat_id, event)
+        if kind == "request.finished" and self.chat_id:
+            self.app.store.touch_manifest(self.chat_id)
+        return event
+
+    def _buffer_reasoning(self, turn: Any, text: str) -> None:
+        if self._reasoning_open and turn != self._reasoning_turn:
+            self.seal_reasoning()
+        if not self._reasoning_open:
+            self._reasoning_open = True
+            self._reasoning_turn = turn
+            self._reasoning_parts = []
+            self._reasoning_t0 = time.monotonic()
+        self._reasoning_parts.append(text)
+
+    def _drop_reasoning(self) -> None:
+        self._reasoning_open = False
+        self._reasoning_turn = None
+        self._reasoning_parts = []
+
+    def seal_reasoning(self) -> Optional[Dict[str, Any]]:
+        """Push the open reasoning as one ``reasoning/message``
+
+        (live now; persisted with the next display event of this request).
+        """
+        if not self._reasoning_open:
+            return None
+        meta: Dict[str, Any] = {
+            "request_id": self.request_id,
+            "turn": self._reasoning_turn,
+            "duration_ms": int(round((time.monotonic() - self._reasoning_t0) * 1000)),
+        }
+        text = "".join(self._reasoning_parts)
+        self._drop_reasoning()
+        event = self.app._push_v2(self.state, "reasoning", "message", text, meta)
+        self._flush_reasoning()
+        self._unpersisted_reasoning = event
+        return event
+
+    def _flush_reasoning(self) -> None:
+        """Persist a still-held sealed reasoning event, if there is one."""
+        event, self._unpersisted_reasoning = self._unpersisted_reasoning, None
+        if event is not None:
+            self.app._persist_display(self.chat_id, event)
+
+    def _retry_reasoning(self, turn: Any) -> None:
+        """turn.retry for a held reasoning's own turn drops it unpersisted; otherwise flush it."""
+        held = self._unpersisted_reasoning
+        if held is None:
+            return
+        if (held.get("metadata") or {}).get("turn") == turn:
+            self._unpersisted_reasoning = None
+        else:
+            self._flush_reasoning()
 
 
 class RuntimeApp:
@@ -420,22 +632,6 @@ class RuntimeApp:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _turn_tracker(request) -> Callable[[Dict[str, Any]], None]:
-        """on_event for v1 sessions: keeps RequestState.turn current for runtime.info.
-
-        v1 sessions get no queue events from on_event (§2a Legacy callbacks);
-        P07-T01 replaces this with _make_on_event for v2 sessions.
-        """
-        def on_event(item: Dict[str, Any]) -> None:
-            metadata = item.get("metadata") or {}
-            if request is not None and metadata.get("kind") == "turn.started":
-                try:
-                    request.turn = int(metadata.get("turn") or 0)
-                except (TypeError, ValueError):
-                    pass
-        return on_event
-
-    @staticmethod
     def _vision_for(loop: Optional[ClaudeToolLoop]) -> bool:
         """runtime.info.vision: the loop's resolved supports_vision (spec 2f).
 
@@ -624,6 +820,58 @@ class RuntimeApp:
             "capabilities": self._capabilities_for(saved),
         }
 
+    def _profiles_rpc(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """profiles.list / save / delete / activate (§3; the M2 settings dialog).
+
+        Changes apply to the next request. chat.send builds each request's
+        loop from the active profile (P03-T08), so a running request keeps
+        the loop it started with.
+        """
+        store = self.settings_store
+        if store is None:
+            raise RpcError("INVALID_PARAMS", "this runtime does not manage ~/.vmdai/settings.json",
+                           {"reason": "no_settings_store"})
+        try:
+            if method == "profiles.list":
+                data = store.load()
+                return {
+                    "active": data.get("active"),
+                    "profiles": store.list_profiles(),
+                    "settings_source": store.settings_source,
+                }
+            name = params["name"]
+            if method == "profiles.delete":
+                store.delete_profile(name)                 # IN_USE for the active profile
+                return {"ok": True}
+            if method == "profiles.activate":
+                store.activate(name)
+                return {"ok": True, "capabilities": self._capabilities_for(store.get_profile(name) or {})}
+            profile = self._keep_num_ctx(store.get_profile(name), params["profile"])
+            saved = store.save_profile(name, profile, activate=bool(params.get("activate")))
+            return {"ok": True, "capabilities": self._capabilities_for(saved)}
+        except SettingsError as exc:
+            raise self._settings_rpc_error(exc)
+
+    @staticmethod
+    def _keep_num_ctx(existing: Optional[Dict[str, Any]], profile: Dict[str, Any]) -> Dict[str, Any]:
+        """C7 Model change: replacing a same-provider profile keeps its stored
+        options.num_ctx unless the new profile sets one (changing num_ctx
+        reloads the model on the server)."""
+        out = dict(profile)
+        if not isinstance(existing, dict):
+            return out
+        if normalize_provider(existing.get("provider")) != normalize_provider(out.get("provider")):
+            return out
+        stored = (existing.get("options") or {}).get("num_ctx")
+        options = out.get("options")
+        if options is None:
+            options = {}
+        if stored is not None and isinstance(options, dict) and "num_ctx" not in options:
+            options = dict(options)
+            options["num_ctx"] = stored
+            out["options"] = options
+        return out
+
     # ------------------------------------------------------------------
     # RPC dispatch
     # ------------------------------------------------------------------
@@ -736,8 +984,9 @@ class RuntimeApp:
                 cwd=params["cwd"],
                 chat_id=chat_id,
                 authenticated=authenticated,
-                # M1 speaks display protocol 1 only; plan 07 negotiates 2.
-                event_protocol=1,
+                # §2c: a token session may negotiate display protocol 2; a
+                # tokenless session always gets today's v1 events.
+                event_protocol=int(params.get("event_protocol") or 1) if authenticated else 1,
                 vmd_env=params.get("vmd_env") if authenticated else None,
             )
             state.queue.push("system", "lifecycle", "session_started", {"chat_id": chat_id})
@@ -770,6 +1019,8 @@ class RuntimeApp:
             if authenticated:
                 result["event_protocol"] = state.event_protocol
                 result["runtime"] = {"version": RUNTIME_VERSION, "pid": os.getpid()}
+                # M2 long-poll (§2d); tokenless sessions keep today's capabilities.
+                result["capabilities"] = dict(CAPABILITIES, long_poll=True)
                 result["profile"] = self._profile_summary(state)
             return result
 
@@ -824,9 +1075,15 @@ class RuntimeApp:
                 request = RequestState(request_id=request_id)
                 state.active_request = request
                 try:
-                    user_event = state.queue.push(
-                        "user", "message", params["text"], {"request_id": request_id}
-                    )
+                    if _wants_v2(state):
+                        # A v2 display event (§2c): _push_v2 adds v: 2.
+                        user_event = self._push_v2(
+                            state, "user", "message", params["text"], {"request_id": request_id}
+                        )
+                    else:
+                        user_event = state.queue.push(
+                            "user", "message", params["text"], {"request_id": request_id}
+                        )
                     self.store.append_events(chat_id, [user_event])
 
                     # Auto-set chat title from the first user message
@@ -882,6 +1139,18 @@ class RuntimeApp:
 
         if method == "chat.events.poll":
             state = self._get_session(params["session_id"], session_token)
+            wait_ms = int(params.get("wait_ms") or 0)
+            if wait_ms > 0:
+                # M2 long-poll (§2d): hold the request until an event newer
+                # than after_seq is queued or wait_ms passes. No lock is held
+                # while waiting (the server runs one thread per request).
+                state.queue.wait(params["after_seq"], wait_ms / 1000.0)
+                last_seq = state.queue.last_seq
+                if params["after_seq"] > last_seq:
+                    # The client's cursor is ahead of this queue (a restarted
+                    # runtime or a reset queue): answer at once with the real
+                    # last_seq so the client can resync.
+                    return {"events": [], "last_seq": last_seq, "has_more": False}
             polled = state.queue.poll(
                 after_seq=params["after_seq"], limit=params["limit"]
             )
@@ -897,12 +1166,17 @@ class RuntimeApp:
 
         if method == "chat.history.get":
             state = self._get_session(params["session_id"], session_token)
-            _ = state
             chat_id = params["chat_id"]
             manifest = self.store.get_manifest(chat_id)
             if manifest is None:
                 raise RpcError("NOT_FOUND", f"chat {chat_id} not found")
-            events = self.store.read_events(chat_id, limit=params["limit"])
+            if getattr(state, "authenticated", False):
+                # A token session replays the whole display log through
+                # vm::apply (§2c Persistence): no tail cut and no tool_start,
+                # and a v1 request's chunks are dropped when its message was stored.
+                events = display_log(self.store.read_events(chat_id, limit=conversation.ALL_EVENTS))
+            else:
+                events = self.store.read_events(chat_id, limit=params["limit"])
             return {"chat_id": chat_id, "manifest": manifest, "events": events}
 
         if method == "chat.resume":
@@ -1113,8 +1387,9 @@ class RuntimeApp:
                         {"call_key": call_key},
                     )
                 reply = self.tool_bridge.post_result(state.session_id, params)
-                if reply.get("accepted") and not reply.get("duplicate"):
-                    # v1 transcript entry, as for tool_call_id results.
+                if reply.get("accepted") and not reply.get("duplicate") and not _wants_v2(state):
+                    # v1 transcript entry, as for tool_call_id results. A v2
+                    # session gets tool.finished from the loop instead (§2c).
                     ok = bool(params["ok"]) and params.get("executed") != "no"
                     label = (
                         params.get("output", "")[:120]
@@ -1132,8 +1407,12 @@ class RuntimeApp:
                             "late": bool(reply.get("late")),
                         },
                     )
-                    if state.chat_id:
-                        self.store.append_events(state.chat_id, [result_event])
+                    # M7: stored in the chat that issued the call — not the
+                    # session's current chat, which chat.resume may since
+                    # have switched away from.
+                    target_chat_id = self.tool_bridge.get_call_chat_id(call_key) or state.chat_id
+                    if target_chat_id:
+                        self.store.append_events(target_chat_id, [result_event])
                 return dict(reply)
 
             tool_call_id = params["tool_call_id"]
@@ -1167,19 +1446,21 @@ class RuntimeApp:
                         "tool.command_result for unknown/timed-out id=%s", tool_call_id
                     )
 
-            # Persist a tool_result event for transcript history
-            label = (
-                result["output"][:120]
-                if result["ok"]
-                else f"Error: {result['error'][:120]}"
-            )
-            result_event = state.queue.push(
-                "tool_result",
-                "message",
-                label,
-                {"tool_call_id": tool_call_id, "ok": result["ok"]},
-            )
-            self.store.append_events(state.chat_id, [result_event])
+            # Persist a tool_result event for transcript history (v1 only; a
+            # v2 session gets tool.finished from the loop instead, §2c).
+            if not _wants_v2(state):
+                label = (
+                    result["output"][:120]
+                    if result["ok"]
+                    else f"Error: {result['error'][:120]}"
+                )
+                result_event = state.queue.push(
+                    "tool_result",
+                    "message",
+                    label,
+                    {"tool_call_id": tool_call_id, "ok": result["ok"]},
+                )
+                self.store.append_events(state.chat_id, [result_event])
 
             return {"ok": True, "resolved": resolved}
 
@@ -1211,6 +1492,13 @@ class RuntimeApp:
                 self._require_auth(state)
             provider_name, base_url, model, api_key = self._catalog_target(state, params)
             return provider_catalog.test_provider(provider_name, base_url, model, api_key=api_key)
+
+        # ---- Profiles (§3 RPC table; the M2 settings dialog) ----
+
+        if method in ("profiles.list", "profiles.save", "profiles.delete", "profiles.activate"):
+            state = self._get_session(params["session_id"], session_token)
+            self._require_auth(state)
+            return self._profiles_rpc(method, params)
 
         raise RpcError("METHOD_NOT_FOUND", f"Unknown method: {method}")
 
@@ -1364,29 +1652,99 @@ class RuntimeApp:
         return _number("tool_exec_timeout_s", 1.0), _number("cancel_grace_s", 0.0)
 
     def _on_late_result(self, session_id: str, call_key: str, info: Dict[str, Any]) -> None:
-        """A tool result arrived after its request gave up (spec 2b Late results).
+        """A tool result arrived after its request gave up on it (§2b Late results, §2d).
 
-        Stored as a ``late_result`` line in the chat the call belonged to, so
-        build_prior can note it before the next prompt.
+        It is stored as a ``late_result`` line in the chat the call belonged
+        to, so build_prior can note it before the next prompt. A v2 session
+        still on that chat also gets a second ``tool.finished`` with
+        ``late: true`` for the call_key. VmdToolBridge calls this once per
+        accepted late result (duplicates are refused), even after the run's
+        request.finished or after the next request has started.
         """
         chat_dir = info.get("chat_dir")
-        if not chat_dir:
-            return
+        if chat_dir:
+            try:
+                conversation.Appender(Path(chat_dir), str(info.get("request_id") or "")).append_late_result(
+                    call_key,
+                    bool(info.get("ok", False)),
+                    str(info.get("executed") or "yes"),
+                    str(info.get("output") or ""),
+                    str(info.get("error") or ""),
+                )
+            except Exception:
+                if self.logger:
+                    self.logger.warning("could not store late result %s", call_key, exc_info=True)
         try:
-            conversation.Appender(Path(chat_dir), str(info.get("request_id") or "")).append_late_result(
-                call_key,
-                bool(info.get("ok", False)),
-                str(info.get("executed") or "yes"),
-                str(info.get("output") or ""),
-                str(info.get("error") or ""),
-            )
+            self._push_late_finished(session_id, call_key, info)
         except Exception:
             if self.logger:
-                self.logger.warning("could not store late result %s", call_key, exc_info=True)
+                self.logger.warning("could not emit the late tool.finished %s", call_key, exc_info=True)
+
+    def _push_late_finished(self, session_id: str, call_key: str,
+                            info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The late ``tool.finished`` for a v2 session still on the call's chat (§2c, §2d).
+
+        It carries the original request_id and call_key, so the view-model
+        updates that row in place (state "late"). v1 sessions get only the
+        late_result line.
+        """
+        state = self.sessions.get(session_id)
+        if state is None or not _wants_v2(state):
+            return None
+        chat_dir = info.get("chat_dir")
+        chat_id = Path(str(chat_dir)).name if chat_dir else None
+        if not chat_id:
+            return None
+        duration = info.get("duration_ms")
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            duration = 0
+        meta = _tool_finished_meta(call_key, str(info.get("tool_name") or ""), "tcl", info,
+                                   float(duration), late=True)
+        meta["request_id"] = str(info.get("request_id") or "")
+        event: Optional[Dict[str, Any]] = None
+        # chat.resume switches chat_id and drops the queue under this lock.
+        with state.lock:
+            if self.sessions.get(state.session_id) is not state or chat_id != state.chat_id:
+                return None
+            event = self._push_v2(state, "system", "state", "", meta)
+            self._persist_display(chat_id, event)      # "tool.finished (including late:true ones)"
+        return event
 
     # ------------------------------------------------------------------
     # Background thread: Claude agent loop
     # ------------------------------------------------------------------
+
+    def _make_on_event(self, state: SessionState, request: RequestState) -> "_EventMapper":
+        """The on_event sink of one request (§2a, §2c); an ``_EventMapper``.
+
+        It is a Callable[[Dict[str, Any]], None]. A v2 session gets every
+        loop item as a queue event; a v1 session gets none (its events come
+        from the legacy callbacks), and the turn is tracked for both.
+        """
+        return _EventMapper(self, state, request)
+
+    def _push_v2(self, state: SessionState, role: str, event_type: str, text: str,
+                 metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Push one v2 display event (§2c): the metadata gains ``v: 2``."""
+        meta = dict(metadata or {})
+        meta["v"] = 2
+        return state.queue.push(role, event_type, text, meta)
+
+    def _persist_display(self, chat_id: Optional[str], event: Optional[Dict[str, Any]]) -> bool:
+        """Append one v2 display event to chats/<id>/events.jsonl (§2c Persistence).
+
+        Live-only kinds are skipped. The manifest is not touched here;
+        _EventMapper touches it once per request, at request.finished.
+        """
+        if not chat_id or not isinstance(event, dict) or not is_display_event(event):
+            return False
+        try:
+            self.store.append_display_events(chat_id, [event])
+        except Exception:
+            if self.logger:
+                self.logger.warning("could not persist a display event to %s", chat_id, exc_info=True)
+            return False
+        return True
 
     def _run_claude_loop_response(
         self,
@@ -1399,26 +1757,43 @@ class RuntimeApp:
         chat_id: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ) -> None:
-        """Full agentic response on a daemon thread.
+        """Full agentic response on a daemon thread (§4).
 
-        chat.send passes the loop it built for this request, the chat it
-        captured when the request started, and the system prompt the prior
-        was budgeted for. Token sessions also get a messages.jsonl Appender
-        (full memory, §2b).
+        chat.send passes the per-request loop, the chat captured when the
+        request started, and the system prompt the prior was budgeted for.
+        Token sessions also get a messages.jsonl Appender (full memory, §2b).
+
+        v2 sessions: request.started is the first event, and request.finished
+        comes from the ``finally`` on every path, including failures before
+        loop.run (§2c "request.finished is guaranteed"). An error becomes one
+        v2 error event with code, http_status, hint and action (§2f). The
+        legacy callbacks do nothing. v1 sessions keep today's events.
         """
         state = self.sessions.get(session_id)
         if state is None:
             return
         if loop is None:
+            # chat.send always passes the request's loop (P03-T04); building
+            # one here could raise PROVIDER_INIT_FAILED on this thread.
             self._clear_active(state, request_id)
             return
         if chat_id is None:
             chat_id = state.chat_id
-        if system_prompt is None:
-            system_prompt = self._system_prompt_for_request(state, loop)
+        request = state.active_request
+        if request is None or request.request_id != request_id:
+            request = RequestState(request_id=request_id)
+        mapper = self._make_on_event(state, request)
+        mapper.chat_id = chat_id
+        v2 = mapper.v2
+        started = time.monotonic()
         chunk_events: List[Dict[str, Any]] = []
+        events_to_persist: List[Dict[str, Any]] = []
+        failure_text: Optional[str] = None
+        entered_run = False
 
         def on_chunk(chunk: str) -> None:
+            if v2:
+                return  # the loop's assistant chunk items carry the text (§2a)
             chunk_events.append(
                 state.queue.push("assistant", "chunk", chunk, {"request_id": request_id})
             )
@@ -1428,14 +1803,12 @@ class RuntimeApp:
             pass
 
         def on_tool_result(tool_id: str, tool_name: str, result: dict) -> None:
-            # Transcript entry for tool results is written in tool.command_result handler
+            # v1: tool.command_result writes the transcript entry; v2: tool.finished
             pass
 
-        # The session's model setting overrides the loop's model (plan 02).
-        # A per-request loop is adjusted in place; an assigned loop is shared
-        # between requests, so it gets a copy that keeps the wiki store.
         # Token sessions always run their profile's model (§2h); the session
-        # model override stays for tokenless clients only.
+        # model override stays for tokenless clients only (P03-T04/T08). A
+        # tokenless session is always v1, so this never touches a v2 request.
         model = str(state.settings.get("model") or DEFAULT_SETTINGS["model"])
         if not state.authenticated and model and model != loop.model:
             if loop is self._assigned_loop:
@@ -1450,29 +1823,29 @@ class RuntimeApp:
             else:
                 loop.model = model
 
-        messages_out = None
-        if state.authenticated and chat_id:
-            messages_out = conversation.Appender(self.store.chat_dir(chat_id), request_id)
-        request = state.active_request
-        if request is not None and request.request_id != request_id:
-            request = None
-        ctx = RunContext(request_id=request_id, chat_id=chat_id or "",
-                         on_event=self._turn_tracker(request), messages_out=messages_out)
-
-        # Per-request recorder; restored afterwards so an assigned (shared)
-        # loop never carries it into the next request.
         prev_recorder = loop.recorder
-        meta = None
-        if getattr(state, "authenticated", False):
-            try:
-                meta = self._recorder_meta(state, loop, request_id)
-            except Exception:
-                meta = None
-                if self.logger:
-                    self.logger.warning("recorder provenance failed", exc_info=True)
-        loop.recorder = self._build_recorder_for_session(state, meta)
-        events_to_persist: List[Dict[str, Any]] = []
         try:
+            if v2:
+                mapper.push("system", "state", "", self._request_started_meta(loop, request_id, chat_id))
+            if system_prompt is None:
+                system_prompt = self._system_prompt_for_request(state, loop)
+            meta = None
+            if getattr(state, "authenticated", False):
+                try:
+                    meta = self._recorder_meta(state, loop, request_id)
+                except Exception:
+                    meta = None
+                    if self.logger:
+                        self.logger.warning("recorder provenance failed", exc_info=True)
+            recorder = self._build_recorder_for_session(state, meta)
+            loop.recorder = recorder
+            mapper.recorder = recorder
+            messages_out = None
+            if getattr(state, "authenticated", False) and chat_id:
+                messages_out = conversation.Appender(self.store.chat_dir(chat_id), request_id)
+            ctx = RunContext(request_id=request_id, chat_id=chat_id or "",
+                             on_event=mapper, messages_out=messages_out)
+            entered_run = True
             output = loop.run(
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -1487,27 +1860,111 @@ class RuntimeApp:
                 ctx=ctx,
             )
         except ClaudeLoopError as exc:
-            events_to_persist.append(state.queue.push(
-                "error", "message", f"Agent error: {exc}",
-                {"request_id": request_id, "provider": self.provider_name},
-            ))
-        except Exception as exc:
-            events_to_persist.append(state.queue.push(
-                "error", "message", f"Unexpected error: {exc}", {"request_id": request_id},
-            ))
-        else:
-            events_to_persist.extend(chunk_events)
-            if cancel_event.is_set():
-                events_to_persist.append(state.queue.push(
-                    "system", "lifecycle", "cancelled", {"request_id": request_id}))
+            failure_text = str(exc) or exc.__class__.__name__
+            if v2:
+                mapper.push("error", "message", failure_text, self._error_meta(exc))
             else:
                 events_to_persist.append(state.queue.push(
-                    "assistant", "message", output, {"request_id": request_id}))
+                    "error", "message", f"Agent error: {exc}",
+                    {"request_id": request_id, "provider": self.provider_name},
+                ))
+        except Exception as exc:
+            failure_text = f"Unexpected error: {exc}"
+            if v2:
+                mapper.push("error", "message", failure_text, self._error_meta(exc))
+            else:
+                events_to_persist.append(state.queue.push(
+                    "error", "message", failure_text, {"request_id": request_id},
+                ))
+        else:
+            if not v2:
+                events_to_persist.extend(chunk_events)
+                if cancel_event.is_set():
+                    events_to_persist.append(state.queue.push(
+                        "system", "lifecycle", "cancelled", {"request_id": request_id}))
+                else:
+                    events_to_persist.append(state.queue.push(
+                        "assistant", "message", output, {"request_id": request_id}))
         finally:
             loop.recorder = prev_recorder
+            if v2:
+                try:
+                    mapper.push("system", "state", "", self._request_finished_meta(
+                        loop, mapper, entered_run=entered_run,
+                        failure_text=failure_text, started=started))
+                except Exception:
+                    if self.logger:
+                        self.logger.warning("request.finished failed for %s", request_id, exc_info=True)
             if events_to_persist and chat_id:
                 self.store.append_events(chat_id, events_to_persist)
             self._clear_active(state, request_id)
+
+    def _request_started_meta(self, loop: Any, request_id: str, chat_id: Optional[str]) -> Dict[str, Any]:
+        """request.started metadata (§2c): what this request runs with."""
+        options = getattr(loop, "options", None)
+        try:
+            vision = bool(loop._vision_enabled())
+        except Exception:
+            vision = False
+        try:
+            max_turns = int(self._max_turns_for(loop))
+        except Exception:
+            max_turns = int(getattr(loop, "MAX_TURNS", 28))
+        return _request_started_payload(
+            request_id=request_id, chat_id=chat_id,
+            provider=str(getattr(loop, "provider_name", "") or ""),
+            model=str(getattr(loop, "model", "") or ""),
+            max_turns=max_turns, vision=vision,
+            think=getattr(options, "think", None) if options is not None else None,
+        )
+
+    @staticmethod
+    def _request_finished_meta(loop: Any, mapper: "_EventMapper", *, entered_run: bool,
+                               failure_text: Optional[str], started: float) -> Dict[str, Any]:
+        """request.finished metadata (§2c), filled from whatever is known.
+
+        Before loop.run is entered nothing ran: status error, zero turns.
+        After it, the loop's last_* fields describe this run (run() resets
+        them first). C4: a wrap-up that failed leaves its message in error.
+        """
+        if entered_run:
+            status = "error" if failure_text is not None else str(getattr(loop, "last_status", None) or "complete")
+            turns = int(getattr(loop, "last_turns", 0) or 0)
+            tool_calls = int(getattr(loop, "last_tool_calls", 0) or 0)
+            final_text_empty = bool(getattr(loop, "last_final_text_empty", True))
+            usage = dict(getattr(loop, "last_usage", None) or {})
+            wrapped_up = bool(getattr(loop, "last_wrapped_up", False))
+        else:
+            status, turns, tool_calls, final_text_empty, usage, wrapped_up = "error", 0, 0, True, {}, False
+        error = failure_text
+        if error is None and getattr(loop, "last_wrap_up_error", None):
+            error = str(loop.last_wrap_up_error)
+        return _request_finished_payload(
+            request_id=mapper.request_id, status=status, wrapped_up=wrapped_up, turns=turns,
+            tool_calls=tool_calls, final_text_empty=final_text_empty,
+            duration_ms=int(round((time.monotonic() - started) * 1000)),
+            usage=usage, error=error, run_dir=mapper.run_dir,
+        )
+
+    @staticmethod
+    def _error_meta(exc: BaseException) -> Dict[str, Any]:
+        """Metadata of a v2 error event (§2c, §2f Error codes).
+
+        code is ClaudeLoopError.code (unreachable, auth, billing,
+        model_not_found) or "other" for anything else; action follows code.
+        """
+        code = str(getattr(exc, "code", "") or "") if isinstance(exc, ClaudeLoopError) else ""
+        if code not in ACTION_FOR_CODE:
+            code = "other"
+        http_status = getattr(exc, "http_status", None)
+        if isinstance(http_status, bool) or not isinstance(http_status, int):
+            http_status = None
+        return {
+            "code": code,
+            "http_status": http_status,
+            "hint": str(getattr(exc, "hint", "") or ""),
+            "action": ACTION_FOR_CODE[code],
+        }
 
     # ------------------------------------------------------------------
     # Background thread: simple provider (mock / fallback)
@@ -1519,59 +1976,93 @@ class RuntimeApp:
         request_id: str,
         prompt: str,
         cancel_event: threading.Event,
-        prior_messages: list | None = None,
+        prior_messages: Optional[list] = None,
     ) -> None:
-        """Simple non-agentic streaming: used when no API key is set (mock mode)."""
+        """Simple non-agentic streaming: used when no API key is set (mock mode).
+
+        v1 sessions keep today's events. v2 sessions get the envelope of a
+        one-turn run: request.started, turn.started, chunks, the sealed final
+        assistant/message and request.finished from the ``finally`` (§2c).
+        """
         state = self.sessions.get(session_id)
         if state is None:
             return
-        chunk_events = []
+        request = state.active_request
+        if request is None or request.request_id != request_id:
+            request = RequestState(request_id=request_id)
+        mapper = self._make_on_event(state, request)
+        v2 = mapper.v2
+        started = time.monotonic()
+        model = str(state.settings.get("model") or DEFAULT_SETTINGS["model"])
+        chunk_events: List[Dict[str, Any]] = []
+        events_to_persist: List[Dict[str, Any]] = []
+        failure_text: Optional[str] = None
+        output = ""
 
         def on_chunk(chunk: str) -> None:
-            event = state.queue.push(
-                "assistant", "chunk", chunk, {"request_id": request_id}
+            if v2:
+                mapper.push("assistant", "chunk", chunk, {"turn": 1})
+                return
+            chunk_events.append(
+                state.queue.push("assistant", "chunk", chunk, {"request_id": request_id})
             )
-            chunk_events.append(event)
 
         try:
+            if v2:
+                mapper.push("system", "state", "", _request_started_payload(
+                    request_id=request_id, chat_id=state.chat_id, provider=self.provider_name,
+                    model=model, max_turns=1, vision=False, think=None))
+                request.turn = 1
+                mapper.push("system", "state", "", {"kind": "turn.started", "turn": 1})
             output = self.provider.stream_response(
                 prompt=prompt,
                 cancel_event=cancel_event,
                 on_chunk=on_chunk,
-                model=str(state.settings.get("model") or DEFAULT_SETTINGS["model"]),
+                model=model,
                 system_prompt=self._system_prompt_for_mode(
                     str(state.settings.get("mode") or "work")
                 ),
             )
         except Exception as exc:
-            err_event = state.queue.push(
-                "error",
-                "message",
-                f"Provider error: {exc}",
-                {"request_id": request_id, "provider": self.provider_name},
-            )
-            self.store.append_events(state.chat_id, [err_event])
-            if state.active_request and state.active_request.request_id == request_id:
-                state.active_request = None
-            return
-
-        events_to_persist = list(chunk_events)
-        if cancel_event.is_set():
-            cancel_ev = state.queue.push(
-                "system", "lifecycle", "cancelled", {"request_id": request_id}
-            )
-            events_to_persist.append(cancel_ev)
+            failure_text = f"Provider error: {exc}"
+            if v2:
+                mapper.push("error", "message", failure_text, self._error_meta(exc))
+            else:
+                events_to_persist.append(state.queue.push(
+                    "error", "message", failure_text,
+                    {"request_id": request_id, "provider": self.provider_name},
+                ))
         else:
-            final_ev = state.queue.push(
-                "assistant", "message", output, {"request_id": request_id}
-            )
-            events_to_persist.append(final_ev)
-
-        if events_to_persist:
-            self.store.append_events(state.chat_id, events_to_persist)
-
-        if state.active_request and state.active_request.request_id == request_id:
-            state.active_request = None
+            if v2:
+                mapper.push("assistant", "message", output, {"turn": 1, "final": True})
+            else:
+                events_to_persist.extend(chunk_events)
+                if cancel_event.is_set():
+                    events_to_persist.append(state.queue.push(
+                        "system", "lifecycle", "cancelled", {"request_id": request_id}))
+                else:
+                    events_to_persist.append(state.queue.push(
+                        "assistant", "message", output, {"request_id": request_id}))
+        finally:
+            if v2:
+                if failure_text is not None:
+                    status = "error"
+                elif cancel_event.is_set():
+                    status = "cancelled"
+                else:
+                    status = "complete"
+                try:
+                    mapper.push("system", "state", "", _request_finished_payload(
+                        request_id=request_id, status=status, wrapped_up=False, turns=1,
+                        tool_calls=0, final_text_empty=not output,
+                        duration_ms=int(round((time.monotonic() - started) * 1000)),
+                        usage=None, error=failure_text, run_dir=None))
+                except Exception:
+                    if self.logger:
+                        self.logger.warning("request.finished failed for %s", request_id, exc_info=True)
+            if events_to_persist and state.chat_id:
+                self.store.append_events(state.chat_id, events_to_persist)
+            self._clear_active(state, request_id)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1645,15 +2136,16 @@ class RuntimeApp:
                 self._release_chat_lock(state)
                 state.chat_lock = lock
                 state.chat_id = chat_id
-            state.queue.clear()
-            # Polling after last_seq delivers the chat_resumed event below.
+            # §2c: a token session's seq never resets; resume drops what is
+            # queued and polling after last_seq delivers chat_resumed below.
+            state.queue.drop_pending()
             last_seq = state.queue.last_seq
             state.queue.push("system", "lifecycle", "chat_resumed", {"chat_id": chat_id})
         return {
             "ok": True,
             "chat_id": chat_id,
             "title": manifest.get("title", ""),
-            "message_count": manifest.get("message_count", 0),
+            "message_count": self.store.recount_messages(chat_id),
             "last_seq": last_seq,
         }
 

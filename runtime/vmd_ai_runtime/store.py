@@ -58,18 +58,91 @@ class ChatStore:
         return chat_id
 
     def append_events(self, chat_id: str, events: Iterable[Dict[str, Any]]) -> int:
+        """Append events and touch the manifest (updated_at, message_count, index row)."""
+        if not chat_id or not self.chat_dir(chat_id).exists():
+            return 0
+        count = self.append_display_events(chat_id, events)
+        self._touch_manifest(chat_id)
+        return count
+
+    def append_display_events(self, chat_id: str, events: Iterable[Dict[str, Any]]) -> int:
+        """Append events to events.jsonl without touching the manifest (§2c Persistence).
+
+        The v2 display log is written one event at a time while a request
+        runs. For a v2 session the manifest is touched twice per request:
+        when chat.send persists the user message (the auto-title check
+        reads message_count) and when request.finished is pushed. So
+        index.jsonl gains two rows per request, not one per event.
+        """
         if not chat_id:
             return 0
         chat_dir = self.chat_dir(chat_id)
         if not chat_dir.exists():
             return 0
-        events_path = chat_dir / "events.jsonl"
         count = 0
-        with events_path.open("a", encoding="utf-8") as handle:
+        with (chat_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
             for event in events:
                 handle.write(json.dumps(event, ensure_ascii=False) + "\n")
                 count += 1
-        self._touch_manifest(chat_id, delta_messages=count)
+        return count
+
+    def touch_manifest(self, chat_id: str) -> None:
+        """Bump updated_at, recount message_count and append an index row."""
+        self._touch_manifest(chat_id)
+
+    def recount_messages(self, chat_id: str) -> int:
+        """Recompute message_count from events.jsonl and store it (§2c, §7); returns it.
+
+        updated_at is left alone. An index row is appended only when the
+        stored count was wrong (a legacy manifest counted every event).
+        """
+        if not chat_id:
+            return 0
+        manifest_path = self.chat_dir(chat_id) / "manifest.json"
+        if not manifest_path.exists():
+            return 0
+        with store_lock(self.lock_root):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                return 0
+            count = self._count_messages(chat_id)
+            if manifest.get("message_count") != count:
+                manifest["message_count"] = count
+                self._write_manifest(chat_id, manifest)
+                self._append_index_row({
+                    "chat_id": chat_id,
+                    "title": manifest.get("title") or "New Chat",
+                    "updated_at": manifest.get("updated_at") or _now_iso(),
+                    "message_count": count,
+                })
+        return count
+
+    @staticmethod
+    def counts_as_message(event: Any) -> bool:
+        """message_count counts user messages and non-empty assistant messages (§2c)."""
+        if not isinstance(event, dict) or event.get("type") != "message":
+            return False
+        role = event.get("role")
+        if role == "user":
+            return True
+        return role == "assistant" and bool(str(event.get("text") or "").strip())
+
+    def _count_messages(self, chat_id: str) -> int:
+        path = self.chat_dir(chat_id) / "events.jsonl"
+        if not path.exists():
+            return 0
+        count = 0
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if '"message"' not in line:        # cheap skip for chunk and state lines
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if self.counts_as_message(event):
+                    count += 1
         return count
 
     def list_chats(self, limit: int = 30, offset: int = 0) -> List[Dict[str, Any]]:
@@ -143,6 +216,14 @@ class ChatStore:
             self._write_manifest(chat_id, manifest)
 
     def _touch_manifest(self, chat_id: str, delta_messages: int = 0) -> None:
+        """Bump updated_at, recount message_count and append an index row.
+
+        ``delta_messages`` is accepted for old callers and ignored. The count
+        (user and assistant messages only, §2c) is recomputed from
+        events.jsonl on every touch. That corrects a legacy manifest the
+        next time it is touched (§7), and concurrent appends can never lose
+        a count.
+        """
         manifest_path = self.chat_dir(chat_id) / "manifest.json"
         if not manifest_path.exists():
             return
@@ -152,7 +233,7 @@ class ChatStore:
             except Exception:
                 return
             manifest["updated_at"] = _now_iso()
-            manifest["message_count"] = int(manifest.get("message_count") or 0) + int(delta_messages or 0)
+            manifest["message_count"] = self._count_messages(chat_id)
             self._write_manifest(chat_id, manifest)
             self._append_index_row({
                 "chat_id": chat_id,

@@ -13,21 +13,28 @@ from helpers.fake_rpc_server import FakeRpcServer, Recorded, Reply
 from helpers.tcl import REPO, TclTestResult, run_tcltest
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_result_queue.tcl"
-TOTAL = 5
+TOTAL = 7
 
 ACCEPTED = {"accepted": True, "late": False, "duplicate": False}
 UNAVAILABLE = Reply(b"Service Unavailable", status=503, content_type="text/plain")
+SLOW_UNAVAILABLE = Reply(b"Service Unavailable", status=503, content_type="text/plain",
+                         delay_s=0.6)
 
 
 class QueueHandler:
     """Replies by call_key: k_retry fails twice, k_dup is a duplicate,
-    k_unknown is TOOL_CALL_UNKNOWN, k_auth is AUTH_FAILED, k_never always 503."""
+    k_unknown is TOOL_CALL_UNKNOWN, k_auth is AUTH_FAILED, k_slow is a 503
+    sent after 0.6 s, and k_never, k_race and any other key a 503 at once.
+    ``test.seen`` (test only) answers the per-call_key counts so far."""
 
     def __init__(self) -> None:
         self.seen: Dict[str, int] = {}
         self.lock = threading.Lock()
 
     def __call__(self, method: str, params: Dict[str, Any], headers: Dict[str, str]) -> Any:
+        if method == "test.seen":
+            with self.lock:
+                return {"result": dict(self.seen)}
         key = str(params.get("call_key", ""))
         with self.lock:
             self.seen[key] = self.seen.get(key, 0) + 1
@@ -42,6 +49,8 @@ class QueueHandler:
             return {"error": {"code": "TOOL_CALL_UNKNOWN", "message": "unknown call_key", "data": {}}}
         if key == "k_auth":
             return {"error": {"code": "AUTH_FAILED", "message": "session token mismatch", "data": {}}}
+        if key == "k_slow":
+            return SLOW_UNAVAILABLE
         return UNAVAILABLE
 
 
@@ -82,7 +91,18 @@ def test_retries_until_accepted(queue_run):
 
 def test_epoch_change_stops(queue_run):
     _assert_passed(queue_run.result, ["rq-once-1", "rq-epoch-1"])
-    assert queue_run.seen["k_auth"] == 2
+    # rq-epoch-1 bumps the epoch as soon as attempt 2 is issued. The epoch
+    # change aborts that in-flight post, which can be before http has written
+    # it (state created/connecting), so the server sees 1 or 2 posts; never a 3rd.
+    assert queue_run.seen["k_auth"] in (1, 2)
+
+
+def test_epoch_change_cancels_undelivered_and_inflight_posts(queue_run):
+    # rq-epoch-2: a captured reply's pending delivery is cancelled, so no retry.
+    # rq-epoch-3: the post the server is holding is aborted; it was sent once.
+    _assert_passed(queue_run.result, ["rq-epoch-2", "rq-epoch-3"])
+    assert queue_run.seen["k_race"] == 1
+    assert queue_run.seen["k_slow"] == 1
 
 
 def test_duplicate_counts_as_accepted(queue_run):

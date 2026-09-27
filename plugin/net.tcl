@@ -21,9 +21,13 @@ namespace eval ::vmdai::net {
     if {![info exists epoch]} { set epoch 0 }
     variable seq
     if {![info exists seq]} { set seq 0 }
-    # inflight(<rid>) = 1 until the http callback for that request ran.
+    # inflight(<rid>) = http token until the http callback for that request
+    # ran (1 while http::geturl itself runs).
     variable inflight
     if {![info exists inflight]} { array set inflight {} }
+    # delivery(<rid>) = sched id of the after-0 delivery that has not run yet.
+    variable delivery
+    if {![info exists delivery]} { array set delivery {} }
 
     # Control characters, backslash and quote -> JSON escapes.
     variable escape_map [list "\\" "\\\\" "\"" "\\\""]
@@ -126,7 +130,9 @@ proc ::vmdai::net::epoch {} {
 }
 
 # New session, resume and shutdown bump the epoch: replies issued under an
-# older epoch are dropped (their http tokens are still cleaned up).
+# older epoch are dropped (their http tokens are still cleaned up). Queued
+# results of an older epoch are given up at once: their retry timers and
+# pending deliveries are cancelled and their in-flight posts aborted.
 proc ::vmdai::net::bump_epoch {} {
     variable epoch
     incr epoch
@@ -231,8 +237,44 @@ proc ::vmdai::net::_deliver_if_current {call_epoch callback args} {
     deliver $callback {*}$args
 }
 
-proc ::vmdai::net::_later {call_epoch callback outcome} {
-    ::vmdai::sched::after 0 [list ::vmdai::net::_deliver_if_current $call_epoch $callback {*}$outcome]
+proc ::vmdai::net::_later {rid call_epoch callback outcome} {
+    variable delivery
+    set id [::vmdai::sched::after 0 \
+        [list ::vmdai::net::_deliver $rid $call_epoch $callback {*}$outcome]]
+    if {$id ne ""} {
+        set delivery($rid) $id
+    }
+}
+
+proc ::vmdai::net::_deliver {rid call_epoch callback args} {
+    variable delivery
+    unset -nocomplain delivery($rid)
+    _deliver_if_current $call_epoch $callback {*}$args
+}
+
+# Give up request $rid: cancel its pending delivery and, if it is still in
+# flight, reset its http request. Its callback never runs.
+proc ::vmdai::net::abort {rid} {
+    variable inflight
+    variable delivery
+    if {[info exists delivery($rid)]} {
+        ::vmdai::sched::cancel $delivery($rid)
+        unset delivery($rid)
+    }
+    if {![info exists inflight($rid)]} {
+        return
+    }
+    set token $inflight($rid)
+    unset inflight($rid)
+    ::vmdai::sched::untrack_http $token
+    # reset runs the -command callback, which finds $rid no longer in flight
+    # and only cleans up the token. A second http::cleanup would re-create
+    # the token variable, so clean up here only if reset left it behind.
+    catch {::http::reset $token}
+    if {[info exists $token]} {
+        catch {::http::cleanup $token}
+    }
+    return
 }
 
 # http -command callback: capture, clean up, then hand off with after 0.
@@ -240,7 +282,12 @@ proc ::vmdai::net::_later {call_epoch callback outcome} {
 proc ::vmdai::net::_http_done {rid call_epoch callback kind token} {
     variable inflight
     variable epoch
-    unset -nocomplain inflight($rid)
+    if {![info exists inflight($rid)]} {
+        # net::abort gave this request up (it resets the token).
+        catch {::http::cleanup $token}
+        return
+    }
+    unset inflight($rid)
     ::vmdai::sched::untrack_http $token
     set status error
     set ncode ""
@@ -260,7 +307,7 @@ proc ::vmdai::net::_http_done {rid call_epoch callback kind token} {
     } else {
         set outcome [_classify $status $ncode $body $err]
     }
-    _later $call_epoch $callback $outcome
+    _later $rid $call_epoch $callback $outcome
 }
 
 proc ::vmdai::net::_geturl {rid callback kind call_epoch url args} {
@@ -269,10 +316,11 @@ proc ::vmdai::net::_geturl {rid callback kind call_epoch url args} {
     set cmd [list ::vmdai::net::_http_done $rid $call_epoch $callback $kind]
     if {[catch {::http::geturl $url {*}$args -command $cmd} token]} {
         unset -nocomplain inflight($rid)
-        _later $call_epoch $callback [list transport "connect failed: $token"]
+        _later $rid $call_epoch $callback [list transport "connect failed: $token"]
         return $rid
     }
     if {[info exists inflight($rid)]} {
+        set inflight($rid) $token
         ::vmdai::sched::track_http $token
     }
     return $rid
@@ -285,7 +333,7 @@ proc ::vmdai::net::call {method params callback args} {
     lassign [_prepare $method $params $args] url body headers timeout id
     set rid "rpc#$id"
     if {$base_url eq ""} {
-        _later $epoch $callback [list transport "no runtime address"]
+        _later $rid $epoch $callback [list transport "no runtime address"]
         return $rid
     }
     return [_geturl $rid $callback rpc $epoch $url -query $body -type application/json \
@@ -346,7 +394,7 @@ proc ::vmdai::net::http_get {path callback args} {
     }
     set rid "get#[incr seq]"
     if {$base_url eq ""} {
-        _later "" $callback [list transport "no runtime address"]
+        _later $rid "" $callback [list transport "no runtime address"]
         return $rid
     }
     return [_geturl $rid $callback get "" "$base_url$path" -timeout $timeout -keepalive 0]
@@ -358,7 +406,8 @@ proc ::vmdai::net::http_get {path callback args} {
 # and answers {accepted, late, duplicate}; a duplicate counts as accepted.
 
 namespace eval ::vmdai::net {
-    # queue(<call_key>) = dict {pairs epoch delay timer attempts}
+    # queue(<call_key>) = dict {pairs epoch delay timer rid attempts}; rid is
+    # the request id of the latest post.
     variable queue
     if {![info exists queue]} { array set queue {} }
     variable retry_min_ms 250
@@ -375,7 +424,7 @@ proc ::vmdai::net::post_result {call_key result_pairs} {
         return
     }
     set queue($call_key) [dict create pairs [linsert $result_pairs 0 call_key s $call_key] \
-        epoch $epoch delay $retry_min_ms timer "" attempts 0]
+        epoch $epoch delay $retry_min_ms timer "" rid "" attempts 0]
     _queue_send $call_key
 }
 
@@ -398,7 +447,9 @@ proc ::vmdai::net::_queue_send {call_key} {
     dict set entry timer ""
     dict incr entry attempts
     set queue($call_key) $entry
-    call tool.command_result [dict get $entry pairs] [list ::vmdai::net::_queue_reply $call_key]
+    set rid [call tool.command_result [dict get $entry pairs] \
+        [list ::vmdai::net::_queue_reply $call_key]]
+    dict set queue($call_key) rid $rid
 }
 
 proc ::vmdai::net::_queue_reply {call_key kind args} {
@@ -444,13 +495,18 @@ proc ::vmdai::net::_queue_retry {call_key reason} {
     set queue($call_key) $entry
 }
 
+# A post of an older epoch may be waiting for its retry timer, in flight, or
+# answered with its delivery still pending; all three are cancelled here, so
+# an epoch change leaves no timer, delivery or http token behind.
 proc ::vmdai::net::_queue_drop_stale {} {
     variable queue
     variable epoch
     foreach call_key [array names queue] {
-        if {[dict get $queue($call_key) epoch] != $epoch} {
-            ::vmdai::sched::cancel [dict get $queue($call_key) timer]
+        set entry $queue($call_key)
+        if {[dict get $entry epoch] != $epoch} {
             unset queue($call_key)
+            ::vmdai::sched::cancel [dict get $entry timer]
+            abort [dict get $entry rid]
         }
     }
 }

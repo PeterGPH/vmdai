@@ -40,3 +40,13 @@ CONVERSATION_MODES = ("local_first", "hybrid_resume", "resume_only", "full")
 # per-session event_protocol that session.start negotiates.
 RUNTIME_PROTOCOL = 2
 RUNTIME_VERSION = "0.3.0"
+
+# §2f Error codes: the card action the panel offers for each error-event code
+# (metadata.code of a role=error event, i.e. ClaudeLoopError.code).
+ACTION_FOR_CODE = {
+    "unreachable": "test_connection",
+    "auth": "open_settings",
+    "billing": "switch_profile",
+    "model_not_found": "choose_model",
+    "other": "open_log",
+}

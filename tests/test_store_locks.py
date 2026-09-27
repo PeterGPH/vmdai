@@ -90,7 +90,8 @@ def test_store_lock_serialises_index_appends(tmp_path):
 
     def touch():
         for _ in range(40):
-            store.append_events(chat_id, [{"role": "assistant", "type": "chunk", "text": "x", "metadata": {}}])
+            # message_count counts user and assistant messages only (plan 07, §2c)
+            store.append_events(chat_id, [{"role": "assistant", "type": "message", "text": "x", "metadata": {}}])
 
     threads = [threading.Thread(target=touch) for _ in range(4)]
     for thread in threads:

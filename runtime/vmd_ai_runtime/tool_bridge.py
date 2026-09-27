@@ -586,6 +586,21 @@ class VmdToolBridge:
                 pending.state = "awaiting_user"
         return {"proceed": True}
 
+    def get_call_chat_id(self, call_key: str) -> Optional[str]:
+        """The chat_id ``call_key`` was issued in (M7 late-result carry-forward).
+
+        Read from the call registry's ``chat_dir`` (fixed at call-issue
+        time), so a caller can route a late result to the chat that
+        actually issued the call rather than the session's current chat_id,
+        which chat.resume may since have switched away from. None when the
+        call is unknown or was issued with no chat (mock/no-store setups).
+        """
+        with self._lock:
+            pending = self._calls.get(str(call_key or ""))
+        if pending is None or pending.chat_dir is None:
+            return None
+        return pending.chat_dir.name
+
     def post_result(self, session_id: str, params: Dict[str, Any]) -> Dict[str, bool]:
         """``tool.command_result`` by call_key. Returns {accepted, late, duplicate}.
 

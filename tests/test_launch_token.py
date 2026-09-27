@@ -133,9 +133,9 @@ def test_event_protocol_values(tmp_path):
     assert one["event_protocol"] == 1
     assert one["runtime"] == {"version": "0.3.0", "pid": os.getpid()}
     assert TODAY_START_KEYS <= set(one)
-    # The M1 runtime speaks display protocol 1 only; plan 07 negotiates 2.
+    # Plan 07 (M2): a token session that asks for display protocol 2 gets it.
     two = start_token_session(app, TOKEN, event_protocol=2, cwd=str(tmp_path))
-    assert two["event_protocol"] == 1
+    assert two["event_protocol"] == 2
     assert app.sessions.get(two["session_id"]).authenticated is True
     for bad in (3, 0, "abc"):
         resp = rpc(app, "session.start",

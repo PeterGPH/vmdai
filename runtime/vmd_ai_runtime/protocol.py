@@ -14,6 +14,9 @@ CHAT_ID_RE = re.compile(r"chat_[0-9a-f]{12}")
 # Display-event protocols a client may ask for in session.start (§2c).
 EVENT_PROTOCOLS = (1, 2)
 
+# M2 long-poll (§2d): chat.events.poll holds the request at most this long.
+MAX_WAIT_MS = 2000
+
 # session.start vmd_env (C6): at most these four string fields, 64 chars each.
 VMD_ENV_KEYS = ("vmd_version", "arch", "tcl_patchlevel", "tk_patchlevel")
 VMD_ENV_MAX_CHARS = 64
@@ -121,6 +124,15 @@ def _as_profile_name(value: Any) -> str:
     return text
 
 
+def _as_profile_key(value: Any) -> str:
+    """A required profile name: 1-64 letters, digits, '.', '_' or '-' (profiles.*)."""
+    text = _as_str(value, "name")
+    if not _PROFILE_NAME_RE.match(text):
+        raise RpcError("INVALID_PARAMS", "name must be 1-64 letters, digits, '.', '_' or '-'",
+                       {"name": text[:80]})
+    return text
+
+
 def validate_rpc_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     body = _as_dict(payload)
     method = _as_str(body.get("method"), "method")
@@ -183,11 +195,16 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
         }
 
     if method == "chat.events.poll":
-        return {
+        out = {
             "session_id": _as_str(p.get("session_id"), "session_id"),
             "after_seq": _as_int(p.get("after_seq"), "after_seq", minimum=0, default=0),
             "limit": _as_int(p.get("limit"), "limit", minimum=1, default=50),
         }
+        # M2 long-poll (§2d): passed through only when present, so a v1
+        # short-poll gets exactly today's params; clamped to 2000 ms.
+        if p.get("wait_ms") is not None:
+            out["wait_ms"] = min(_as_int(p.get("wait_ms"), "wait_ms", minimum=0, default=0), MAX_WAIT_MS)
+        return out
 
     if method == "chat.history.list":
         return {
@@ -320,6 +337,31 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
             "provider": _as_str(p.get("provider") or "", "provider", required=False),
             "base_url": _as_base_url(p.get("base_url")),
             "model": _as_str(p.get("model") or "", "model", required=False),
+        }
+
+    # ---- profiles.* (§3; the M2 settings dialog; token sessions only, checked in app.py) ----
+
+    if method == "profiles.list":
+        return {"session_id": _as_str(p.get("session_id"), "session_id")}
+
+    if method in ("profiles.delete", "profiles.activate"):
+        return {
+            "session_id": _as_str(p.get("session_id"), "session_id"),
+            "name": _as_profile_key(p.get("name")),
+        }
+
+    if method == "profiles.save":
+        profile = p.get("profile")
+        if not isinstance(profile, dict):
+            raise RpcError("INVALID_PARAMS", "profile must be an object")
+        activate = p.get("activate", False)
+        if not isinstance(activate, bool):
+            raise RpcError("INVALID_PARAMS", "activate must be true or false")
+        return {
+            "session_id": _as_str(p.get("session_id"), "session_id"),
+            "name": _as_profile_key(p.get("name")),
+            "profile": profile,
+            "activate": activate,
         }
 
     raise RpcError("METHOD_NOT_FOUND", f"Unknown method: {method}")

@@ -2538,7 +2538,8 @@ def _canonical_message(message: Dict[str, Any], call_keys: List[str]) -> Dict[st
 
 
 def _tool_finished_meta(call_key: str, tool_name: str, executor: str,
-                        result: Dict[str, Any], duration_ms: float) -> Dict[str, Any]:
+                        result: Dict[str, Any], duration_ms: float, *,
+                        late: bool = False) -> Dict[str, Any]:
     """``tool.finished`` metadata (§2c) from a bridge or runtime result dict.
 
     Fields a bridge does not report yet (plan 05 adds them) default to
@@ -2564,7 +2565,9 @@ def _tool_finished_meta(call_key: str, tool_name: str, executor: str,
         "output_bytes": int(output_bytes) if output_bytes is not None else len(output.encode("utf-8")),
         "image": image if isinstance(image, dict) else None,
         "saved_path": result.get("saved_path"),
-        "late": False,
+        # True only for the second tool.finished the app emits when a result
+        # arrives after its request gave up on it (§2d Cancel semantics).
+        "late": bool(late),
     }
 
 
