@@ -105,6 +105,7 @@ class VmdToolBridge:
         self.exec_timeout_s = float(exec_timeout_s)
         self.cancel_grace_s = float(cancel_grace_s)
         self.session_lookup = session_lookup
+        self.on_late_result: Optional[Callable[[str, str, Dict[str, Any]], None]] = None
 
     def get_pending_session(self, tool_call_id: str) -> Optional[str]:
         """Return the session_id that owns a pending call, or None if unknown.
@@ -354,20 +355,32 @@ class VmdToolBridge:
                 self._calls.pop(self._finished_order.popleft(), None)
 
     def _finalize(self, pending: _PendingCall) -> Dict[str, Any]:
-        """Turn the posted result into the product result dict."""
+        """Turn the posted result into the product result dict (C2, C3).
+
+        A posted ``executed: "no"`` always wins over the ack-derived status
+        (C2 refusal, C3 pre-check), and such a call is never ``ok``.
+        """
         raw = dict(pending.raw or {})
         executed = "no" if str(raw.get("executed") or "yes") == "no" else "yes"
         ok = bool(raw.get("ok", False)) and executed == "yes"
+        output = str(raw.get("output") or "")
         error = str(raw.get("error") or "")
         if executed == "no" and not error:
             error = "not executed"
+        duration = raw.get("duration_ms")
+        if duration is None:
+            duration = int((time.monotonic() - pending.started) * 1000)
         result = _empty_result()
         result.update({
             "ok": ok,
-            "output": str(raw.get("output") or ""),
+            "output": output,
             "error": error,
             "executed": executed,
-            "duration_ms": int((time.monotonic() - pending.started) * 1000),
+            "truncated": bool(raw.get("truncated", False)),
+            "duration_ms": int(duration),
+            "statements": _statements_from(raw, ok),
+            "output_bytes": len(output.encode("utf-8", "replace")),
+            "applied_text": str(raw.get("applied_text") or ""),
         })
         return result
 
@@ -408,6 +421,44 @@ class VmdToolBridge:
                 pending.state = "awaiting_user"
         return {"proceed": True}
 
+    def post_result(self, session_id: str, params: Dict[str, Any]) -> Dict[str, bool]:
+        """``tool.command_result`` by call_key. Returns {accepted, late, duplicate}.
+
+        * The first result for a waiting call resolves it, acked or not: an
+          un-acked result (a C2 refusal) counts as pickup.
+        * A repeat of an accepted result is a duplicate (the plugin's result
+          queue retries until it sees ``accepted``).
+        * A result for a call execute_tool already gave up on is accepted as
+          late: it is finalised the same way and handed to ``on_late_result``.
+        """
+        call_key = str(params.get("call_key") or "")
+        with self._lock:
+            pending = self._calls.get(call_key)
+        if pending is None or pending.session_id != str(session_id or ""):
+            return {"accepted": False, "late": False, "duplicate": False}
+        with pending.lock:
+            if pending.raw is not None:
+                return {"accepted": True, "late": pending.late, "duplicate": True}
+            pending.raw = dict(params)
+            if not pending.finished:
+                pending.done.set()
+                return {"accepted": True, "late": False, "duplicate": False}
+            pending.late = True
+        late = self._finalize(pending)
+        late.update({
+            "late": True,
+            "request_id": pending.request_id,
+            "tool_name": pending.tool_name,
+            "chat_dir": str(pending.chat_dir) if pending.chat_dir is not None else None,
+        })
+        callback = self.on_late_result
+        if callback is not None:
+            try:
+                callback(pending.session_id, call_key, late)
+            except Exception:
+                logger.warning("on_late_result failed for %s", call_key, exc_info=True)
+        return {"accepted": True, "late": True, "duplicate": False}
+
     def resolve(self, tool_call_id: str, result: Dict[str, Any]) -> bool:
         """
         Called when the Tcl bridge POSTs tool.command_result by tool_call_id.
@@ -443,6 +494,25 @@ def _empty_result() -> Dict[str, Any]:
         "truncated": False, "duration_ms": 0, "statements": None, "blocked": None,
         "output_path": None, "output_bytes": 0, "image": None, "saved_path": None,
         "applied_text": "",
+    }
+
+
+def _statements_from(raw: Dict[str, Any], ok: bool) -> Optional[Dict[str, Any]]:
+    """C3: {total, applied, failed} from the posted statement fields, or None."""
+    total = raw.get("statements_total")
+    if total is None:
+        return None
+    failed = None
+    if not ok and raw.get("failed_index"):
+        failed = {
+            "index": int(raw["failed_index"]),
+            "text": str(raw.get("failed_statement") or ""),
+            "error_info": str(raw.get("error_info") or ""),
+        }
+    return {
+        "total": int(total),
+        "applied": int(raw.get("statements_applied") or 0),
+        "failed": failed,
     }
 
 

@@ -48,6 +48,23 @@ def _as_int(value: Any, field: str, minimum: int = 0, default: int = 0) -> int:
     return out
 
 
+def _as_opt_int(value: Any, field: str) -> Optional[int]:
+    """An optional non-negative int: None when absent."""
+    if value is None or value == "":
+        return None
+    return _as_int(value, field, minimum=0)
+
+
+def _as_raw_str(value: Any) -> str:
+    """Exact text, not stripped: applied_text must be a source prefix (C3)."""
+    return "" if value is None else str(value)
+
+
+def _first_lines(text: str, lines: int, limit: int) -> str:
+    """The first ``lines`` lines of ``text``, at most ``limit`` characters."""
+    return "\n".join(text.splitlines()[:lines])[:limit]
+
+
 def _as_chat_id(value: Any, field: str = "chat_id", required: bool = True) -> str:
     text = _as_str(value, field, required=required)
     if text and CHAT_ID_RE.fullmatch(text) is None:
@@ -251,17 +268,34 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
         }
 
     if method == "tool.command_result":
-        # Posted by the Tcl bridge after executing a VMD tool call.
-        # tool_call_id must match a pending call in VmdToolBridge.
+        # Posted by the Tcl bridge after executing a VMD tool call. Token
+        # sessions name the call by call_key (spec 2d, C2, C3); tokenless
+        # sessions keep tool_call_id, which must match a pending call.
+        call_key = _as_str(p.get("call_key") or "", "call_key", required=False)
+        executed = _as_str(p.get("executed") or "yes", "executed", required=False)
+        if executed not in ("yes", "no"):
+            raise RpcError("INVALID_PARAMS", "executed must be 'yes' or 'no'",
+                           {"allowed": ["yes", "no"]})
         return {
             "session_id": _as_str(p.get("session_id"), "session_id"),
-            "tool_call_id": _as_str(p.get("tool_call_id"), "tool_call_id"),
+            "tool_call_id": _as_str(p.get("tool_call_id"), "tool_call_id", required=not call_key),
             "ok": bool(p.get("ok", False)),
             "output": _as_str(p.get("output") or "", "output", required=False),
             "error": _as_str(p.get("error") or "", "error", required=False),
-            # snapshot_file: local path written by VMD's render command.
-            # Python runtime reads this file, encodes as PNG, then discards it.
+            # snapshot_file: local path written by VMD's render command. The
+            # runtime reads and deletes it only if it is the path it chose.
             "snapshot_file": _as_str(p.get("snapshot_file") or "", "snapshot_file", required=False),
+            "call_key": call_key,
+            "executed": executed,
+            "statements_total": _as_opt_int(p.get("statements_total"), "statements_total"),
+            "statements_applied": _as_opt_int(p.get("statements_applied"), "statements_applied"),
+            "failed_index": _as_opt_int(p.get("failed_index"), "failed_index"),
+            "failed_statement": _as_str(
+                p.get("failed_statement") or "", "failed_statement", required=False)[:200],
+            "error_info": _first_lines(_as_raw_str(p.get("error_info")), 3, 500),
+            "applied_text": _as_raw_str(p.get("applied_text")),
+            "duration_ms": _as_opt_int(p.get("duration_ms"), "duration_ms"),
+            "truncated": bool(p.get("truncated", False)),
         }
 
     if method == "runtime.info":

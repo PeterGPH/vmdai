@@ -118,6 +118,7 @@ class RuntimeApp:
         self._snapshot_lock = threading.Lock()
         self._snapshot_dirs: Dict[str, str] = {}
         self.tool_bridge = VmdToolBridge(session_lookup=self._bridge_session)
+        self.tool_bridge.on_late_result = self._on_late_result
         # Round-2 hook (spec 1, 2g): each callable returns extra per-request
         # context (for example scene state) appended after the <session> block.
         self.context_providers: List[Callable[[SessionState], str]] = []
@@ -1059,6 +1060,45 @@ class RuntimeApp:
             #      a session could resolve another session's pending tool.
             state = self._get_session(params["session_id"], session_token)
 
+            call_key = params.get("call_key") or ""
+            if call_key:
+                owner = self.tool_bridge.get_call_session(call_key)
+                if owner is None:
+                    raise RpcError(
+                        "TOOL_CALL_UNKNOWN",
+                        "call_key is not known (never issued or long expired)",
+                        {"call_key": call_key},
+                    )
+                if owner != state.session_id:
+                    raise RpcError(
+                        "AUTH_FAILED",
+                        "call_key does not belong to this session",
+                        {"call_key": call_key},
+                    )
+                reply = self.tool_bridge.post_result(state.session_id, params)
+                if reply.get("accepted") and not reply.get("duplicate"):
+                    # v1 transcript entry, as for tool_call_id results.
+                    ok = bool(params["ok"]) and params.get("executed") != "no"
+                    label = (
+                        params.get("output", "")[:120]
+                        if ok
+                        else f"Error: {params.get('error', '')[:120]}"
+                    )
+                    result_event = state.queue.push(
+                        "tool_result",
+                        "message",
+                        label,
+                        {
+                            "tool_call_id": params.get("tool_call_id") or "",
+                            "call_key": call_key,
+                            "ok": ok,
+                            "late": bool(reply.get("late")),
+                        },
+                    )
+                    if state.chat_id:
+                        self.store.append_events(state.chat_id, [result_event])
+                return dict(reply)
+
             tool_call_id = params["tool_call_id"]
             pending_session = self.tool_bridge.get_pending_session(tool_call_id)
             if pending_session is None:
@@ -1228,6 +1268,27 @@ class RuntimeApp:
             return value if value >= minimum else None
 
         return _number("tool_exec_timeout_s", 1.0), _number("cancel_grace_s", 0.0)
+
+    def _on_late_result(self, session_id: str, call_key: str, info: Dict[str, Any]) -> None:
+        """A tool result arrived after its request gave up (spec 2b Late results).
+
+        Stored as a ``late_result`` line in the chat the call belonged to, so
+        build_prior can note it before the next prompt.
+        """
+        chat_dir = info.get("chat_dir")
+        if not chat_dir:
+            return
+        try:
+            conversation.Appender(Path(chat_dir), str(info.get("request_id") or "")).append_late_result(
+                call_key,
+                bool(info.get("ok", False)),
+                str(info.get("executed") or "yes"),
+                str(info.get("output") or ""),
+                str(info.get("error") or ""),
+            )
+        except Exception:
+            if self.logger:
+                self.logger.warning("could not store late result %s", call_key, exc_info=True)
 
     # ------------------------------------------------------------------
     # Background thread: Claude agent loop
