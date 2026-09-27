@@ -351,7 +351,7 @@ def test_no_announce_writes_token_file_0600_and_removes_on_exit(tmp_path):
         assert not path.exists()
         # No READY line (nor any other stdout) without --announce, over the
         # runtime's whole life rather than a 0.5 s window after the token file.
-        assert proc.stdout.read() == b""
+        assert proc.communicate(timeout=5)[0] == b""
     finally:
         _stop(proc)
 

@@ -141,13 +141,13 @@ test net-epoch-1 {a reply from an older epoch is dropped and its token cleaned u
 
 test net-deliver-1 {a throwing handler is logged and later replies still arrive} -body {
     reset_net
+    # Both calls are in flight together; the replies may come back in either
+    # order, so wait until the handler has thrown and the second has arrived.
     ::vmdai::net::call echo {n i 1} {apply {{args} {error "boom-handler"}}}
-    # The replies may come back in either order; ask again once the handler
-    # has thrown, so the second reply is the later one.
-    set logged [wait_for {string match "*boom-handler*" [plugin_log]}]
     ::vmdai::net::call echo {n i 2} {collect second}
-    wait_for {info exists ::got(second)}
-    list [lindex $::got(second) 0] $logged
+    set done [wait_for {expr {[info exists ::got(second)]
+                              && [string match "*boom-handler*" [plugin_log]]}}]
+    list [lindex $::got(second) 0] $done
 } -result {ok 1}
 
 test net-sync-1 {call_sync returns the result or raises with an errorcode} -body {

@@ -279,6 +279,13 @@ def run_tcltest(
 # environment is active during a run, just as when each module fixture ran on
 # its own. Each run is still exactly one run per module, and an exception
 # (a failure or pytest.skip) is re-raised by that module's own fixture.
+#
+# Run bodies do execute concurrently with each other, on worker threads. A
+# run body must therefore not touch process-wide state (os.environ, the cwd,
+# signal handlers, module globals), must pass its environment to the
+# subprocess explicitly, and must use its own tmp_path_factory.mktemp prefix.
+# A module that needs per-test hermetic state or global patches keeps a
+# plain fixture instead.
 
 ModuleRun = Callable[[pytest.TempPathFactory], Any]
 
