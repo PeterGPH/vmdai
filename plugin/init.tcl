@@ -1,7 +1,7 @@
 namespace eval ::vmdai {}
 
 set _vmdai_here [file dirname [info script]]
-foreach _vmdai_m {config sched net runtime bridge ui} {
+foreach _vmdai_m {config sched net runtime bridge executor ui} {
     source [file join $_vmdai_here $_vmdai_m.tcl]
 }
 
