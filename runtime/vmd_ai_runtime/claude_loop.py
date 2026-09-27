@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import copy
 import dataclasses
+import functools
 import http.client
 import json
 import logging
@@ -33,7 +34,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import provider_catalog
+from . import image_scale, provider_catalog
 from .provider import (
     ProviderError,
     resolve_anthropic_api_key,
@@ -1119,6 +1120,130 @@ def _apply_openai_body_options(body: Dict[str, Any], opts: Any) -> None:
         body[key] = copy.deepcopy(value)
 
 
+# ---------------------------------------------------------------------------
+# Vision (spec 2f): which providers get images, and at what size.
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_DIRECT_NAMES = ("anthropic-direct", "anthropic_api", "anthropic-direct-api")
+_IMAGE_NOT_SHOWN = "[Snapshot captured — image not shown in this provider mode]"
+
+
+def resolve_supports_vision(provider: str, value: Any, capabilities: Optional[Dict[str, bool]]) -> bool:
+    """Resolve LoopOptions.supports_vision to a bool.
+
+    True/False are explicit. None keeps today's rule (images only to
+    anthropic-direct). "auto" is True for anthropic-direct, the /api/show
+    ``vision`` capability for Ollama, and False for openai-compatible and
+    openrouter, which have no capability probe (a manual toggle)."""
+    name = str(provider or "").lower()
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return name in _ANTHROPIC_DIRECT_NAMES
+    if str(value).lower() == "auto":
+        if name in _ANTHROPIC_DIRECT_NAMES:
+            return True
+        if name in _OLLAMA_PROVIDER_NAMES:
+            return bool((capabilities or {}).get("vision"))
+    return False
+
+
+def _images_allowed(opts: Any) -> bool:
+    """Converters inline image blocks only when vision resolved to True."""
+    return opts is not None and opts.supports_vision is True
+
+
+def _image_block_b64(block: Dict[str, Any]) -> str:
+    source = block.get("source") or {}
+    if source.get("type") != "base64":
+        return ""
+    return str(source.get("data") or "")
+
+
+@functools.lru_cache(maxsize=16)
+def _downscaled_b64(data: str, max_edge: int) -> str:
+    """Base64 of the PNG ``data`` fitted to ``max_edge`` (cached, so a
+    snapshot that stays in the history is resized once, not every turn)."""
+    try:
+        png = base64.b64decode(data)
+        small, _width, _height = image_scale.downscale_png(png, max_edge)
+    except Exception:
+        logger.warning("snapshot downscale failed; sending the original", exc_info=True)
+        return data
+    if small is png:
+        return data
+    return base64.b64encode(small).decode("ascii")
+
+
+def _has_image(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    if block.get("type") == "image":
+        return True
+    content = block.get("content")
+    return block.get("type") == "tool_result" and isinstance(content, list) and any(
+        isinstance(b, dict) and b.get("type") == "image" for b in content
+    )
+
+
+def _messages_have_images(messages: List[Dict]) -> bool:
+    return any(
+        isinstance(m, dict) and isinstance(m.get("content"), list)
+        and any(_has_image(b) for b in m["content"])
+        for m in messages
+    )
+
+
+def _image_for_call(block: Dict[str, Any], vision: bool, max_edge: int) -> Dict[str, Any]:
+    if not vision:
+        return {"type": "text", "text": _IMAGE_NOT_SHOWN}
+    source = block.get("source") or {}
+    data = _image_block_b64(block)
+    if not data or max_edge <= 0 or str(source.get("media_type") or "image/png") != "image/png":
+        return block
+    small = _downscaled_b64(data, int(max_edge))
+    if small == data:
+        return block
+    return dict(block, source=dict(source, data=small))
+
+
+def _block_for_call(block: Any, vision: bool, max_edge: int) -> Any:
+    if not isinstance(block, dict):
+        return block
+    if block.get("type") == "image":
+        return _image_for_call(block, vision, max_edge)
+    content = block.get("content")
+    if block.get("type") == "tool_result" and isinstance(content, list):
+        return dict(block, content=[
+            _image_for_call(b, vision, max_edge)
+            if isinstance(b, dict) and b.get("type") == "image" else b
+            for b in content
+        ])
+    return block
+
+
+def _images_for_call(messages: List[Dict], *, vision: bool, max_edge: int) -> List[Dict]:
+    """Per-call view of ``messages`` for the options path (spec 2f Vision).
+
+    With vision, every base64 PNG image block (top level or inside a
+    tool_result) is downscaled to fit ``max_edge`` (1024 px local, 1568 px
+    Anthropic); without vision, each becomes the text marker, so no provider
+    ever receives an image. Covers this run's snapshots and the images
+    build_prior hydrates from disk. Messages without images are shared, the
+    in-run list is never modified, and ``messages`` itself comes back when
+    no message holds an image."""
+    out: List[Dict] = []
+    changed = False
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list) and any(_has_image(b) for b in content):
+            out.append(dict(msg, content=[_block_for_call(b, vision, max_edge) for b in content]))
+            changed = True
+        else:
+            out.append(msg)
+    return out if changed else messages
+
+
 def _stream_anthropic_direct(
     messages: List[Dict],
     model: str,
@@ -1297,7 +1422,12 @@ def _stream_openrouter(
     or_messages = []
     if system_prompt:
         or_messages.append({"role": "system", "content": system_prompt})
-    or_messages.extend(_to_openrouter_messages(messages))
+    if opts is None:
+        or_messages.extend(_to_openrouter_messages(messages))
+    else:
+        or_messages.extend(
+            _to_openrouter_messages(messages, include_images=_images_allowed(opts))
+        )
 
     tools_list = list(tools) if tools is not None else VMD_TOOLS
     body: Dict[str, Any] = {
@@ -1474,6 +1604,7 @@ def _ollama_tools(tools: List[Dict]) -> List[Dict]:
 def _to_ollama_messages(
     messages: List[Dict],
     *,
+    include_images: bool = False,
     tool_name: bool = False,
 ) -> List[Dict]:
     """Convert internal Anthropic-style messages to Ollama format.
@@ -1487,9 +1618,12 @@ def _to_ollama_messages(
       * ``arguments`` in tool_calls is an OBJECT (not a JSON string)
       * Ollama doesn't track ``tool_call_id`` the same way — we still
         emit it for round-trip clarity, but Ollama will ignore it.
-      * Images in ``tool_result`` are dropped (Ollama vision models
-        accept images differently; we keep this path text-only for
-        now and surface a text marker instead).
+      * Images in ``tool_result`` become a text marker unless
+        include_images is set (vision on, LoopOptions path): then they
+        move to a ``{"role": "user", "content": "Snapshot from
+        capture_vmd_snapshot (call <id>).", "images": [b64]}`` message
+        placed right after that turn's tool messages, and top-level image
+        blocks ride on their own message's ``images``.
 
     tool_name (LoopOptions.ollama_tool_name) adds the name of the tool that
     produced each ``role=tool`` message, looked up from the earlier
@@ -1512,6 +1646,8 @@ def _to_ollama_messages(
         text_parts: List[str] = []
         tool_calls: List[Dict] = []
         tool_results: List[Dict] = []
+        snapshot_messages: List[Dict] = []
+        top_images: List[str] = []
 
         for block in content:
             btype = block.get("type", "")
@@ -1531,17 +1667,26 @@ def _to_ollama_messages(
                 tc_content = block.get("content", "")
                 if isinstance(tc_content, list):
                     parts = []
+                    images: List[str] = []
                     for b in tc_content:
                         if not isinstance(b, dict):
                             continue
                         if b.get("type") == "image":
-                            parts.append(
-                                "[Snapshot captured — image not shown in "
-                                "this provider mode]"
-                            )
+                            data = _image_block_b64(b)
+                            if include_images and data:
+                                images.append(data)
+                            else:
+                                parts.append(_IMAGE_NOT_SHOWN)
                         else:
                             parts.append(str(b.get("text") or ""))
                     tc_content = " ".join(p for p in parts if p)
+                    if images:
+                        snapshot_messages.append({
+                            "role": "user",
+                            "content": "Snapshot from capture_vmd_snapshot "
+                                       f"(call {block.get('tool_use_id', '')}).",
+                            "images": images,
+                        })
                 entry: Dict[str, Any] = {
                     "role": "tool",
                     "tool_call_id": block.get("tool_use_id", ""),
@@ -1550,12 +1695,16 @@ def _to_ollama_messages(
                 if tool_name and names_by_id.get(str(block.get("tool_use_id", ""))):
                     entry["tool_name"] = names_by_id[str(block.get("tool_use_id", ""))]
                 tool_results.append(entry)
-            # ``image`` blocks at top level are dropped — Ollama's
-            # vision path requires multipart images on the user msg,
-            # which we don't use here.
+            elif btype == "image" and include_images:
+                data = _image_block_b64(block)
+                if data:
+                    top_images.append(data)
+            # Without include_images, top-level ``image`` blocks are dropped
+            # as before.
 
         if tool_results:
             out.extend(tool_results)
+            out.extend(snapshot_messages)
         elif tool_calls:
             msg_out: Dict[str, Any] = {
                 "role": role,
@@ -1564,7 +1713,10 @@ def _to_ollama_messages(
             }
             out.append(msg_out)
         else:
-            out.append({"role": role, "content": "".join(text_parts)})
+            plain: Dict[str, Any] = {"role": role, "content": "".join(text_parts)}
+            if top_images:
+                plain["images"] = top_images
+            out.append(plain)
 
     return out
 
@@ -1787,9 +1939,11 @@ def _stream_ollama(
     if opts is None:
         ol_messages.extend(_to_ollama_messages(messages))
     else:
-        ol_messages.extend(
-            _to_ollama_messages(messages, tool_name=bool(opts.ollama_tool_name))
-        )
+        ol_messages.extend(_to_ollama_messages(
+            messages,
+            include_images=_images_allowed(opts),
+            tool_name=bool(opts.ollama_tool_name),
+        ))
 
     tools_list = list(tools) if tools is not None else VMD_TOOLS
     if opts is None:
@@ -1990,7 +2144,11 @@ def _stream_ollama(
 # Message-format conversion helpers
 # ---------------------------------------------------------------------------
 
-def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
+def _to_openrouter_messages(
+    messages: List[Dict],
+    *,
+    include_images: bool = False,
+) -> List[Dict]:
     """
     Convert internal Anthropic-style messages to OpenAI/OpenRouter format.
 
@@ -2000,6 +2158,10 @@ def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
     OpenRouter format:
         {"role": "user"|"assistant", "content": str, "tool_calls": [...]}
         {"role": "tool", "tool_call_id": "...", "content": "..."}
+
+    include_images (vision on, LoopOptions path): each image inside a
+    tool_result becomes a user message with an ``image_url`` data-URL part,
+    placed right after that turn's tool messages.
     """
     out: List[Dict] = []
     for msg in messages:
@@ -2017,6 +2179,7 @@ def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
         text_parts: List[str] = []
         tool_calls: List[Dict] = []
         tool_results: List[Dict] = []
+        snapshot_messages: List[Dict] = []
 
         for block in content:
             btype = block.get("type", "")
@@ -2037,6 +2200,16 @@ def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
                 # Flatten image content to text if present
                 tc_content = block.get("content", "")
                 if isinstance(tc_content, list):
+                    if include_images:
+                        for b in tc_content:
+                            if isinstance(b, dict) and b.get("type") == "image" and _image_block_b64(b):
+                                mime = str((b.get("source") or {}).get("media_type") or "image/png")
+                                snapshot_messages.append({"role": "user", "content": [
+                                    {"type": "text", "text": "Snapshot from capture_vmd_snapshot "
+                                                             f"(call {block['tool_use_id']})."},
+                                    {"type": "image_url", "image_url": {
+                                        "url": f"data:{mime};base64,{_image_block_b64(b)}"}},
+                                ]})
                     tc_content = " ".join(
                         b.get("text", "") for b in tc_content if isinstance(b, dict)
                     )
@@ -2054,6 +2227,7 @@ def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
 
         if tool_results:
             out.extend(tool_results)
+            out.extend(snapshot_messages)
         elif tool_calls:
             msg_out: Dict[str, Any] = {
                 "role": role,
@@ -2412,6 +2586,41 @@ class ClaudeToolLoop:
             "error": "",
         }
 
+    def _vision_enabled(self) -> bool:
+        """Whether snapshot images go to this loop's model (spec 2f Vision).
+
+        options=None keeps today's rule (anthropic-direct only). With options,
+        True/False are used as-is; None and "auto" are resolved once through
+        resolve_supports_vision (for Ollama, "auto" asks /api/show with the
+        2 s preflight timeout) and the bool is stored back into self.options,
+        so the converters see the same answer on every later call."""
+        options = getattr(self, "options", None)
+        if options is None:
+            return self._is_anthropic_direct
+        value = options.supports_vision
+        if isinstance(value, bool):
+            return value
+        capabilities: Optional[Dict[str, bool]] = None
+        if self._is_ollama and str(value).lower() == "auto":
+            capabilities = self._ollama_capabilities()
+        resolved = resolve_supports_vision(self.provider_name, value, capabilities)
+        self.options = dataclasses.replace(options, supports_vision=resolved)
+        return resolved
+
+    def _ollama_capabilities(self) -> Optional[Dict[str, bool]]:
+        options = getattr(self, "options", None)
+        base = options.base_url if options is not None and options.base_url else self.api_key
+        try:
+            show = provider_catalog.ollama_show(
+                base or "http://localhost:11434", self.model,
+                timeout=provider_catalog.PREFLIGHT_TIMEOUT_S,
+            )
+            return dict(provider_catalog.model_capabilities(show))
+        except Exception:
+            logger.warning("ollama /api/show failed; treating %s as non-vision", self.model,
+                           exc_info=True)
+            return None
+
     def _tools_for_turn(self) -> List[Dict[str, Any]]:
         """Tool list to advertise to the provider this turn.
 
@@ -2610,6 +2819,14 @@ class ClaudeToolLoop:
         ``options=None`` they are called exactly as before (S7).
         """
         tools = self._tools_for_turn()
+        if self.options is not None and _messages_have_images(messages):
+            # Per-call image view (spec 2f Vision): downscaled when this loop's
+            # resolved vision is on, a text marker when it is off. The in-run
+            # list (and messages_out) keep the full image.
+            vision = self._vision_enabled()
+            messages = _images_for_call(
+                messages, vision=vision, max_edge=int(self.options.image_max_edge or 0)
+            )
         extra: Dict[str, Any] = {}
         if self.options is not None:
             extra = {
@@ -3105,7 +3322,7 @@ class ClaudeToolLoop:
                         _build_tool_result_block(
                             tool_use_id=tool_id,
                             result=result,
-                            include_image=self._is_anthropic_direct,
+                            include_image=self._vision_enabled(),
                         )
                     )
                     result_keys.append(call_key)

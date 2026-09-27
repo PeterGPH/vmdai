@@ -391,11 +391,16 @@ class RuntimeApp:
 
     @staticmethod
     def _vision_for(loop: Optional[ClaudeToolLoop]) -> bool:
+        """runtime.info.vision: the loop's resolved supports_vision (spec 2f).
+
+        "auto" asks /api/show once for Ollama (2 s timeout, cached 60 s by
+        provider_catalog); a failed probe reads as no vision."""
         if loop is None:
             return False
-        if loop.provider_name == "anthropic-direct":
-            return True
-        return getattr(getattr(loop, "options", None), "supports_vision", None) is True
+        try:
+            return bool(loop._vision_enabled())
+        except Exception:
+            return False
 
     def _max_turns_for(self, loop: Optional[ClaudeToolLoop]) -> int:
         options = getattr(loop, "options", None) if loop is not None else None
