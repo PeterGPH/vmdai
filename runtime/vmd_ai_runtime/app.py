@@ -152,6 +152,43 @@ def is_display_event(event: Dict[str, Any]) -> bool:
     return event_type == "message" and role in ("user", "assistant", "reasoning", "error")
 
 
+def _request_started_payload(*, request_id: str, chat_id: Optional[str], provider: str, model: str,
+                              max_turns: int, vision: bool, think: Any) -> Dict[str, Any]:
+    """request.started metadata (§2c): the one shape both worker paths push (m2)."""
+    return {
+        "kind": "request.started",
+        "request_id": request_id,
+        "chat_id": chat_id,
+        "provider": provider,
+        "model": model,
+        "max_turns": max_turns,
+        "vision": vision,
+        "think": think,
+    }
+
+
+def _request_finished_payload(*, request_id: str, status: str, wrapped_up: bool, turns: int,
+                              tool_calls: int, final_text_empty: bool, duration_ms: int,
+                              usage: Optional[Dict[str, Any]], error: Optional[str],
+                              run_dir: Optional[str]) -> Dict[str, Any]:
+    """request.finished metadata (§2c): the one shape both worker paths push (m2)."""
+    u = usage or {}
+    return {
+        "kind": "request.finished",
+        "request_id": request_id,
+        "status": status,
+        "wrapped_up": wrapped_up,
+        "turns": turns,
+        "tool_calls": tool_calls,
+        "final_text_empty": final_text_empty,
+        "duration_ms": duration_ms,
+        "usage": {"input_tokens_evaluated": u.get("input_tokens_evaluated"),
+                  "output_tokens": u.get("output_tokens")},
+        "error": error,
+        "run_dir": run_dir,
+    }
+
+
 class _EventMapper:
     """The ``ctx.on_event`` sink of one request (§2a Legacy callbacks, §2c).
 
@@ -161,9 +198,11 @@ class _EventMapper:
     callbacks. ``push`` also:
 
     * collects a turn's reasoning chunks and pushes one sealed
-      ``reasoning/message`` just before the first non-reasoning event that
-      follows them (or before request.finished). ``turn.retry`` drops the
-      unsealed reasoning, because the retried attempt streams it again;
+      ``reasoning/message`` live at once, but writes it to events.jsonl only
+      just before the next persisted display event of this request
+      (assistant/message, tool.started, tool.finished, error,
+      request.finished). ``turn.retry`` for its own turn drops it
+      unpersisted, and drops unsealed reasoning too;
     * writes the display kinds to events.jsonl (``is_display_event``) and
       touches the manifest once, at request.finished.
 
@@ -185,6 +224,7 @@ class _EventMapper:
         self._reasoning_turn: Any = None
         self._reasoning_parts: List[str] = []
         self._reasoning_t0 = 0.0
+        self._unpersisted_reasoning: Optional[Dict[str, Any]] = None
 
     def __call__(self, item: Dict[str, Any]) -> None:
         try:
@@ -223,10 +263,13 @@ class _EventMapper:
             self._buffer_reasoning(meta.get("turn"), text)
         elif kind == "turn.retry":
             self._drop_reasoning()
+            self._retry_reasoning(meta.get("turn"))
         else:
             self.seal_reasoning()
         event = self.app._push_v2(self.state, role, event_type, text, meta)
-        self.app._persist_display(self.chat_id, event)
+        if isinstance(event, dict) and is_display_event(event):
+            self._flush_reasoning()
+            self.app._persist_display(self.chat_id, event)
         if kind == "request.finished" and self.chat_id:
             self.app.store.touch_manifest(self.chat_id)
         return event
@@ -247,7 +290,10 @@ class _EventMapper:
         self._reasoning_parts = []
 
     def seal_reasoning(self) -> Optional[Dict[str, Any]]:
-        """Push the open reasoning as one ``reasoning/message`` (live and persisted)."""
+        """Push the open reasoning as one ``reasoning/message``
+
+        (live now; persisted with the next display event of this request).
+        """
         if not self._reasoning_open:
             return None
         meta: Dict[str, Any] = {
@@ -258,8 +304,25 @@ class _EventMapper:
         text = "".join(self._reasoning_parts)
         self._drop_reasoning()
         event = self.app._push_v2(self.state, "reasoning", "message", text, meta)
-        self.app._persist_display(self.chat_id, event)
+        self._flush_reasoning()
+        self._unpersisted_reasoning = event
         return event
+
+    def _flush_reasoning(self) -> None:
+        """Persist a still-held sealed reasoning event, if there is one."""
+        event, self._unpersisted_reasoning = self._unpersisted_reasoning, None
+        if event is not None:
+            self.app._persist_display(self.chat_id, event)
+
+    def _retry_reasoning(self, turn: Any) -> None:
+        """turn.retry for a held reasoning's own turn drops it unpersisted; otherwise flush it."""
+        held = self._unpersisted_reasoning
+        if held is None:
+            return
+        if (held.get("metadata") or {}).get("turn") == turn:
+            self._unpersisted_reasoning = None
+        else:
+            self._flush_reasoning()
 
 
 class RuntimeApp:
@@ -1630,7 +1693,7 @@ class RuntimeApp:
             return None
         chat_dir = info.get("chat_dir")
         chat_id = Path(str(chat_dir)).name if chat_dir else None
-        if not chat_id or chat_id != state.chat_id:
+        if not chat_id:
             return None
         duration = info.get("duration_ms")
         if isinstance(duration, bool) or not isinstance(duration, (int, float)):
@@ -1638,8 +1701,13 @@ class RuntimeApp:
         meta = _tool_finished_meta(call_key, str(info.get("tool_name") or ""), "tcl", info,
                                    float(duration), late=True)
         meta["request_id"] = str(info.get("request_id") or "")
-        event = self._push_v2(state, "system", "state", "", meta)
-        self._persist_display(chat_id, event)      # "tool.finished (including late:true ones)"
+        event: Optional[Dict[str, Any]] = None
+        # chat.resume switches chat_id and drops the queue under this lock.
+        with state.lock:
+            if self.sessions.get(state.session_id) is not state or chat_id != state.chat_id:
+                return None
+            event = self._push_v2(state, "system", "state", "", meta)
+            self._persist_display(chat_id, event)      # "tool.finished (including late:true ones)"
         return event
 
     # ------------------------------------------------------------------
@@ -1842,16 +1910,13 @@ class RuntimeApp:
             max_turns = int(self._max_turns_for(loop))
         except Exception:
             max_turns = int(getattr(loop, "MAX_TURNS", 28))
-        return {
-            "kind": "request.started",
-            "request_id": request_id,
-            "chat_id": chat_id,
-            "provider": str(getattr(loop, "provider_name", "") or ""),
-            "model": str(getattr(loop, "model", "") or ""),
-            "max_turns": max_turns,
-            "vision": vision,
-            "think": getattr(options, "think", None) if options is not None else None,
-        }
+        return _request_started_payload(
+            request_id=request_id, chat_id=chat_id,
+            provider=str(getattr(loop, "provider_name", "") or ""),
+            model=str(getattr(loop, "model", "") or ""),
+            max_turns=max_turns, vision=vision,
+            think=getattr(options, "think", None) if options is not None else None,
+        )
 
     @staticmethod
     def _request_finished_meta(loop: Any, mapper: "_EventMapper", *, entered_run: bool,
@@ -1874,20 +1939,12 @@ class RuntimeApp:
         error = failure_text
         if error is None and getattr(loop, "last_wrap_up_error", None):
             error = str(loop.last_wrap_up_error)
-        return {
-            "kind": "request.finished",
-            "request_id": mapper.request_id,
-            "status": status,
-            "wrapped_up": wrapped_up,
-            "turns": turns,
-            "tool_calls": tool_calls,
-            "final_text_empty": final_text_empty,
-            "duration_ms": int(round((time.monotonic() - started) * 1000)),
-            "usage": {"input_tokens_evaluated": usage.get("input_tokens_evaluated"),
-                      "output_tokens": usage.get("output_tokens")},
-            "error": error,
-            "run_dir": mapper.run_dir,
-        }
+        return _request_finished_payload(
+            request_id=mapper.request_id, status=status, wrapped_up=wrapped_up, turns=turns,
+            tool_calls=tool_calls, final_text_empty=final_text_empty,
+            duration_ms=int(round((time.monotonic() - started) * 1000)),
+            usage=usage, error=error, run_dir=mapper.run_dir,
+        )
 
     @staticmethod
     def _error_meta(exc: BaseException) -> Dict[str, Any]:
@@ -1952,11 +2009,9 @@ class RuntimeApp:
 
         try:
             if v2:
-                mapper.push("system", "state", "", {
-                    "kind": "request.started", "request_id": request_id, "chat_id": state.chat_id,
-                    "provider": self.provider_name, "model": model, "max_turns": 1,
-                    "vision": False, "think": None,
-                })
+                mapper.push("system", "state", "", _request_started_payload(
+                    request_id=request_id, chat_id=state.chat_id, provider=self.provider_name,
+                    model=model, max_turns=1, vision=False, think=None))
                 request.turn = 1
                 mapper.push("system", "state", "", {"kind": "turn.started", "turn": 1})
             output = self.provider.stream_response(
@@ -1997,14 +2052,11 @@ class RuntimeApp:
                 else:
                     status = "complete"
                 try:
-                    mapper.push("system", "state", "", {
-                        "kind": "request.finished", "request_id": request_id, "status": status,
-                        "wrapped_up": False, "turns": 1, "tool_calls": 0,
-                        "final_text_empty": not output,
-                        "duration_ms": int(round((time.monotonic() - started) * 1000)),
-                        "usage": {"input_tokens_evaluated": None, "output_tokens": None},
-                        "error": failure_text, "run_dir": None,
-                    })
+                    mapper.push("system", "state", "", _request_finished_payload(
+                        request_id=request_id, status=status, wrapped_up=False, turns=1,
+                        tool_calls=0, final_text_empty=not output,
+                        duration_ms=int(round((time.monotonic() - started) * 1000)),
+                        usage=None, error=failure_text, run_dir=None))
                 except Exception:
                     if self.logger:
                         self.logger.warning("request.finished failed for %s", request_id, exc_info=True)

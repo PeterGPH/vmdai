@@ -104,6 +104,59 @@ def test_late_after_finished(tmp_path, monkeypatch):
     assert late_at > end
 
 
+def test_late_finished_holds_state_lock(tmp_path, monkeypatch):
+    """m1: the late tool.finished push+persist runs under state.lock (§2c),
+    so it cannot race a concurrent chat.resume switching chat_id."""
+    app, session = _held_run(tmp_path, monkeypatch, [ScriptTurn(tool_blocks=[run_cmd("tc_1", "long_job")])])
+    with FakePlugin(app, session, answer=lambda meta: None) as plugin:
+        result(send(app, session, "run the long job"))
+        key, = plugin.wait_held()
+        result(call(app, "chat.cancel", {}, session))
+        wait_idle(app, session)
+
+        state = app.sessions.get(session.session_id)
+
+        class _LockProbe:
+            def __init__(self) -> None:
+                self._inner = threading.Lock()
+                self.held = False
+
+            def __enter__(self) -> None:
+                self._inner.acquire()
+                self.held = True
+
+            def __exit__(self, *exc: object) -> None:
+                self.held = False
+                self._inner.release()
+
+        probe = _LockProbe()
+        state.lock = probe
+
+        recorded: list = []
+        orig_push = app._push_v2
+        orig_persist = app._persist_display
+
+        def push_wrap(state_arg, role, event_type, text, metadata):
+            meta = metadata or {}
+            if meta.get("kind") == "tool.finished" and meta.get("late") is True:
+                recorded.append(("push", probe.held))
+            return orig_push(state_arg, role, event_type, text, metadata)
+
+        def persist_wrap(chat_id, event):
+            meta = (event or {}).get("metadata") or {}
+            if meta.get("kind") == "tool.finished" and meta.get("late") is True:
+                recorded.append(("persist", probe.held))
+            return orig_persist(chat_id, event)
+
+        monkeypatch.setattr(app, "_push_v2", push_wrap)
+        monkeypatch.setattr(app, "_persist_display", persist_wrap)
+
+        reply = plugin.post(key, ok=True, output="3 atoms")
+
+    assert reply == {"accepted": True, "late": True, "duplicate": False}
+    assert recorded == [("push", True), ("persist", True)]
+
+
 def test_late_after_next_request(tmp_path, monkeypatch):
     """Review focus 2: the late row update lands while the next request is running."""
     gate = threading.Event()

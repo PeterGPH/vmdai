@@ -83,6 +83,33 @@ def test_turn_retry_discards_reasoning(tmp_path):
     assert [e["text"] for e in _stored(app, reply["chat_id"]) if e["role"] == "reasoning"] == ["Second try"]
 
 
+def test_turn_retry_after_sealed_reasoning(tmp_path):
+    script = [
+        ScriptTurn(reasoning="First try.", text="Partial", drop_after_text=True),
+        ScriptTurn(reasoning="Second try.", text="Done."),
+    ]
+    app, _session, (reply,), events = _run(tmp_path, script)
+    sealed = [(e["metadata"]["turn"], e["text"]) for e in events
+              if e["role"] == "reasoning" and e["type"] == "message"]
+    assert sealed == [(1, "First try."), (1, "Second try.")]
+    retry_at = next(i for i, e in enumerate(events)
+                    if (e.get("metadata") or {}).get("kind") == "turn.retry")
+    first_reasoning_at = next(i for i, e in enumerate(events)
+                              if e["role"] == "reasoning" and e["type"] == "message")
+    assert first_reasoning_at < retry_at
+
+    stored = _stored(app, reply["chat_id"])
+    assert [(e["metadata"]["turn"], e["text"]) for e in stored if e["role"] == "reasoning"] == [
+        (1, "Second try.")]
+    assert kinds(stored) == [
+        ("user", "message", None),
+        ("system", "state", "request.started"),
+        ("reasoning", "message", None),
+        ("assistant", "message", None),
+        ("system", "state", "request.finished"),
+    ]
+
+
 def test_message_count_user_assistant_only(tmp_path):
     script = [
         ScriptTurn(text="Loading.", tool_blocks=[LOAD]),

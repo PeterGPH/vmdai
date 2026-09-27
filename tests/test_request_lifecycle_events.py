@@ -150,6 +150,7 @@ def test_mock_path(tmp_path):
     assert sealed == [("Mock assistant response to: hello",
                        {"request_id": rid, "turn": 1, "final": True, "v": 2})]
     finished, = of_kind(events, "request.finished")
+    assert set(finished) == FINISHED_KEYS
     assert {k: finished[k] for k in ("status", "wrapped_up", "turns", "tool_calls", "final_text_empty",
                                      "usage", "error", "run_dir")} == {
         "status": "complete", "wrapped_up": False, "turns": 1, "tool_calls": 0,

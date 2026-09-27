@@ -4348,7 +4348,7 @@ Expected:
    - New store methods: `append_display_events` (no manifest touch), `touch_manifest`, `counts_as_message` and `_count_messages`. The v2 display log is appended per event while the manifest is touched at chat.send and at request.finished, so `index.jsonl` grows two rows per request, not one per event.
    - `recount_messages` is also used by a token session's `chat.resume`.
    - Plan 03's `tests/test_store_locks.py` concurrency test now appends assistant messages instead of chunks (its count of 161 is unchanged).
-8. **Sealed reasoning is also pushed live (P07-T04),** not only persisted. The view-model then sees the same `reasoning/message` live and on replay, and seals the reasoning block before the answer or tool row. `turn.retry` drops unsealed reasoning.
+8. **Sealed reasoning is also pushed live (P07-T04),** not only persisted. The view-model then sees the same `reasoning/message` live and on replay, and seals the reasoning block before the answer or tool row. `turn.retry` drops unsealed reasoning. Final-review fix: a sealed reasoning/message is persisted only with the next persisted display event of its request, and a turn.retry for its turn drops it unpersisted, so replay matches the live view after the view-model's retry discard.
 9. **Replay (P07-T05).** `events.display_log` is added. For a token session, `chat.history.get` returns the whole display log (`limit` is ignored), never returns `tool_start`, and drops a v1 request's chunks when its assistant message was stored. Tokenless behaviour is unchanged.
 10. **Long-poll (P07-T06).**
     - `protocol.MAX_WAIT_MS` is added.
