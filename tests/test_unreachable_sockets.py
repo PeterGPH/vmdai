@@ -13,7 +13,7 @@ import socket
 import threading
 import time
 import urllib.request
-from typing import Callable, Iterator, List, Tuple
+from typing import Any, Callable, Iterator, List, Tuple
 
 import pytest
 
@@ -189,18 +189,38 @@ def test_accept_then_close_cold_and_warm(listeners):
 
 
 def test_never_answering_cold_and_warm(listeners):
+    # Each case waits out the real 2 s timeout, so the cold case runs on a
+    # thread while the warm one runs here. Each is timed on its own and has
+    # its own listener and base_url (the version cache is per base_url).
     cold = listeners("hang")
-    exc, elapsed = run_until_raise(cold.base_url)
+    cold_outcome: List[Any] = []
+
+    def run_cold() -> None:
+        try:
+            cold_outcome.append(run_until_raise(cold.base_url))
+        except BaseException as failure:  # noqa: BLE001 - re-raised below
+            cold_outcome.append(failure)
+
+    cold_thread = threading.Thread(target=run_cold, daemon=True)
+    cold_thread.start()
+
+    warm = listeners("ok")
+    prime_version_cache(warm.base_url)
+    warm.mode = "hang"
+    warm_exc, warm_elapsed = run_until_raise(warm.base_url)
+
+    cold_thread.join(timeout=30)
+    assert len(cold_outcome) == 1, "the cold case did not finish"
+    if isinstance(cold_outcome[0], BaseException):
+        raise cold_outcome[0]
+    exc, elapsed = cold_outcome[0]
     assert 1.5 < elapsed < 3.0
     assert exc.code == "unreachable"
     assert exc.hint == provider_catalog.unreachable_hint(cold.base_url, "timeout")
     assert "stale" in exc.hint
     assert cold.paths == ["/api/version"]
 
-    warm = listeners("ok")
-    prime_version_cache(warm.base_url)
-    warm.mode = "hang"
-    exc, elapsed = run_until_raise(warm.base_url)
+    exc, elapsed = warm_exc, warm_elapsed
     assert 1.5 < elapsed < 3.0
     assert exc.hint == provider_catalog.unreachable_hint(warm.base_url, "timeout")
     # /api/version came from the cache; the never-cached /api/ps timed out.
