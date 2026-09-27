@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Optional
 
 from .image_utils import read_image_as_png_bytes
+from .image_scale import make_thumbnail, png_size, to_jpeg
 
 logger = logging.getLogger("vmdai.tool_bridge")
 
@@ -223,17 +224,25 @@ class VmdToolBridge:
             result = pending.result or {}
 
             # For snapshot tool: read the rendered file and base64-encode it.
+            # Old plugins may only use /tmp/vmdai_snap_<tool_call_id>.tga
+            # (spec 2d); any other path is rejected, never read or deleted.
             if tool_name == "capture_vmd_snapshot" and result.get("ok"):
                 snap_file = str(result.get("snapshot_file") or "")
-                if snap_file and os.path.isfile(snap_file):
-                    png_bytes = read_image_as_png_bytes(snap_file)
-                    if png_bytes:
-                        result["image_b64"] = base64.b64encode(png_bytes).decode()
-                        result["image_mime"] = "image/png"
-                    try:
-                        os.unlink(snap_file)
-                    except Exception:
-                        pass
+                if snap_file and _legacy_snapshot_allowed(snap_file, tool_call_id):
+                    if os.path.isfile(snap_file):
+                        png_bytes = read_image_as_png_bytes(snap_file)
+                        if png_bytes:
+                            result["image_b64"] = base64.b64encode(png_bytes).decode()
+                            result["image_mime"] = "image/png"
+                        try:
+                            os.unlink(snap_file)
+                        except Exception:
+                            pass
+                elif snap_file:
+                    logger.warning("rejected snapshot_file %r for %s", snap_file, tool_call_id)
+                    result["ok"] = False
+                    result["error"] = ("snapshot file rejected: the plugin may only use "
+                                       "/tmp/vmdai_snap_<tool_call_id>.tga")
 
             return result
 
@@ -382,7 +391,73 @@ class VmdToolBridge:
             "output_bytes": len(output.encode("utf-8", "replace")),
             "applied_text": str(raw.get("applied_text") or ""),
         })
+        if pending.tool_name == "capture_vmd_snapshot":
+            self._attach_snapshot(pending, raw, result)
         return result
+
+    def _attach_snapshot(self, pending: _PendingCall, raw: Dict[str, Any],
+                         result: Dict[str, Any]) -> None:
+        """Read the render the runtime asked for, write image + thumbnail files,
+        honour save_path, and delete the temp TGA (spec 2d Snapshot, 2c).
+
+        The runtime reads and deletes ONLY ``pending.snapshot_path``; a posted
+        ``snapshot_file`` naming any other path is rejected and left alone (S11).
+        """
+        expected = pending.snapshot_path
+        posted = str(raw.get("snapshot_file") or "")
+        try:
+            if posted and os.path.realpath(posted) != os.path.realpath(expected):
+                logger.warning("rejected snapshot_file %r (expected %r)", posted, expected)
+                result["ok"] = False
+                result["error"] = "snapshot file rejected: not the path the runtime chose"
+                return
+            if not result["ok"]:
+                return
+            png = read_image_as_png_bytes(expected) if os.path.isfile(expected) else None
+            if not png:
+                result["ok"] = False
+                result["error"] = "Snapshot file missing or unreadable: %s" % expected
+                return
+            width, height = png_size(png)
+            result["image_b64"] = base64.b64encode(png).decode("ascii")
+            result["image_mime"] = "image/png"
+            image: Dict[str, Any] = {
+                "path": None,
+                "thumb_path": None,
+                "width": width,
+                "height": height,
+                "src_width": width,
+                "src_height": height,
+                "renderer": "TachyonInternal",
+            }
+            if pending.chat_dir is not None:
+                images = Path(pending.chat_dir) / "images"
+                images.mkdir(parents=True, exist_ok=True)
+                full = images / ("%s.png" % pending.call_key)
+                thumb = images / ("%s_thumb.png" % pending.call_key)
+                full.write_bytes(png)
+                thumb_png, _thumb_w, _thumb_h = make_thumbnail(png, 256, 192)
+                thumb.write_bytes(thumb_png)
+                image["path"] = str(full)
+                image["thumb_path"] = str(thumb)
+            result["image"] = image
+            note = "Snapshot rendered (%d×%d)." % (width, height)
+            save_path = str(pending.tool_input.get("save_path") or "").strip()
+            if save_path:
+                saved, message = _write_save_path(png, save_path, pending.cwd)
+                if saved is None:
+                    result["ok"] = False
+                    result["error"] = message
+                else:
+                    result["saved_path"] = saved
+                    note += " " + message
+            result["output"] = note
+        finally:
+            try:
+                if expected and os.path.isfile(expected):
+                    os.unlink(expected)
+            except OSError:
+                pass
 
     def _token_call_by_tool_call_id(self, tool_call_id: str) -> Optional[_PendingCall]:
         """Compat: an unresolved token call that a client names by tool_call_id."""
@@ -514,6 +589,48 @@ def _statements_from(raw: Dict[str, Any], ok: bool) -> Optional[Dict[str, Any]]:
         "applied": int(raw.get("statements_applied") or 0),
         "failed": failed,
     }
+
+
+def _legacy_snapshot_allowed(path: str, tool_call_id: str) -> bool:
+    """Old plugins may only post /tmp/vmdai_snap_<tool_call_id>.tga (compared after realpath)."""
+    tcid = str(tool_call_id or "")
+    if not tcid or any(ch in tcid for ch in "/\\\x00"):
+        return False
+    allowed = "/tmp/vmdai_snap_%s.tga" % tcid
+    return os.path.realpath(path) == os.path.realpath(allowed)
+
+
+def _write_save_path(png: bytes, save_path: str, cwd: str):
+    """Write the save_path deliverable (S10). Returns (absolute path, note) or (None, error).
+
+    Relative paths resolve against the session cwd. JPEG needs Pillow;
+    without it the image is written as .png and the note says so. A missing
+    directory or a '..' component is refused; nothing is ever deleted.
+    """
+    raw = os.path.expanduser(save_path)
+    if ".." in Path(raw).parts:
+        return None, "save_path must not contain '..': %s" % save_path
+    dest = raw if os.path.isabs(raw) else os.path.join(cwd or os.getcwd(), raw)
+    dest = os.path.normpath(dest)
+    parent = os.path.dirname(dest) or "."
+    if not os.path.isdir(parent):
+        return None, "save_path directory does not exist: %s" % parent
+    ext = os.path.splitext(dest)[1].lower()
+    note = ""
+    data = png
+    if ext in (".jpg", ".jpeg"):
+        jpeg = to_jpeg(png)
+        if jpeg is None:
+            dest = os.path.splitext(dest)[0] + ".png"
+            note = " (JPEG needs Pillow; saved as PNG instead.)"
+        else:
+            data = jpeg
+    try:
+        with open(dest, "wb") as fh:
+            fh.write(data)
+    except OSError as exc:
+        return None, "could not write save_path %s: %s" % (dest, exc)
+    return dest, "Saved to %s.%s" % (dest, note)
 
 
 def _format_tool_label(tool_name: str, tool_input: Dict[str, Any]) -> str:

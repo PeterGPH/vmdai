@@ -16,6 +16,7 @@ import hmac
 import json
 import logging
 import os
+import shutil
 import tempfile
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -743,6 +744,7 @@ class RuntimeApp:
                 self._cancel_active_request(state)
                 self._release_chat_lock(state)
                 self.sessions.remove(state.session_id)
+            self._drop_snapshot_dir(state.session_id)
             return {"ok": True}
 
         # ---- Chat ----
@@ -1242,6 +1244,13 @@ class RuntimeApp:
                 path = tempfile.mkdtemp(prefix="vmdai_snap_")
                 self._snapshot_dirs[session_id] = path
         return Path(path)
+
+    def _drop_snapshot_dir(self, session_id: str) -> None:
+        """Delete the per-session snapshot temp dir (it only ever holds renders)."""
+        with self._snapshot_lock:
+            path = self._snapshot_dirs.pop(session_id, None)
+        if path:
+            shutil.rmtree(path, ignore_errors=True)
 
     def _tool_timeouts(self) -> Tuple[Optional[float], Optional[float]]:
         """(tool_exec_timeout_s, cancel_grace_s) from settings.json; None = bridge default.

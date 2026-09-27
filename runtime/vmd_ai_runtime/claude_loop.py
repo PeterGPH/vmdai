@@ -3432,12 +3432,22 @@ class ClaudeToolLoop:
                     ext = "jpg"
                 elif image_mime == "image/tga":
                     ext = "tga"
+                # The product bridge renders with TachyonInternal and may have
+                # written a save_path deliverable (spec 2d); benchmark bridges
+                # return neither key, so their transcript lines are unchanged.
+                extra: Dict[str, Any] = {}
+                image = result.get("image")
+                if isinstance(image, dict):
+                    extra["renderer"] = str(image.get("renderer") or "TachyonInternal")
+                if result.get("saved_path"):
+                    extra["saved_path"] = str(result["saved_path"])
                 self.recorder.record_snapshot(
                     ok=ok,
                     purpose=purpose,
                     image_bytes=image_bytes,
                     image_ext=ext,
                     duration_ms=duration_ms,
+                    **extra,
                 )
             # search_docs is intentionally not recorded — it produces no
             # VMD state change, so replaying without it still works.

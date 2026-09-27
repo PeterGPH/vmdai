@@ -255,13 +255,16 @@ class RunRecorder:
         image_bytes: Optional[bytes] = None,
         image_ext: str = "png",
         duration_ms: float = 0.0,
+        renderer: str = "snapshot",
+        saved_path: Optional[str] = None,
     ) -> Optional[int]:
         """Record one ``capture_vmd_snapshot`` tool call.
 
-        On success: save image_bytes to ``snapshots/turn_NN.<ext>`` and
-        emit a ``render snapshot snapshots/turn_NN.<ext>`` line to
-        ``transcript.tcl`` so replay reproduces the image file. Returns
-        the turn number.
+        On success: save image_bytes to ``snapshots/turn_NNN.<ext>`` and
+        emit a ``render <renderer> snapshots/turn_NNN.<ext>`` line to
+        ``transcript.tcl`` so replay reproduces the image file. When the
+        runtime also wrote a ``save_path`` deliverable, replay re-renders it
+        with ``render <renderer> {<saved_path>}``. Returns the turn number.
 
         On failure: count it and return None.
         """
@@ -286,7 +289,10 @@ class RunRecorder:
 
         self._current.successful_count += 1
         self._current.snapshot_count += 1
-        block = self._format_snapshot_block(turn_n, snap_name, purpose, duration_ms)
+        block = self._format_snapshot_block(
+            turn_n, snap_name, purpose, duration_ms,
+            renderer=renderer, saved_path=saved_path,
+        )
         with (self._current.dir / "transcript.tcl").open("a", encoding="utf-8") as f:
             f.write(block)
         self._flush_manifest(status="active")
@@ -323,6 +329,8 @@ class RunRecorder:
         snap_name: str,
         purpose: str,
         duration_ms: float,
+        renderer: str = "snapshot",
+        saved_path: Optional[str] = None,
     ) -> str:
         ts = _utc_iso(time.time())
         out: list[str] = []
@@ -334,8 +342,12 @@ class RunRecorder:
             for p_line in purpose.splitlines():
                 out.append(f"# purpose   : {p_line}")
         out.append(f"# saved to  : snapshots/{snap_name}")
+        if saved_path:
+            out.append(f"# save_path : {saved_path}")
         out.append("")
-        out.append(f"render snapshot snapshots/{snap_name}")
+        out.append(f"render {renderer} snapshots/{snap_name}")
+        if saved_path:
+            out.append(f"render {renderer} {{{saved_path}}}")
         out.append("")
         return "\n".join(out)
 

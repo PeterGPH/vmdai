@@ -217,9 +217,11 @@ class ToolBridgeSnapshotTests(unittest.TestCase):
         cancel = threading.Event()
 
         tga_data = _make_tga_1x1()
-        with tempfile.NamedTemporaryFile(suffix=".tga", delete=False) as f:
+        # Tokenless sessions may only use the path the old plugin builds
+        # (spec 2d Snapshot): /tmp/vmdai_snap_<tool_call_id>.tga
+        tga_path = "/tmp/vmdai_snap_tc_snap.tga"
+        with open(tga_path, "wb") as f:
             f.write(tga_data)
-            tga_path = f.name
 
         try:
             def resolve_later():
@@ -264,7 +266,7 @@ class ToolBridgeSnapshotTests(unittest.TestCase):
                 "ok": True,
                 "output": "Snapshot",
                 "error": "",
-                "snapshot_file": "/tmp/does_not_exist_vmdai_test.tga",
+                "snapshot_file": "/tmp/vmdai_snap_tc_snap2.tga",
             })
 
         threading.Thread(target=resolve_later, daemon=True).start()
