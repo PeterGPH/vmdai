@@ -2328,10 +2328,64 @@ def _is_stream_drop(exc: BaseException) -> bool:
 # Tool result construction
 # ---------------------------------------------------------------------------
 
+def _structured_summary(result: Dict[str, Any]) -> str:
+    """C3 model-facing text for product runs (``result_format="structured"``).
+
+    Tells the model what actually happened: blocked (C1), not executed
+    (Stop, pickup deadline, loop guard, C2 refusal), nothing run (C3
+    pre-check), outcome unknown, or which statement failed and which ones
+    are already applied in VMD.
+    """
+    ok = bool(result.get("ok", False))
+    output = str(result.get("output") or "")
+    error = str(result.get("error") or "")
+    executed = str(result.get("executed") or "yes")
+    statements = result.get("statements") or {}
+    failed = statements.get("failed") or None
+    if result.get("blocked"):
+        return error or "Not run: blocked by ChatVMD."
+    if executed == "no":
+        if error.startswith("Nothing was run"):
+            if failed and failed.get("text"):
+                return "%s\nIncomplete statement: `%s`" % (error, failed["text"])
+            return error
+        if error == "cancelled":
+            return "not executed: request stopped"
+        if error.lower().startswith("not executed"):
+            return error
+        return "not executed: %s" % (error or "unknown reason")
+    if executed == "unknown":
+        return error or "stopped while running; outcome unknown"
+    if ok:
+        return output if output else "Command executed successfully."
+    if failed and statements.get("total"):
+        total = int(statements["total"])
+        applied = int(statements.get("applied") or 0)
+        index = int(failed.get("index") or applied + 1)
+        lines = ["Failed at statement %d of %d: `%s`" % (index, total, failed.get("text") or "")]
+        lines.append("Error: %s" % (error or "unknown error"))
+        if failed.get("error_info"):
+            lines.append(str(failed["error_info"]))
+        if applied == 0:
+            lines.append("No statements were applied.")
+        elif applied == 1:
+            lines.append("Statement 1 was applied and is still in effect; do not re-run it.")
+        else:
+            lines.append(
+                "Statements 1–%d were applied and are still in effect; "
+                "do not re-run them." % applied
+            )
+        if output:
+            lines.append("Output before the error:\n%s" % output)
+        return "\n".join(lines)
+    return ("Error: %s" % error) if error else "Command failed with unknown error."
+
+
 def _build_tool_result_block(
     tool_use_id: str,
     result: Dict[str, Any],
     include_image: bool,
+    result_format: str = "legacy",
 ) -> Dict:
     """
     Build an Anthropic tool_result content block from the tool bridge result dict.
@@ -2339,6 +2393,10 @@ def _build_tool_result_block(
     For capture_vmd_snapshot results that include image_b64, the image is
     embedded as a base64 content block (only when include_image=True, i.e.
     when calling Anthropic directly).
+
+    ``result_format="structured"`` (product runs only; C3) replaces the
+    plain ``Error: ...`` text with :func:`_structured_summary`. The default
+    ``"legacy"`` keeps today's text byte-for-byte (options=None / S7).
     """
     ok = bool(result.get("ok", False))
     output = str(result.get("output") or "")
@@ -2346,7 +2404,9 @@ def _build_tool_result_block(
     image_b64 = str(result.get("image_b64") or "")
     image_mime = str(result.get("image_mime") or "image/png")
 
-    if ok:
+    if result_format == "structured":
+        summary = _structured_summary(result)
+    elif ok:
         summary = output if output else "Command executed successfully."
     else:
         summary = f"Error: {error}" if error else "Command failed with unknown error."
@@ -2659,6 +2719,13 @@ class ClaudeToolLoop:
         if options is not None and options.tool_overrides:
             tools = _apply_tool_overrides(tools, options.tool_overrides)
         return tools
+
+    def _result_format(self) -> str:
+        """C3: "structured" for product runs, "legacy" (today's text) otherwise."""
+        options = getattr(self, "options", None)
+        if options is None:
+            return "legacy"
+        return str(getattr(options, "result_format", "legacy") or "legacy")
 
     # ------------------------------------------------------------------
     # Wiki tool dispatchers
@@ -3340,6 +3407,7 @@ class ClaudeToolLoop:
                             tool_use_id=tool_id,
                             result=result,
                             include_image=self._vision_enabled(),
+                            result_format=self._result_format(),
                         )
                     )
                     result_keys.append(call_key)
@@ -3412,12 +3480,28 @@ class ClaudeToolLoop:
                 command = str(tool_input.get("command") or "")
                 rationale = str(tool_input.get("rationale") or "")
                 ok = bool(result.get("ok", False))
-                self.recorder.record_vmd_command(
-                    command,
-                    ok=ok,
-                    rationale=rationale,
-                    duration_ms=duration_ms,
-                )
+                statements = result.get("statements") or {}
+                failed = statements.get("failed") or {}
+                applied_text = str(result.get("applied_text") or "")
+                if not ok and applied_text and failed.get("index"):
+                    # C3 partial failure: statements 1..applied are in effect.
+                    self.recorder.record_vmd_command(
+                        command,
+                        ok=False,
+                        rationale=rationale,
+                        duration_ms=duration_ms,
+                        applied_text=applied_text,
+                        failed_index=int(failed["index"]),
+                        total=int(statements.get("total") or 0),
+                        error=str(result.get("error") or ""),
+                    )
+                else:
+                    self.recorder.record_vmd_command(
+                        command,
+                        ok=ok,
+                        rationale=rationale,
+                        duration_ms=duration_ms,
+                    )
             elif tool_name == "capture_vmd_snapshot":
                 purpose = str(tool_input.get("purpose") or "")
                 ok = bool(result.get("ok", False))

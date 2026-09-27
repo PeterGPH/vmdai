@@ -218,12 +218,23 @@ class RunRecorder:
         ok: bool,
         rationale: str = "",
         duration_ms: float = 0.0,
+        applied_text: Optional[str] = None,
+        failed_index: Optional[int] = None,
+        total: Optional[int] = None,
+        error: Optional[str] = None,
     ) -> Optional[int]:
         """Record one ``run_vmd_command`` tool call.
 
         Returns the 1-based turn number on success, ``None`` if no task
         is active or the call failed (failed commands are counted in
-        the manifest but never written to transcript.tcl).
+        the manifest and never written as runnable Tcl).
+
+        A partial failure (C3: ``ok=False`` with a non-empty
+        ``applied_text``, the exact source of statements 1..applied)
+        writes that applied prefix, which is still in effect in VMD,
+        followed by a comment naming the failed statement and the
+        unapplied rest commented out line by line. Without
+        ``applied_text`` a failed call writes nothing, as before.
         """
         if self._current is None:
             return None
@@ -233,6 +244,13 @@ class RunRecorder:
 
         if not ok:
             self._current.failed_count += 1
+            if applied_text:
+                block = self._format_partial_block(
+                    turn_n, command, rationale, duration_ms,
+                    applied_text, failed_index, total, error,
+                )
+                with (self._current.dir / "transcript.tcl").open("a", encoding="utf-8") as f:
+                    f.write(block)
             self._flush_manifest(status="active")
             return None
 
@@ -320,6 +338,48 @@ class RunRecorder:
                 out.append(f"# rationale : {r_line}")
         out.append("")
         out.append(command.rstrip())
+        out.append("")
+        return "\n".join(out)
+
+    def _format_partial_block(
+        self,
+        turn_n: int,
+        command: str,
+        rationale: str,
+        duration_ms: float,
+        applied_text: str,
+        failed_index: Optional[int],
+        total: Optional[int],
+        error: Optional[str],
+    ) -> str:
+        """C3: the applied prefix, then the failed/unapplied rest as comments
+        (the same rule as the panel's Save .tcl export)."""
+        ts = _utc_iso(time.time())
+        first_error = (str(error or "").strip().splitlines() or ["error"])[0]
+        idx = int(failed_index or 0)
+        tot = int(total or 0)
+        if idx and tot and idx < tot:
+            span = f"statements {idx}–{tot} were not applied"
+        elif idx:
+            span = f"statement {idx} was not applied"
+        else:
+            span = "the rest was not applied"
+        out: list[str] = []
+        out.append("")
+        out.append(f"# --- turn {turn_n:02d} | {ts} | {duration_ms:.0f}ms | partial ---")
+        if rationale:
+            for r_line in rationale.splitlines():
+                out.append(f"# rationale : {r_line}")
+        out.append("")
+        out.append(applied_text.rstrip())
+        out.append(f"# statement {idx} of {tot} failed ({first_error}); {span}:")
+        rest = command[len(applied_text):] if command.startswith(applied_text) else command
+        for r_line in rest.strip("\n").splitlines():
+            # A trailing odd backslash would continue the comment onto the
+            # next line; a following space stops that.
+            if (len(r_line) - len(r_line.rstrip("\\"))) % 2 == 1:
+                r_line += " "
+            out.append(f"# {r_line}")
         out.append("")
         return "\n".join(out)
 
