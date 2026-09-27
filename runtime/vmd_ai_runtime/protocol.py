@@ -124,6 +124,15 @@ def _as_profile_name(value: Any) -> str:
     return text
 
 
+def _as_profile_key(value: Any) -> str:
+    """A required profile name: 1-64 letters, digits, '.', '_' or '-' (profiles.*)."""
+    text = _as_str(value, "name")
+    if not _PROFILE_NAME_RE.match(text):
+        raise RpcError("INVALID_PARAMS", "name must be 1-64 letters, digits, '.', '_' or '-'",
+                       {"name": text[:80]})
+    return text
+
+
 def validate_rpc_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     body = _as_dict(payload)
     method = _as_str(body.get("method"), "method")
@@ -328,6 +337,31 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
             "provider": _as_str(p.get("provider") or "", "provider", required=False),
             "base_url": _as_base_url(p.get("base_url")),
             "model": _as_str(p.get("model") or "", "model", required=False),
+        }
+
+    # ---- profiles.* (§3; the M2 settings dialog; token sessions only, checked in app.py) ----
+
+    if method == "profiles.list":
+        return {"session_id": _as_str(p.get("session_id"), "session_id")}
+
+    if method in ("profiles.delete", "profiles.activate"):
+        return {
+            "session_id": _as_str(p.get("session_id"), "session_id"),
+            "name": _as_profile_key(p.get("name")),
+        }
+
+    if method == "profiles.save":
+        profile = p.get("profile")
+        if not isinstance(profile, dict):
+            raise RpcError("INVALID_PARAMS", "profile must be an object")
+        activate = p.get("activate", False)
+        if not isinstance(activate, bool):
+            raise RpcError("INVALID_PARAMS", "activate must be true or false")
+        return {
+            "session_id": _as_str(p.get("session_id"), "session_id"),
+            "name": _as_profile_key(p.get("name")),
+            "profile": profile,
+            "activate": activate,
         }
 
     raise RpcError("METHOD_NOT_FOUND", f"Unknown method: {method}")

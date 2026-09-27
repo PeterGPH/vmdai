@@ -757,6 +757,58 @@ class RuntimeApp:
             "capabilities": self._capabilities_for(saved),
         }
 
+    def _profiles_rpc(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """profiles.list / save / delete / activate (§3; the M2 settings dialog).
+
+        Changes apply to the next request. chat.send builds each request's
+        loop from the active profile (P03-T08), so a running request keeps
+        the loop it started with.
+        """
+        store = self.settings_store
+        if store is None:
+            raise RpcError("INVALID_PARAMS", "this runtime does not manage ~/.vmdai/settings.json",
+                           {"reason": "no_settings_store"})
+        try:
+            if method == "profiles.list":
+                data = store.load()
+                return {
+                    "active": data.get("active"),
+                    "profiles": store.list_profiles(),
+                    "settings_source": store.settings_source,
+                }
+            name = params["name"]
+            if method == "profiles.delete":
+                store.delete_profile(name)                 # IN_USE for the active profile
+                return {"ok": True}
+            if method == "profiles.activate":
+                store.activate(name)
+                return {"ok": True, "capabilities": self._capabilities_for(store.get_profile(name) or {})}
+            profile = self._keep_num_ctx(store.get_profile(name), params["profile"])
+            saved = store.save_profile(name, profile, activate=bool(params.get("activate")))
+            return {"ok": True, "capabilities": self._capabilities_for(saved)}
+        except SettingsError as exc:
+            raise self._settings_rpc_error(exc)
+
+    @staticmethod
+    def _keep_num_ctx(existing: Optional[Dict[str, Any]], profile: Dict[str, Any]) -> Dict[str, Any]:
+        """C7 Model change: replacing a same-provider profile keeps its stored
+        options.num_ctx unless the new profile sets one (changing num_ctx
+        reloads the model on the server)."""
+        out = dict(profile)
+        if not isinstance(existing, dict):
+            return out
+        if normalize_provider(existing.get("provider")) != normalize_provider(out.get("provider")):
+            return out
+        stored = (existing.get("options") or {}).get("num_ctx")
+        options = out.get("options")
+        if options is None:
+            options = {}
+        if stored is not None and isinstance(options, dict) and "num_ctx" not in options:
+            options = dict(options)
+            options["num_ctx"] = stored
+            out["options"] = options
+        return out
+
     # ------------------------------------------------------------------
     # RPC dispatch
     # ------------------------------------------------------------------
@@ -1377,6 +1429,13 @@ class RuntimeApp:
                 self._require_auth(state)
             provider_name, base_url, model, api_key = self._catalog_target(state, params)
             return provider_catalog.test_provider(provider_name, base_url, model, api_key=api_key)
+
+        # ---- Profiles (§3 RPC table; the M2 settings dialog) ----
+
+        if method in ("profiles.list", "profiles.save", "profiles.delete", "profiles.activate"):
+            state = self._get_session(params["session_id"], session_token)
+            self._require_auth(state)
+            return self._profiles_rpc(method, params)
 
         raise RpcError("METHOD_NOT_FOUND", f"Unknown method: {method}")
 
