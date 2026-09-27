@@ -1,0 +1,7 @@
+images 0
+001 role rolemeta | You⇥12:00 AM
+002 user | how many atoms does 1hck have?
+003 think | Thought for 7 s ▸
+005 think | Thought for 5 s ▸
+007 rule | <rule>
+008 prose | 1hck has 2442 atoms.

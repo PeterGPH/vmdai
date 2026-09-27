@@ -1,0 +1,11 @@
+images 0
+001 role rolemeta | You⇥12:00 AM
+002 user | load 1hck and show it as a cartoon
+003 prose | I'll load 1hck and show it as a cartoon.
+004 prose | `display backgroundcolor` does not exist; the color command alone is enough.
+005 rule | <rule>
+006 prose | Loaded **1hck** as a cartoon on a white background.
+007 role rolemeta | You⇥12:00 AM
+008 user | what is its radius of gyration?
+009 rule | <rule>
+010 prose | The radius of gyration is 20.84 Å.
