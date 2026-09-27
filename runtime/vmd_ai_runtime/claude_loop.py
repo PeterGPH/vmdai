@@ -1001,6 +1001,39 @@ def _ollama_preflight(
         on_meta({"kind": "model_digest", "value": str(entry["digest"])})
 
 
+# Per-(base_url, model) memo of servers that answered HTTP 400 to "think"
+# (spec 2f). Module-level so it outlives the per-request loop; tests clear it.
+_NO_THINK: set = set()
+_NO_THINK_LOCK = threading.Lock()
+
+
+def _think_key(base_url: str, model: str) -> Tuple[str, str]:
+    return (str(base_url or "").rstrip("/"), str(model or ""))
+
+
+def _think_disabled(base_url: str, model: str) -> bool:
+    with _NO_THINK_LOCK:
+        return _think_key(base_url, model) in _NO_THINK
+
+
+def _remember_no_think(base_url: str, model: str) -> None:
+    with _NO_THINK_LOCK:
+        _NO_THINK.add(_think_key(base_url, model))
+
+
+def _ollama_body_options(opts: Any) -> Dict[str, Any]:
+    """The /api/chat ``options`` object on the options path: num_ctx from the
+    profile (LoopOptions.product() fills 32768 when the profile has none,
+    C7; a bare LoopOptions() keeps 8192), temperature and seed only when
+    set. No environment reads."""
+    options: Dict[str, Any] = {"num_ctx": int(opts.num_ctx) if opts.num_ctx else 8192}
+    if opts.temperature is not None:
+        options["temperature"] = float(opts.temperature)
+    if opts.seed is not None:
+        options["seed"] = int(opts.seed)
+    return options
+
+
 def _stream_anthropic_direct(
     messages: List[Dict],
     model: str,
@@ -1325,7 +1358,11 @@ def _ollama_tools(tools: List[Dict]) -> List[Dict]:
     return out
 
 
-def _to_ollama_messages(messages: List[Dict]) -> List[Dict]:
+def _to_ollama_messages(
+    messages: List[Dict],
+    *,
+    tool_name: bool = False,
+) -> List[Dict]:
     """Convert internal Anthropic-style messages to Ollama format.
 
     Ollama's ``/api/chat`` accepts an OpenAI-ish message list with
@@ -1340,8 +1377,13 @@ def _to_ollama_messages(messages: List[Dict]) -> List[Dict]:
       * Images in ``tool_result`` are dropped (Ollama vision models
         accept images differently; we keep this path text-only for
         now and surface a text marker instead).
+
+    tool_name (LoopOptions.ollama_tool_name) adds the name of the tool that
+    produced each ``role=tool`` message, looked up from the earlier
+    assistant ``tool_use`` block with the same id.
     """
     out: List[Dict] = []
+    names_by_id: Dict[str, str] = {}
     for msg in messages:
         role = msg["role"]
         content = msg["content"]
@@ -1363,6 +1405,7 @@ def _to_ollama_messages(messages: List[Dict]) -> List[Dict]:
             if btype == "text":
                 text_parts.append(str(block.get("text") or ""))
             elif btype == "tool_use":
+                names_by_id[str(block.get("id", ""))] = str(block.get("name", ""))
                 tool_calls.append({
                     "id": block.get("id", ""),
                     "type": "function",
@@ -1386,11 +1429,14 @@ def _to_ollama_messages(messages: List[Dict]) -> List[Dict]:
                         else:
                             parts.append(str(b.get("text") or ""))
                     tc_content = " ".join(p for p in parts if p)
-                tool_results.append({
+                entry: Dict[str, Any] = {
                     "role": "tool",
                     "tool_call_id": block.get("tool_use_id", ""),
                     "content": str(tc_content),
-                })
+                }
+                if tool_name and names_by_id.get(str(block.get("tool_use_id", ""))):
+                    entry["tool_name"] = names_by_id[str(block.get("tool_use_id", ""))]
+                tool_results.append(entry)
             # ``image`` blocks at top level are dropped — Ollama's
             # vision path requires multipart images on the user msg,
             # which we don't use here.
@@ -1604,6 +1650,7 @@ def _stream_ollama(
     on_meta: Optional[Callable[[Dict[str, Any]], None]] = None,
     opts: Optional[LoopOptions] = None,
     tool_mode: Optional[str] = None,
+    _no_think_retry: bool = False,
 ) -> Tuple[str, List[Dict]]:
     """Stream one turn from Ollama's ``/api/chat`` with tool support.
 
@@ -1624,29 +1671,37 @@ def _stream_ollama(
     ol_messages: List[Dict] = []
     if system_prompt:
         ol_messages.append({"role": "system", "content": system_prompt})
-    ol_messages.extend(_to_ollama_messages(messages))
+    if opts is None:
+        ol_messages.extend(_to_ollama_messages(messages))
+    else:
+        ol_messages.extend(
+            _to_ollama_messages(messages, tool_name=bool(opts.ollama_tool_name))
+        )
 
     tools_list = list(tools) if tools is not None else VMD_TOOLS
-    options: Dict[str, Any] = {
-        # Bigger context so multi-turn tool-calling sessions don't
-        # rotate the agent's prior reasoning out of the window.
-        "num_ctx": 8192,
-    }
-    # Temperature / seed pass-through. Read at request time (not loop
-    # construction) so a wrapper script can set them between trials —
-    # this is how the seed-bench plan gets independent runs.
-    _temp_env = os.getenv("VMD_AI_TEMPERATURE")
-    if _temp_env:
-        try:
-            options["temperature"] = float(_temp_env)
-        except ValueError:
-            pass
-    _seed_env = os.getenv("VMD_AI_SEED")
-    if _seed_env:
-        try:
-            options["seed"] = int(_seed_env)
-        except ValueError:
-            pass
+    if opts is None:
+        options: Dict[str, Any] = {
+            # Bigger context so multi-turn tool-calling sessions don't
+            # rotate the agent's prior reasoning out of the window.
+            "num_ctx": 8192,
+        }
+        # Temperature / seed pass-through. Read at request time (not loop
+        # construction) so a wrapper script can set them between trials —
+        # this is how the seed-bench plan gets independent runs.
+        _temp_env = os.getenv("VMD_AI_TEMPERATURE")
+        if _temp_env:
+            try:
+                options["temperature"] = float(_temp_env)
+            except ValueError:
+                pass
+        _seed_env = os.getenv("VMD_AI_SEED")
+        if _seed_env:
+            try:
+                options["seed"] = int(_seed_env)
+            except ValueError:
+                pass
+    else:
+        options = _ollama_body_options(opts)
     body: Dict[str, Any] = {
         "model": model,
         "messages": ol_messages,
@@ -1654,6 +1709,15 @@ def _stream_ollama(
         "tools": _ollama_tools(tools_list),
         "options": options,
     }
+    if opts is not None:
+        if opts.keep_alive is not None:
+            body["keep_alive"] = opts.keep_alive
+        if (
+            opts.think is not None
+            and not _no_think_retry
+            and not _think_disabled(base_url, model)
+        ):
+            body["think"] = opts.think
 
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/api/chat",
@@ -1718,7 +1782,22 @@ def _stream_ollama(
                 cause, urllib.error.HTTPError
             ):
                 raise _ollama_unreachable_error(base_url, cause, opts) from cause
-            if _http_status_of(exc) == 404:
+            status = _http_status_of(exc)
+            if status == 400 and "think" in body and not _no_think_retry:
+                _remember_no_think(base_url, model)
+                if on_meta is not None:
+                    on_meta({
+                        "kind": "status",
+                        "phase": "think_unsupported",
+                        "message": f"{model} does not support thinking; continuing without it.",
+                    })
+                return _stream_ollama(
+                    messages=messages, model=model, system_prompt=system_prompt,
+                    base_url=base_url, timeout=timeout, on_text=on_text,
+                    should_cancel=should_cancel, tools=tools, on_meta=on_meta,
+                    opts=opts, tool_mode=tool_mode, _no_think_retry=True,
+                )
+            if status == 404:
                 # On /api/chat a 404 always means the model is not pulled;
                 # plan 02's generic "Choose a model..." hint is replaced.
                 exc.hint = f"ollama pull {model}"
