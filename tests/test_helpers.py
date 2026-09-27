@@ -32,7 +32,10 @@ class RuntimeHarness:
         try:
             self.server = create_server(self.app, host="127.0.0.1", port=get_free_port())
             self.port = int(self.server.server_port)
-            self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+            # stop() waits for serve_forever to notice shutdown(); the default
+            # 0.5 s poll made every stop that slow.
+            self.thread = threading.Thread(target=self.server.serve_forever,
+                                           kwargs={"poll_interval": 0.05}, daemon=True)
         except OSError:
             # Some CI/sandbox environments deny local socket binds.
             self.inprocess = True
