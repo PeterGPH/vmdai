@@ -7,15 +7,20 @@ from typing import List
 import pytest
 
 from helpers import tk
-from helpers.tcl import REPO, TclTestResult
+from helpers.tcl import REPO, TclTestResult, module_result, module_run
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_ui_min.tcl"
 TOTAL = 6
 
 
-@pytest.fixture(scope="module")
-def result() -> TclTestResult:
+@module_run
+def _run(tmp_path_factory) -> TclTestResult:
     return tk.run_tk_test(str(TCL_FILE))
+
+
+@pytest.fixture(scope="module")
+def result(request) -> TclTestResult:
+    return module_result(request)
 
 
 def _assert_passed(result: TclTestResult, names: List[str]) -> None:

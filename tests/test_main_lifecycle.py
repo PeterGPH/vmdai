@@ -15,6 +15,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from helpers.runtime_fixture import make_app, serve_app
+
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "runtime" / "main.py"
 READY = "VMDAI_READY "
@@ -160,6 +162,31 @@ def test_runtime_shutdown_rpc_exits_within_2s(tmp_path):
         _stop(proc)
 
 
+def test_runtime_shutdown_reply_is_sent_before_the_shutdown_hook(tmp_path):
+    """The {ok: true} reply is on the wire before on_shutdown runs.
+
+    main.py's hook ends the process and request threads are daemons, so a
+    hook that ran before the write could cut the reply off (the
+    IncompleteRead flake in the test above). This hook freezes its thread,
+    as process exit would: the client gets the reply only if it came first.
+    """
+    token = "ab" * 16
+    called, release = threading.Event(), threading.Event()
+
+    def _freeze():
+        called.set()
+        release.wait(10)
+
+    app = make_app(tmp_path, launch_token=token, on_shutdown=_freeze)
+    try:
+        with serve_app(app) as port:
+            reply = _rpc(port, "runtime.shutdown", {"launch_token": token})
+            assert reply["result"] == {"ok": True}
+            assert called.wait(2), "on_shutdown never ran"
+    finally:
+        release.set()
+
+
 def test_sigterm_exits_within_2s(tmp_path):
     """S4: SIGTERM exits within 2 s (the old handler deadlocked)."""
     proc = _spawn(tmp_path, "--announce")
@@ -292,13 +319,17 @@ def test_stdin_eof_exits_within_2s(tmp_path):
     try:
         _ready(proc)
         _ready(other)
+        # Without --watch-stdin, EOF on stdin is ignored. Close other's stdin
+        # first so its 0.5 s check overlaps proc's exit instead of following it.
+        other.stdin.close()
+        other_closed = time.monotonic()
         started = time.monotonic()
         proc.stdin.close()
         proc.wait(timeout=10)
         assert time.monotonic() - started < 2.0
         assert proc.returncode == 0
-        other.stdin.close()  # without --watch-stdin, EOF on stdin is ignored
-        time.sleep(0.5)
+        time.sleep(max(0.0, 0.5 - (time.monotonic() - other_closed)))
+        assert time.monotonic() - other_closed >= 0.5
         assert other.poll() is None
     finally:
         _stop(proc)
@@ -314,11 +345,13 @@ def test_no_announce_writes_token_file_0600_and_removes_on_exit(tmp_path):
         assert set(data) == {"port", "pid", "token", "protocol"}
         assert data["pid"] == proc.pid and data["protocol"] == 2 and len(data["token"]) == 32
         assert path.name == f"runtime-{data['port']}.json"
-        assert _readline(proc, timeout=0.5) == ""  # no READY line without --announce
         started = _rpc(data["port"], "session.start", {"cwd": str(tmp_path)})
         assert "session_id" in started["result"]  # tokenless is fine without --announce
         assert _exit_seconds(proc) < 2.0
         assert not path.exists()
+        # No READY line (nor any other stdout) without --announce, over the
+        # runtime's whole life rather than a 0.5 s window after the token file.
+        assert proc.communicate(timeout=5)[0] == b""
     finally:
         _stop(proc)
 

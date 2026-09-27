@@ -63,7 +63,10 @@ def main() -> int:
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # A short poll interval: server.shutdown() waits for serve_forever to
+    # notice, so the default 0.5 s made every stop of this stub that slow.
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                     daemon=True).start()
     if stubborn:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     else:

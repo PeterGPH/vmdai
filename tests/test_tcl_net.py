@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 import pytest
 
 from helpers.fake_rpc_server import FakeRpcServer, Recorded, Reply
-from helpers.tcl import REPO, TclTestResult, run_tcl, run_tcltest, tcl_word
+from helpers.tcl import REPO, TclTestResult, module_result, module_run, run_tcl, run_tcltest, tcl_word
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_net.tcl"
 TOTAL = 14  # every case except the http 2.9.5-only net-s8-1
@@ -53,9 +53,14 @@ def _run(**kw: Any) -> NetRun:
         return NetRun(result, list(plain.requests), list(utf8.requests))
 
 
-@pytest.fixture(scope="module")
-def net_run() -> NetRun:
+@module_run
+def _module_run(tmp_path_factory) -> NetRun:
     return _run()
+
+
+@pytest.fixture(scope="module")
+def net_run(request) -> NetRun:
+    return module_result(request)
 
 
 def _assert_passed(result: TclTestResult, names: List[str]) -> None:

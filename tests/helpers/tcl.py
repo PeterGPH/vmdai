@@ -10,6 +10,7 @@ from VMD's plugins/noarch/tcl/json1.0.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import functools
 import os
 import re
@@ -17,7 +18,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import pytest
 
@@ -264,3 +265,70 @@ def run_tcltest(
         return TclTestResult(passed=0, failed=1, skipped=0, output=output)
     _total, passed, skipped, failed = (int(g) for g in match.groups())
     return TclTestResult(passed=passed, failed=failed, skipped=skipped, output=output)
+
+
+# --- once-per-module tcltest runs, overlapped ---------------------------------
+#
+# A tcltest module's module-scoped fixture runs one subprocess that mostly
+# waits (timers, child processes, sockets). Each such module registers that
+# work with @module_run; its fixture returns module_result(request). The first
+# of these fixtures a session reaches runs every registered module that has
+# selected tests, each on its own thread, and waits for all of them; later
+# fixtures take their stored outcome. The runs overlap only each other: the
+# test thread waits meanwhile, so no test body, monkeypatch or hermetic
+# environment is active during a run, just as when each module fixture ran on
+# its own. Each run is still exactly one run per module, and an exception
+# (a failure or pytest.skip) is re-raised by that module's own fixture.
+#
+# Run bodies do execute concurrently with each other, on worker threads. A
+# run body must therefore not touch process-wide state (os.environ, the cwd,
+# signal handlers, module globals), must pass its environment to the
+# subprocess explicitly, and must use its own tmp_path_factory.mktemp prefix.
+# A module that needs per-test hermetic state or global patches keeps a
+# plain fixture instead.
+
+ModuleRun = Callable[[pytest.TempPathFactory], Any]
+
+_MODULE_RUNS: Dict[str, ModuleRun] = {}
+_MODULE_OUTCOMES: Dict[str, Tuple[bool, Any]] = {}
+
+
+def module_run(fn: ModuleRun) -> ModuleRun:
+    """Register ``fn(tmp_path_factory)`` as its module's once-per-module run."""
+    _MODULE_RUNS[fn.__module__] = fn
+    return fn
+
+
+def _outcome(fn: ModuleRun, factory: pytest.TempPathFactory) -> Tuple[bool, Any]:
+    try:
+        return True, fn(factory)
+    except BaseException as exc:  # noqa: BLE001 - pytest.skip and failures alike
+        return False, exc
+
+
+def _run_pending(request: pytest.FixtureRequest) -> None:
+    selected = {getattr(item, "module", None) for item in request.session.items}
+    selected_names = {module.__name__ for module in selected if module is not None}
+    names = [name for name in _MODULE_RUNS
+             if name not in _MODULE_OUTCOMES
+             and (name in selected_names or name == request.module.__name__)]
+    factory = request.getfixturevalue("tmp_path_factory")
+    factory.getbasetemp()  # create the base temp dir before the threads use it
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(names)),
+                                               thread_name_prefix="tcltest") as pool:
+        futures = {name: pool.submit(_outcome, _MODULE_RUNS[name], factory) for name in names}
+        for name, future in futures.items():
+            _MODULE_OUTCOMES[name] = future.result()
+
+
+def module_result(request: pytest.FixtureRequest) -> Any:
+    """The calling module's @module_run result; runs the pending ones first."""
+    name = request.module.__name__
+    if name not in _MODULE_RUNS:
+        raise RuntimeError(f"{name} has no @module_run function")
+    if name not in _MODULE_OUTCOMES:
+        _run_pending(request)
+    ok, value = _MODULE_OUTCOMES[name]
+    if not ok:
+        raise value
+    return value

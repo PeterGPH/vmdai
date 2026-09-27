@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Tuple
+from typing import Any, Callable, List, Tuple
 
 from .constants import RUNTIME_PROTOCOL, RUNTIME_VERSION
 from .errors import RpcError
@@ -100,8 +100,18 @@ class RpcRequestHandler(BaseHTTPRequestHandler):
             return
 
         session_token = self.headers.get("X-Session-Token", "")
-        result = self.server.app.handle_rpc(body, session_token=session_token)
-        self._send_json(result, status=200)
+        after_reply: List[Callable[[], None]] = []
+        result = self.server.app.handle_rpc(body, session_token=session_token,
+                                            after_reply=after_reply)
+        try:
+            self._send_json(result, status=200)
+            self.wfile.flush()
+        finally:
+            # Only now may runtime.shutdown start the exit: this thread is a
+            # daemon, so an earlier exit could cut the reply off mid-write.
+            # It still runs if the client already hung up.
+            for action in after_reply:
+                action()
 
     def log_message(self, format, *args):
         return
