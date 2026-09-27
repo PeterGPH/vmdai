@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "recorded_at": "2026-09-24T00:00:00Z",
+    "provider": "openai-compatible",
+    "server_version": "vllm (synthetic)",
+    "model": "qwen3-32b",
+    "model_digest": null,
+    "synthetic": true
+  },
+  "exchanges": [
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "request_sha256": "",
+      "status": 200,
+      "content_type": "text/event-stream",
+      "body_lines": [
+        "data: {\"id\":\"chatcmpl-syn1\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3-32b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"The user asks for \"},\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-syn1\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3-32b\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"the chain count.\"},\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-syn1\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3-32b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The structure has \"},\"finish_reason\":null}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-syn1\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3-32b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"one chain.\"},\"finish_reason\":\"stop\"}]}",
+        "",
+        "data: {\"id\":\"chatcmpl-syn1\",\"object\":\"chat.completion.chunk\",\"model\":\"qwen3-32b\",\"choices\":[],\"usage\":{\"prompt_tokens\":812,\"completion_tokens\":24,\"total_tokens\":836}}",
+        "",
+        "data: [DONE]",
+        ""
+      ]
+    }
+  ]
+}
