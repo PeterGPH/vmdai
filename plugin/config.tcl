@@ -10,6 +10,7 @@ namespace eval ::vmdai::config {
     variable poll_ms 250
     variable ready_timeout_ms 20000
     variable shutdown_kill_ms 1500
+    variable respawn_reset_ms 60000
 
     # plugin.json defaults (spec 2f Files).
     variable plugin_defaults [dict create version 1 python "" appearance system \

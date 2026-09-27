@@ -12,7 +12,7 @@ import pytest
 from helpers.tcl import REPO, TclTestResult, run_tcltest
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_executor.tcl"
-TOTAL = 15
+TOTAL = 16
 
 
 @pytest.fixture(scope="module")
@@ -36,6 +36,10 @@ def test_puts_captured(result):
 
 def test_puts_variants(result):
     _assert_passed(result, ["exec-puts-2", "exec-puts-3"])
+
+
+def test_executing_reset_when_puts_cannot_be_captured(result):
+    _assert_passed(result, ["exec-puts-4"])
 
 
 def test_code_2_is_success(result):

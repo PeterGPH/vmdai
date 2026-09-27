@@ -103,6 +103,15 @@ test exec-puts-3 {puts is restored even when the model's Tcl renames it} -setup 
         [info commands ::vmdai::executor::_real_puts]
 } -cleanup { catch {rename ::gone {}} } -result {true 1 {}}
 
+test exec-puts-4 {a puts that cannot be captured resets executing instead of sticking} -setup fresh -body {
+    rename ::puts ::saved_puts
+    set r [::vmdai::executor::exec_command "set x 1"]
+    list [dict get $r executed] $::vmdai::executor::executing
+} -cleanup {
+    if {[llength [info commands ::saved_puts]]} { rename ::saved_puts ::puts }
+    fresh
+} -result {no 0}
+
 test exec-code2-1 {catch codes 0 and 2 count as success} -setup fresh -body {
     set r [run_cmd "set a 1\nreturn 7\nset b 2"]
     set brk [run_cmd "break"]

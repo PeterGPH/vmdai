@@ -87,6 +87,29 @@ proc ::installer::find_block {data} {
     return [list $first $last]
 }
 
+# Follow symlinks by hand (no -readlink primitive Tcl 8.5 can rely on for
+# every case): a dotfiles-managed ~/.vmdrc is often a link, and the installer
+# must read and write its target, not replace the link with a regular file.
+proc ::installer::resolve_link {path} {
+    set hops 0
+    while {[catch {file type $path} t] == 0 && $t eq "link"} {
+        set path [file join [file dirname $path] [file readlink $path]]
+        incr hops
+        if {$hops > 32} {
+            error "too many levels of symbolic links: $path"
+        }
+    }
+    return $path
+}
+
+# $vmdrc as it should read in a message: with a note when it is a link.
+proc ::installer::_named {vmdrc target} {
+    if {$target ne $vmdrc} {
+        return "$vmdrc (a link to $target)"
+    }
+    return $vmdrc
+}
+
 proc ::installer::confirm {question} {
     puts -nonewline "$question \[y/N\] "
     flush stdout
@@ -123,11 +146,13 @@ proc ::installer::main {argv} {
         }
     }
     set vmdrc [file normalize $vmdrc]
-    set old [read_bytes $vmdrc]
+    set target [resolve_link $vmdrc]
+    set name [_named $vmdrc $target]
+    set old [read_bytes $target]
     lassign [find_block $old] first last
     if {$uninstall} {
         if {$first < 0} {
-            puts "ChatVMD is not installed in $vmdrc; nothing changed."
+            puts "ChatVMD is not installed in $name; nothing changed."
             return 0
         }
         set before [string range $old 0 [expr {$first - 1}]]
@@ -136,7 +161,7 @@ proc ::installer::main {argv} {
             set before [string range $before 0 end-1]
         }
         set new "$before[string range $old [expr {$last + 1}] end]"
-        puts "ChatVMD will remove its block from $vmdrc."
+        puts "ChatVMD will remove its block from $name."
         if {$dry} {
             return 0
         }
@@ -144,12 +169,12 @@ proc ::installer::main {argv} {
             puts "Nothing changed."
             return 1
         }
-        if {[string trim $new] eq ""} {
+        if {[string trim $new] eq "" && $target eq $vmdrc} {
             file delete $vmdrc
-            puts "Removed ChatVMD from $vmdrc (the file only held ChatVMD, so it was deleted)."
+            puts "Removed ChatVMD from $name (the file only held ChatVMD, so it was deleted)."
         } else {
-            write_bytes $vmdrc $new
-            puts "Removed ChatVMD from $vmdrc."
+            write_bytes $target $new
+            puts "Removed ChatVMD from $name."
         }
         return 0
     }
@@ -157,13 +182,13 @@ proc ::installer::main {argv} {
         puts stderr "No pkgIndex.tcl in $plugin_dir; pass --plugin-dir with the ChatVMD plugin folder."
         return 1
     }
-    set exists [file exists $vmdrc]
+    set exists [file exists $target]
     if {$first >= 0} {
         set current [string range $old $first $last]
         set with_defaults [expr {[string first $defaults_line $current] >= 0}]
         set block [block $plugin_dir $with_defaults]
         if {$current eq $block} {
-            puts "ChatVMD is already installed in $vmdrc; nothing changed."
+            puts "ChatVMD is already installed in $name; nothing changed."
             return 0
         }
         set new "[string range $old 0 [expr {$first - 1}]]$block[string range $old [expr {$last + 1}] end]"
@@ -178,7 +203,7 @@ proc ::installer::main {argv} {
         }
         set new "$old$sep$block"
     }
-    puts "ChatVMD will add these lines to $vmdrc:\n"
+    puts "ChatVMD will add these lines to $name:\n"
     puts [encoding convertfrom utf-8 $block]
     if {$dry} {
         return 0
@@ -188,10 +213,10 @@ proc ::installer::main {argv} {
         return 1
     }
     if {$exists && ![file exists "$vmdrc.vmdai-backup"]} {
-        file copy $vmdrc "$vmdrc.vmdai-backup"
+        file copy $target "$vmdrc.vmdai-backup"
     }
-    write_bytes $vmdrc $new
-    puts "Installed ChatVMD in $vmdrc. Start VMD and open Extensions > VMD AI."
+    write_bytes $target $new
+    puts "Installed ChatVMD in $name. Start VMD and open Extensions > VMD AI."
     return 0
 }
 

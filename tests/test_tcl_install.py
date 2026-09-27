@@ -38,13 +38,21 @@ def _handler():
 
 
 @pytest.fixture(scope="module")
-def init_run(tmp_path_factory) -> TclTestResult:
+def init_session(tmp_path_factory):
     home = tmp_path_factory.mktemp("init") / "home"
     home.mkdir()
     with FakeRpcServer(_handler()) as fake:
         write_token_file(fake.port, 4242, TOKEN, 2, home=str(home))
-        return run_tcltest(str(TCL_FILE), env={"HOME": str(home),
-                                               "VMDAI_ATTACH_PORT": str(fake.port)})
+        result = run_tcltest(str(TCL_FILE), env={"HOME": str(home),
+                                                  "VMDAI_ATTACH_PORT": str(fake.port)})
+        started = [f"sess_{n}" for n in range(1, len(fake.calls("session.start")) + 1)]
+        stopped = [c.params.get("session_id") for c in fake.calls("session.stop")]
+    return result, started, stopped
+
+
+@pytest.fixture(scope="module")
+def init_run(init_session) -> TclTestResult:
+    return init_session[0]
 
 
 def _assert_passed(result: TclTestResult, names: List[str]) -> None:
@@ -67,6 +75,13 @@ def test_menu_path_vmd_ai(init_run):
 
 def test_reload_twice_after_info_empty(init_run):
     _assert_passed(init_run, ["init-reload-1", "init-stop-1"])
+
+
+def test_every_attached_session_is_stopped(init_session):
+    result, started, stopped = init_session
+    assert len(started) == 5, result.output
+    assert len(stopped) == 5, result.output
+    assert set(stopped) == set(started), result.output
 
 
 # --- installer ------------------------------------------------------------------
@@ -133,6 +148,32 @@ def test_installer_asks_first(tmp_path):
     assert dry.returncode == 0 and vmdrc.read_text(encoding="utf-8") == "menu main on\n"
     accepted = _install(vmdrc, answer="y\n")
     assert accepted.returncode == 0 and BEGIN in vmdrc.read_text(encoding="utf-8")
+
+
+def test_installer_writes_through_a_symlinked_vmdrc(tmp_path):
+    """A dotfiles-managed ~/.vmdrc (a symlink) keeps being a symlink; its
+    real target is edited and backed up by content, never replaced (Minor 5)."""
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    real = dotfiles / "vmdrc"
+    real.write_bytes(b"menu main on\n")
+    link = tmp_path / ".vmdrc"
+    link.symlink_to(Path("dotfiles") / "vmdrc")
+
+    installed = _install(link, "--yes")
+    assert installed.returncode == 0, installed.stderr
+    assert link.is_symlink()
+    content = real.read_bytes()
+    assert content.startswith(b"menu main on\n")
+    assert BEGIN.encode("utf-8") in content
+    backup = tmp_path / ".vmdrc.vmdai-backup"
+    assert not backup.is_symlink()
+    assert backup.read_bytes() == b"menu main on\n"
+
+    removed = _install(link, "--uninstall", "--yes")
+    assert removed.returncode == 0, removed.stderr
+    assert link.is_symlink()
+    assert real.read_bytes() == b"menu main on\n"
 
 
 def test_vmdrc_block_loads_the_plugin(tmp_path):

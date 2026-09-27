@@ -279,6 +279,59 @@ test bridge-recover-1 {recover: new session with the token, chat.resume, the los
         [param [lindex [calls chat.resume] 0] chat_id] [llength [calls session.start]]
 } -cleanup fresh -result {sess_3 chat_00000000000b 12 0 {{The request in progress was lost when the AI runtime restarted.}} chat_00000000000b 2}
 
+test bridge-recover-2 {a CHAT_LOCKED resume during recovery retries once and can still succeed} -setup fresh -body {
+    set ::vmdai::config::shutdown_kill_ms 0
+    set ::vmdai::bridge::recover_retry_margin_ms 0
+    started
+    set ::vmdai::bridge::chat_id chat_00000000000b
+    set ::replies(session.start) [list [list ok [dict create session_id sess_3 \
+        session_token tok_3 chat_id null]]]
+    set ::replies(chat.resume) [list {rpc_error CHAT_LOCKED {chat is locked} {}} \
+        {ok {chat_id chat_00000000000b last_seq 12}}]
+    ::vmdai::bridge::recover
+    settle 100
+    list [st chat_id] [llength [calls chat.resume]] $::notices
+} -cleanup {
+    set ::vmdai::config::shutdown_kill_ms 1500
+    set ::vmdai::bridge::recover_retry_margin_ms 250
+    fresh
+} -result {chat_00000000000b 2 {}}
+
+test bridge-recover-3 {two CHAT_LOCKED resumes give up and warn exactly once} -setup fresh -body {
+    set ::vmdai::config::shutdown_kill_ms 0
+    set ::vmdai::bridge::recover_retry_margin_ms 0
+    started
+    set ::vmdai::bridge::chat_id chat_00000000000b
+    set ::replies(session.start) [list [list ok [dict create session_id sess_3 \
+        session_token tok_3 chat_id null]]]
+    set ::replies(chat.resume) [list {rpc_error CHAT_LOCKED {chat is locked} {}} \
+        {rpc_error CHAT_LOCKED {chat is locked} {}}]
+    ::vmdai::bridge::recover
+    settle 100
+    list [st chat_id] [llength [calls chat.resume]] [llength $::notices] [lindex $::notices 0 0]
+} -cleanup {
+    set ::vmdai::config::shutdown_kill_ms 1500
+    set ::vmdai::bridge::recover_retry_margin_ms 250
+    fresh
+} -result {{} 2 1 warn}
+
+test bridge-recover-4 {a NOT_FOUND resume during recovery warns without retrying} -setup fresh -body {
+    set ::vmdai::config::shutdown_kill_ms 0
+    set ::vmdai::bridge::recover_retry_margin_ms 0
+    started
+    set ::vmdai::bridge::chat_id chat_00000000000b
+    set ::replies(session.start) [list [list ok [dict create session_id sess_3 \
+        session_token tok_3 chat_id null]]]
+    set ::replies(chat.resume) [list {rpc_error NOT_FOUND {no such chat} {}}]
+    ::vmdai::bridge::recover
+    settle 100
+    list [st chat_id] [llength [calls chat.resume]] [llength $::notices] [lindex $::notices 0 0]
+} -cleanup {
+    set ::vmdai::config::shutdown_kill_ms 1500
+    set ::vmdai::bridge::recover_retry_margin_ms 250
+    fresh
+} -result {{} 1 1 warn}
+
 test bridge-auth-1 {AUTH_FAILED on a poll asks the runtime to recover and stops the pump} -setup fresh -body {
     set ::replies(chat.events.poll) [list {rpc_error AUTH_FAILED {invalid session or token} {}}]
     started

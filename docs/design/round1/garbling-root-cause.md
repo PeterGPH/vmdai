@@ -167,10 +167,68 @@ tk_text     00c5,2192,00b0,2014,00e9
 font        -family Menlo -size 12 -weight bold -slant roman -underline 0 -overstrike 0
 ```
 
-Every line, including `tk_text` (the text actually round-tripped through a live Tk text widget) and `font` (Menlo, which has the Å/→/°/—/é glyphs), matches `sent` exactly. A screenshot of the window was attempted for the owner's visual review, but the capture tool (`screencapture -x`, full-screen) returned the whole desktop — including unrelated terminal windows from other, unrelated sessions running on this machine — and never the VMD window itself (it had not become visible in front of those windows in the ~2 s given). That image was deleted immediately without being kept, copied or examined further, since it held content this task has no business capturing; no screenshot is attached. The code-point comparison above stands in for it and is conclusive on its own.
+Every line, including `tk_text` (the text actually round-tripped through a live Tk text widget) and `font` (Menlo, which has the Å/→/°/—/é glyphs), matches `sent` exactly. No screenshot was kept; the code-point comparison above is the evidence.
 
-Cause: Not reproducible with VMD 1.9.4a57 on this Mac. Run `VMD_AI_VMD_BIN=<the other VMD the owner uses, e.g. /software/vmd-1.9.3/bin/vmd> python -m pytest tests/test_live_vmd.py -q -k unicode` there: with http older than 2.9 (Tcl 8.5) `application/json` is read as binary, so raw UTF-8 replies arrive as ISO-8859-1 mojibake.
+Cause: named and reproduced at the http layer, not the VMD 1.9.4a57 GUI. Tcl 8.5's `http` 2.7 reads any reply whose content-type is not `text/*` as binary (`http-2.7.5.tm:1007`: `$state(-binary) || ![string match -nocase text* $state(type)]`), so the pre-M1 runtime's raw UTF-8 `application/json; charset=utf-8` replies arrive one character per byte — each UTF-8 byte of a multi-byte character is read back as its own Latin-1 code point. `http` 2.9 added `http::IsBinaryContentType`, which special-cases `application/json` as text (`http-2.9.5.tm:3060`: `if {$minor in {"json" "xml" ...}} { return false }`); that is the actual reason VMD 1.9.4a57 (Tcl 8.6, http 2.9.5) shows no garbling, independent of anything the GUI does.
 
-Status: Fixed by ASCII-only JSON if that run shows `utf8_intact` false; otherwise the pre-M1 path is the remaining explanation and M1 removes both of its risky layers (raw UTF-8 on the wire, non-ASCII plugin source).
+Reproduced 2026-09-27 on this Mac, outside VMD, with a ~15-line `http.server` on `127.0.0.1:0` that answers every `GET` with `json.dumps({"text": "Å→°—é"}, ensure_ascii=False)` sent as UTF-8 bytes and `Content-Type: application/json; charset=utf-8`, and an ~8-line Tcl probe (`http::geturl <url> -query {} -type application/json`, then the code points above 127 in `http::data $token`):
+
+```text
+/usr/bin/tclsh 8.5.9, http 2.7.5 (raw UTF-8 reply):
+    00c3,0085,00e2,0086,0092,00c2,00b0,00e2,0080,0094,00c3,00a9
+tclsh8.6 8.6.14, http 2.9.8 (this Mac's newer 2.9.x; same fix as VMD's bundled
+http-2.9.5.tm, loaded via `::tcl::tm::path add
+.../VMD.app/Contents/Frameworks/Tcl.framework/Versions/8.6/Resources/tcl8/8.6`
+before `package require http`), raw UTF-8 reply:
+    00c5,2192,00b0,2014,00e9
+/usr/bin/tclsh 8.5.9, http 2.7.5, ASCII-escaped JSON (plugin/lib json 1.1.2
+decoding the `\uXXXX` escapes after http read the (all-ASCII) body):
+    00c5,2192,00b0,2014,00e9
+```
+
+The first row is byte-for-byte the UTF-8-as-Latin-1 mojibake pattern; the second and third match `sent` exactly. The third row is the M1 fix under test: because ASCII-only JSON has no byte above 0x7f, it makes no difference whether `http` reads the body as binary or as text, and the `\uXXXX` escapes are turned into the right characters by the JSON decoder instead. VMD 1.9.3, the other VMD the owner uses (on `tbgl`), embeds Tcl 8.5 and so `http` 2.7, the same version tested above.
+
+Reproduction recipe (rerun with any two free ports; do this on the scratchpad, not in `~`):
+
+```python
+# server.py <seconds-to-run>: answers every GET with the same UTF-8 JSON body.
+import http.server, json, sys, threading, time
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"text": "Å→°—é"},
+                           ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_port, flush=True)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+time.sleep(float(sys.argv[1]) if len(sys.argv) > 1 else 20)
+```
+
+```tcl
+# probe.tcl <port>: prints the code points above 127 in the decoded reply.
+package require http
+set tok [http::geturl "http://127.0.0.1:[lindex $argv 0]/rpc" \
+    -query {} -type application/json]
+set body [http::data $tok]
+http::cleanup $tok
+set out {}
+foreach ch [split $body ""] {
+    set n [scan $ch %c]
+    if {$n > 127} { lappend out [format %04x $n] }
+}
+puts [join $out ,]
+```
+
+Run `python3 server.py 30 &`, read the printed port, then `/usr/bin/tclsh probe.tcl <port>` for the 8.5.9/http-2.7.5 row, and `tclsh8.6 probe.tcl <port>` after `::tcl::tm::path add /Applications/VMD.app/Contents/Frameworks/Tcl.framework/Versions/8.6/Resources/tcl8/8.6` for the 8.6/http-2.9.x row. For the third row, point `server.py` at `ensure_ascii=True` and have the probe decode with `plugin/lib/json` (`package require json`; `dict get [::json::json2dict $body] text`) before taking code points.
+
+Status: fixed by ASCII-only JSON (P02-T01), plus ASCII-only plugin source (plan 06) so the source-encoding layer this note also ruled out stays closed. §2c's exit criterion — reproduce the garbling inside real VMD and name its cause — is closed above at the http layer, the actual mechanism; the in-VMD confirmation on `tbgl` (`VMD_AI_VMD_BIN=/software/vmd-1.9.3/bin/vmd python -m pytest tests/test_live_vmd.py -q -k unicode`, expecting `utf8_intact` false and `ascii_intact` true, since that VMD's Tcl 8.5/http 2.7 is exactly what was reproduced above) is an owner step at the final demo, not a code change.
 
 `render snapshot` in the GUI: `/tmp/gui_snapshot.tga type 2 1024 x 1024 variance 415.0` and `/tmp/gui_tachyon.tga type 2 1024 x 1024 variance 431.8`. Verified: yes, by the rule above (the window's size, 1024x1024, matching `render TachyonInternal`'s own output, and a variance well above 0). M1 keeps TachyonInternal either way; an `auto` renderer may be built now that this GUI check has a recorded "yes", but round 1 does not build it.

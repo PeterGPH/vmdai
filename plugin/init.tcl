@@ -24,15 +24,18 @@ proc ::vmdai::start {} {
 
 # Close the panel and stop the runtime. An owned runtime is shut down; an
 # attached one keeps running (spec 2d). With -sync, wait (without an event
-# loop) until an owned runtime has exited.
+# loop) until an owned runtime has exited, and give an attached runtime's
+# session.stop the same synchronous treatment, so it releases its chat lock
+# before a following cleanup resets the http tokens.
 proc ::vmdai::stop {args} {
     if {[llength [info commands ::winfo]]} {
         catch {destroy $::vmdai::ui::win}
     }
-    ::vmdai::bridge::shutdown
     if {[lsearch -exact $args -sync] >= 0} {
+        ::vmdai::bridge::shutdown -sync
         ::vmdai::runtime::stop -sync
     } else {
+        ::vmdai::bridge::shutdown
         ::vmdai::runtime::stop
     }
     ::vmdai::executor::reset
@@ -40,7 +43,10 @@ proc ::vmdai::stop {args} {
 
 # Stop everything, then cancel every timer, fileevent and http token the
 # plugin registered (S4). The runtime is stopped with -sync first, because
-# teardown would cancel the timer that escalates to kill -9.
+# teardown would cancel the timer that escalates to kill -9; -sync also
+# makes an attached runtime's session.stop synchronous, since teardown's
+# http::reset would otherwise close the socket before an async request was
+# ever written.
 proc ::vmdai::cleanup {} {
     catch {::vmdai::stop -sync}
     ::vmdai::sched::teardown

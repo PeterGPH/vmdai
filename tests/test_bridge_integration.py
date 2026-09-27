@@ -139,7 +139,10 @@ def test_has_more_draining_200(tmp_path):
     assert data["text"] == LONG
     assert data["roles"].count("assistant/chunk") == 250
     assert data["polls"] >= 4
-    assert data["drain_ms"] < 600  # three has_more re-polls at once, not 3 x 250 ms
+    # Structural: back-to-back polls while has_more, not a wall-clock budget
+    # on drain_ms (Minor 8; drain_ms stays in the output for information).
+    assert data["more_replies"] >= 1
+    assert data["more_gap_max_ms"] < 200
 
 
 def _kill_then_restart(runtime: RunningRuntime) -> None:

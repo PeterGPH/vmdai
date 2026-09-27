@@ -67,6 +67,7 @@ test init-start-1 {::vmdai::start returns the window path and attaches} -body {
     set ::env(VMD_AI_ATTACH) 127.0.0.1:$::env(VMDAI_ATTACH_PORT)
     set w [::vmdai::start]
     wait_for {expr {[::vmdai::runtime::state] eq "ready"}}
+    wait_for {expr {[dict get [::vmdai::bridge::state] session_id] ne ""}}
     list $w [::vmdai::runtime::state] [dict get [::vmdai::runtime::info] owned]
 } -cleanup { ::vmdai::cleanup } -result {.vmd_ai ready 0}
 
@@ -94,9 +95,10 @@ test init-reload-1 {reload twice: nothing left in after info; one poll pump afte
 test init-stop-1 {::vmdai::stop leaves an attached runtime alone and ends the session} -body {
     attach_and_poll
     ::vmdai::stop
-    set r [list [::vmdai::runtime::state] [dict get [::vmdai::bridge::state] session_id]]
+    set drained [wait_for {expr {[array size ::vmdai::sched::tokens] == 0}}]
+    set r [list [::vmdai::runtime::state] [dict get [::vmdai::bridge::state] session_id] $drained]
     ::vmdai::cleanup
     lappend r [after info]
-} -result {stopped {} {}}
+} -result {stopped {} 1 {}}
 
 cleanupTests

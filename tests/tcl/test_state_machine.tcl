@@ -155,6 +155,25 @@ test sm-respawn-1 {an owned runtime that keeps dying is respawned at most 3 time
         $levels [lindex $::notices 1 1] [probe_ms]
 } -cleanup reset_all -result {down didnt_start 4 {warn warn warn warn error} {The AI runtime stopped; restarting it (1 of 3).} {}}
 
+test sm-respawn-4 {sustained ready resets the respawn budget; a stale generation's timer does not} -setup reset_all -body {
+    set pid [start_owned]
+    set old_gen [current_gen]
+    set ::alive {}
+    ::vmdai::runtime::_pipe_eof [current_gen]
+    fire_probe
+    set new [lindex $::spawned end]
+    set ::health [list [list ok [list pid $new protocol 2]]]
+    ::vmdai::runtime::_pipe_line [current_gen] [ready_line $new]
+    set after_cycle $::vmdai::runtime::respawns
+    ::vmdai::runtime::_stable $old_gen
+    set stale $::vmdai::runtime::respawns
+    set i [lsearch -glob $::timers {* *_stable *}]
+    set t [lindex $::timers $i]
+    set ::timers [lreplace $::timers $i $i]
+    uplevel #0 [lindex $t 2]
+    list $after_cycle $stale $::vmdai::runtime::respawns
+} -cleanup reset_all -result {1 1 0}
+
 test sm-respawn-2 {a respawn that reaches ready recovers the session once} -setup reset_all -body {
     set pid [start_owned]
     set ::alive {}
@@ -191,6 +210,31 @@ test sm-retry-1 {retry_now from down starts again with a fresh respawn budget} -
     ::vmdai::runtime::retry_now
     list $before [::vmdai::runtime::state] [llength $::spawned] $::vmdai::runtime::respawns
 } -cleanup reset_all -result {down launching 5 0}
+
+test sm-ensure-1 {ensure from down also resets the respawn budget} -setup reset_all -body {
+    set pid [start_owned]
+    set ::alive {}
+    ::vmdai::runtime::_pipe_eof [current_gen]
+    foreach i {1 2 3} { fire_probe; ::vmdai::runtime::_pipe_eof [current_gen] }
+    set before [::vmdai::runtime::state]
+    ::vmdai::runtime::ensure
+    list $before [::vmdai::runtime::state] [llength $::spawned] $::vmdai::runtime::respawns
+} -cleanup reset_all -result {down launching 5 0}
+
+test sm-ready-tail-1 {a runtime that exits right after READY: the tail keeps the line, not the token} -setup reset_all -body {
+    set saved_probe_args [info args ::vmdai::runtime::_probe]
+    set saved_probe_body [info body ::vmdai::runtime::_probe]
+    proc ::vmdai::runtime::_probe {callback} {}
+    ::vmdai::runtime::ensure
+    ::vmdai::runtime::_pipe_line [current_gen] [ready_line 9001]
+    ::vmdai::runtime::_pipe_eof [current_gen]
+    list [::vmdai::runtime::state] [::vmdai::runtime::failure_reason] \
+        [string match {*exited right after it started*} [lindex $::notices end 1]] \
+        [expr {[string first [string repeat a 32] [join [::vmdai::runtime::pipe_tail 50]]] < 0}]
+} -cleanup {
+    proc ::vmdai::runtime::_probe $saved_probe_args $saved_probe_body
+    reset_all
+} -result {down didnt_start 1 1}
 
 test sm-newpid-1 {an attached runtime back with a new pid: new token, one recover} -setup reset_all -body {
     set ::env(VMD_AI_ATTACH) 127.0.0.1:40003
@@ -243,6 +287,6 @@ test sm-stop-1 {stop while reconnecting cancels the probe timer} -setup reset_al
     set armed [llength $::timers]
     ::vmdai::runtime::stop
     list $armed $::timers [::vmdai::runtime::state] $::signals
-} -cleanup reset_all -result {1 {} stopped {}}
+} -cleanup reset_all -result {2 {} stopped {}}
 
 cleanupTests

@@ -60,7 +60,13 @@ class ScriptedLoop(ClaudeToolLoop):
 
 
 class ScriptedLoopFactory:
-    """loop_factory(profile) -> ScriptedLoop, all loops sharing one script."""
+    """loop_factory(profile) -> ScriptedLoop, all loops sharing one script.
+
+    The script is a list of ``(text, tool_calls)`` model turns, served in
+    order across requests; each tool call is a dict with ``id``, ``name`` and
+    ``input`` (the loop adds ``type: tool_use``). Once the script is used up
+    every turn answers ``("Done.", [])``.
+    """
 
     def __init__(self, script: List[Turn]) -> None:
         self.script: List[Turn] = list(script)

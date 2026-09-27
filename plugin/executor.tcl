@@ -237,7 +237,11 @@ proc ::vmdai::executor::exec_command {command} {
     set applied 0
     set failed ""
     set executing 1
-    _install_puts
+    if {[catch {_install_puts} err]} {
+        set executing 0
+        dict set result error "Could not capture the command's output: $err"
+        return $result
+    }
     set rc [catch {
         foreach span $spans {
             set statement [string range $command [lindex $span 0] [lindex $span 1]]

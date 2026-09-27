@@ -13,7 +13,7 @@ import pytest
 from helpers.tcl import REPO, TclTestResult, run_tcltest
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_state_machine.tcl"
-TOTAL = 12
+TOTAL = 15
 
 
 @pytest.fixture(scope="module")
@@ -45,3 +45,11 @@ def test_respawn_cap_3(result):
 
 def test_new_pid_triggers_recover(result):
     _assert_passed(result, ["sm-newpid-1", "sm-auth-1"])
+
+
+def test_respawn_budget_resets(result):
+    _assert_passed(result, ["sm-respawn-4", "sm-ensure-1"])
+
+
+def test_ready_line_token_redacted(result):
+    _assert_passed(result, ["sm-ready-tail-1"])

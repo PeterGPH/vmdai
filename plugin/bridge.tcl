@@ -47,6 +47,14 @@ namespace eval ::vmdai::bridge {
     if {![info exists finished]} { set finished {} }
     variable ready_timer
     if {![info exists ready_timer]} { set ready_timer "" }
+    # A CHAT_LOCKED resume during automatic recovery gets one retry, after
+    # the old runtime's kill deadline plus a margin (it may still hold the
+    # chat's flock until then).
+    variable recover_retries
+    if {![info exists recover_retries]} { set recover_retries 0 }
+    variable recover_timer
+    if {![info exists recover_timer]} { set recover_timer "" }
+    variable recover_retry_margin_ms 250
     variable poll_limit 80
     variable client_version "vmd_ai 2.0"
 }
@@ -249,26 +257,68 @@ proc ::vmdai::bridge::recover {} {
 proc ::vmdai::bridge::_recovered {kind args} {
     variable recovering
     variable chat_id
+    variable recover_retries
     if {$kind ne "ok" || $chat_id eq ""} {
         set recovering 0
         return
     }
+    set recover_retries 1
     _op [list ::vmdai::bridge::_resume $chat_id "" ::vmdai::bridge::_on_recover_resume]
 }
 
 proc ::vmdai::bridge::_on_recover_resume {target callback kind args} {
     variable recovering
     variable chat_id
+    variable recover_retries
+    variable recover_timer
+    variable recover_retry_margin_ms
+    variable session_id
     note_outcome chat.resume $kind {*}$args
     set recovering 0
     if {$kind eq "ok"} {
         _resumed $target [lindex $args 0]
+    } elseif {$kind eq "rpc_error" && [lindex $args 0] eq "CHAT_LOCKED" && $recover_retries > 0} {
+        incr recover_retries -1
+        _log "recover: chat.resume $target got CHAT_LOCKED, retrying ($recover_retries left)"
+        set chat_id ""
+        set recover_timer [::vmdai::sched::after \
+            [expr {$::vmdai::config::shutdown_kill_ms + $recover_retry_margin_ms}] \
+            [list ::vmdai::bridge::_retry_recover_resume $target $session_id]]
     } else {
         # The chat stays on disk; this session starts a new one.
         _log "recover: chat.resume $target failed: $args"
         set chat_id ""
+        if {$kind eq "transport"} {
+            set reason "the AI runtime did not answer"
+        } else {
+            lassign $args code message
+            switch -- $code {
+                CHAT_LOCKED { set reason "it is open in another VMD window" }
+                NOT_FOUND { set reason "it no longer exists" }
+                default { set reason $message }
+            }
+        }
+        set text "Could not reopen this chat after the AI runtime restarted ($reason). Your next message starts a new chat."
+        if {[catch {::vmdai::ui::notify warn $text} err]} {
+            _log "ui: $err"
+        }
     }
     _op_done
+}
+
+# One retry of a chat.resume that lost to CHAT_LOCKED during recovery, timed
+# for after the old runtime (if any) was killed. Abandoned if the session
+# moved on, a chat is already set, or a request is running.
+proc ::vmdai::bridge::_retry_recover_resume {target sid} {
+    variable recover_timer
+    variable session_id
+    variable chat_id
+    variable busy
+    set recover_timer ""
+    if {$sid ne $session_id || $chat_id ne "" || $busy} {
+        return
+    }
+    _op [list ::vmdai::bridge::_resume $target "" ::vmdai::bridge::_on_recover_resume]
 }
 
 # New Chat: cancel a running request, stop the old session (which releases
@@ -709,12 +759,17 @@ proc ::vmdai::bridge::_reset_session {} {
     variable reconcile_pending
     variable request_id
     variable ready_timer
+    variable recover_timer
+    variable recover_retries
     _stop_pump
     ::vmdai::sched::cancel $drain_timer
     ::vmdai::sched::cancel $ready_timer
+    ::vmdai::sched::cancel $recover_timer
     _request_ended $request_id
     set drain_timer ""
     set ready_timer ""
+    set recover_timer ""
+    set recover_retries 0
     set session_id ""
     set session_token ""
     set chat_id ""
@@ -729,11 +784,28 @@ proc ::vmdai::bridge::_reset_session {} {
 }
 
 # ::vmdai::stop: end the session (an attached runtime keeps running and must
-# release the chat lock), then forget it.
-proc ::vmdai::bridge::shutdown {} {
+# release the chat lock), then forget it. With -sync, an attached runtime
+# gets a synchronous session.stop (at most 500 ms), because cleanup resets
+# every http token before an async request would be written.
+proc ::vmdai::bridge::shutdown {args} {
     variable session_id
+    variable drain_timer
+    variable ready_timer
+    set sync [expr {[lsearch -exact $args -sync] >= 0}]
     if {$session_id ne ""} {
-        catch {::vmdai::net::call session.stop {} ::vmdai::bridge::_ignore}
+        set owned 1
+        catch {set owned [dict get [::vmdai::runtime::info] owned]}
+        if {$sync && !$owned} {
+            _stop_pump
+            ::vmdai::sched::cancel $drain_timer
+            set drain_timer ""
+            ::vmdai::sched::cancel $ready_timer
+            set ready_timer ""
+            catch {::vmdai::net::bump_epoch}
+            catch {::vmdai::net::call_sync session.stop {} -timeout 500}
+        } else {
+            catch {::vmdai::net::call session.stop {} ::vmdai::bridge::_ignore}
+        }
     }
     _reset_session
 }

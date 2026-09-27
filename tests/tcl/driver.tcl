@@ -41,14 +41,25 @@ proc ::record_state {old new detail} {
     lappend ::transitions [list [clock milliseconds] $old $new]
 }
 ::vmdai::runtime::subscribe ::record_state
-# Count RPCs by method.
+# Count RPCs by method, and time every chat.events.poll call.
 array set ::rpc_count {}
+set ::poll_calls {}
 proc ::count_rpc {cmd op} {
     set m [lindex $cmd 1]
     if {![info exists ::rpc_count($m)]} { set ::rpc_count($m) 0 }
     incr ::rpc_count($m)
+    if {$m eq "chat.events.poll"} { lappend ::poll_calls [clock milliseconds] }
 }
 trace add execution ::vmdai::net::call enter ::count_rpc
+# Time every chat.events.poll reply and whether it said has_more (Minor 8:
+# a structural back-to-back-polls check instead of a wall-clock budget).
+set ::poll_replies {}
+trace add execution ::vmdai::bridge::_on_poll enter {apply {{cmd op} {
+    set result [lindex $cmd 3]
+    set has_more 0
+    catch {set has_more [string is true -strict [dict get $result has_more]]}
+    lappend ::poll_replies [list [clock milliseconds] $has_more]
+}}}
 
 # --- helpers --------------------------------------------------------------------
 proc jstr {s} { return [::vmdai::net::json_string $s] }
@@ -178,15 +189,39 @@ proc scenario_cancel_after_ack {} {
         elapsed_ms i [expr {[clock milliseconds] - $t0}]]]
 }
 
+# The count of has_more:true replies, and the largest gap between one and
+# the poll call that follows it (0 when there is none): proof of
+# back-to-back draining that does not depend on wall-clock budgets.
+proc more_gap_stats {} {
+    set more_replies 0
+    set max_gap 0
+    foreach entry $::poll_replies {
+        lassign $entry t has_more
+        if {!$has_more} { continue }
+        incr more_replies
+        set next_call ""
+        foreach ct $::poll_calls {
+            if {$ct > $t} { set next_call $ct; break }
+        }
+        if {$next_call ne ""} {
+            set gap [expr {$next_call - $t}]
+            if {$gap > $max_gap} { set max_gap $gap }
+        }
+    }
+    return [list $more_replies $max_gap]
+}
+
 # A long answer: has_more is drained with back-to-back polls.
 proc scenario_has_more {} {
     connect
     ask "Tell me a long story"
     set chunk_ms {}
     foreach t $::chunk_times { lappend chunk_ms $t }
+    lassign [more_gap_stats] more_replies more_gap_max_ms
     write_out [concat [common_out] [list text s [chunks_text] \
         polls i $::rpc_count(chat.events.poll) after_seq i [bstate after_seq] \
-        drain_ms i [expr {[lindex $chunk_ms end] - [lindex $chunk_ms 0]}]]]
+        drain_ms i [expr {[lindex $chunk_ms end] - [lindex $chunk_ms 0]}] \
+        more_replies i $more_replies more_gap_max_ms i $more_gap_max_ms]]
 }
 
 # S3: pytest kills the runtime and restarts it on the same port with a new

@@ -45,6 +45,11 @@ namespace eval ::vmdai::runtime {
     # Set while the transition to `ready` ends a reconnect or a respawn.
     variable recovering
     if {![::info exists recovering]} { set recovering 0 }
+    # Cancelled and rearmed on every `ready`; resets the respawn budget after
+    # a period of sustained `ready`, so a crash long after an earlier one
+    # does not inherit its budget.
+    variable stable_timer
+    if {![::info exists stable_timer]} { set stable_timer "" }
     variable max_respawns 3
     variable hung_probe_limit 5
 }
@@ -157,9 +162,11 @@ proc ::vmdai::runtime::_alive {pid} {
 
 proc ::vmdai::runtime::ensure {} {
     variable state
+    variable respawns
     if {$state ni {stopped down}} {
         return $state
     }
+    set respawns 0
     if {[catch {::vmdai::config::attach_target} target]} {
         _fail unreachable $target
         return [state]
@@ -219,8 +226,15 @@ proc ::vmdai::runtime::_on_readable {g ch} {
 
 proc ::vmdai::runtime::_pipe_line {g line} {
     variable state
-    _tail_add $line
     set at [string first "VMDAI_READY \{" $line]
+    if {$at >= 0} {
+        # Keep the READY line in the tail (it helps diagnose a runtime that
+        # dies right after printing it), but never its launch_token.
+        regsub {("launch_token"[ \t]*:[ \t]*")[^"]*(")} $line {\1<redacted>\2} shown
+        _tail_add $shown
+    } else {
+        _tail_add $line
+    }
     if {$at >= 0 && $state eq "launching"} {
         _on_ready $g [string range $line [expr {$at + 12}] end]
     }
@@ -257,8 +271,13 @@ proc ::vmdai::runtime::_pipe_eof {g} {
     if {$state in {launching connecting}} {
         set last "The runtime exited before it was ready."
         for {set i [expr {[llength $tail] - 1}]} {$i >= 0} {incr i -1} {
-            if {[string trim [lindex $tail $i]] ne ""} {
-                set last [string trim [lindex $tail $i]]
+            set line [string trim [lindex $tail $i]]
+            if {$line ne ""} {
+                if {[string first "VMDAI_READY \{" $line] >= 0} {
+                    set last "The runtime exited right after it started."
+                } else {
+                    set last $line
+                }
                 break
             }
         }
@@ -362,6 +381,8 @@ proc ::vmdai::runtime::_became_ready {} {
     variable last_ready_pid
     variable recovering
     variable state
+    variable gen
+    variable stable_timer
     ::vmdai::sched::cancel $probe_timer
     set probe_timer ""
     set attempt 0
@@ -372,8 +393,24 @@ proc ::vmdai::runtime::_became_ready {} {
     set last_ready_pid [dict get $info pid]
     _set_state ready
     set recovering 0
+    ::vmdai::sched::cancel $stable_timer
+    set stable_timer [::vmdai::sched::after $::vmdai::config::respawn_reset_ms \
+        [list ::vmdai::runtime::_stable $gen]]
     if {$previous ne "" && $previous ne $last_ready_pid} {
         _recover "new runtime pid $last_ready_pid (was $previous)"
+    }
+}
+
+# After a long stretch of uninterrupted `ready` under one gen, the runtime
+# has proven itself again: give it a fresh respawn budget.
+proc ::vmdai::runtime::_stable {g} {
+    variable stable_timer
+    variable gen
+    variable state
+    variable respawns
+    set stable_timer ""
+    if {$g == $gen && $state eq "ready"} {
+        set respawns 0
     }
 }
 
@@ -454,12 +491,15 @@ proc ::vmdai::runtime::stop {args} {
     variable respawns
     variable respawning
     variable last_ready_pid
+    variable stable_timer
     set sync [expr {[lsearch -exact $args -sync] >= 0}]
     incr gen
     ::vmdai::sched::cancel $ready_timer
     set ready_timer ""
     ::vmdai::sched::cancel $probe_timer
     set probe_timer ""
+    ::vmdai::sched::cancel $stable_timer
+    set stable_timer ""
     set respawns 0
     set respawning 0
     set last_ready_pid ""

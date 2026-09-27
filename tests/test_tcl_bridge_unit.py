@@ -13,7 +13,7 @@ import pytest
 from helpers.tcl import REPO, TclTestResult, run_tcltest
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_bridge_unit.tcl"
-TOTAL = 14
+TOTAL = 17
 
 
 @pytest.fixture(scope="module")
@@ -61,3 +61,7 @@ def test_apply_workdir_cd_and_set_cwd(result):
 
 def test_session_changes_drop_stale_replies(result):
     _assert_passed(result, ["bridge-race-1", "bridge-resume-1", "bridge-recover-1", "bridge-auth-1"])
+
+
+def test_recover_resume_retries_lock_then_warns(result):
+    _assert_passed(result, ["bridge-recover-2", "bridge-recover-3", "bridge-recover-4"])
