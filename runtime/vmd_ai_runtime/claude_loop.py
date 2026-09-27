@@ -1086,6 +1086,39 @@ def _ollama_usage_meta(done_event: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return _usage_meta("ollama", event.get("prompt_eval_count"), event.get("eval_count"), None)
 
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible endpoints (spec 2f): per-loop base_url and body extras.
+# ---------------------------------------------------------------------------
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_PROTECTED_BODY_KEYS = ("model", "messages", "tools", "stream")
+
+
+def _openai_chat_url(base_url: str) -> str:
+    """Join a /v1 base URL and /chat/completions without doubling slashes or
+    the path (a base that already ends in /chat/completions is kept)."""
+    base = str(base_url or "").strip().rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    return base + "/chat/completions"
+
+
+def _apply_openai_body_options(body: Dict[str, Any], opts: Any) -> None:
+    """Options-path body fields: temperature/seed when set, the opt-in
+    stream_options.include_usage (older vLLM rejects it), then extra_body
+    merged at top level (it may not replace model, messages, tools or stream)."""
+    if opts.temperature is not None:
+        body["temperature"] = float(opts.temperature)
+    if opts.seed is not None:
+        body["seed"] = int(opts.seed)
+    if opts.include_usage:
+        body["stream_options"] = {"include_usage": True}
+    for key, value in dict(opts.extra_body or {}).items():
+        if key in _PROTECTED_BODY_KEYS:
+            continue
+        body[key] = copy.deepcopy(value)
+
+
 def _stream_anthropic_direct(
     messages: List[Dict],
     model: str,
@@ -1278,13 +1311,22 @@ def _stream_openrouter(
     # Endpoint is configurable so the same OpenAI-style path can target any
     # OpenAI-compatible server (OpenRouter by default, or a local vLLM/SGLang/
     # Ollama-OpenAI endpoint via VMD_AI_OPENAI_BASE_URL=http://host:8000/v1).
-    _base = os.environ.get("VMD_AI_OPENAI_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+    # With options set, the URL, key and body extras come from opts alone;
+    # the environment is read only on the options=None (benchmark) path.
+    if opts is None:
+        _base = os.environ.get("VMD_AI_OPENAI_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+        _url = _base + "/chat/completions"
+        _bearer = api_key
+    else:
+        _url = _openai_chat_url(opts.base_url or OPENROUTER_BASE_URL)
+        _bearer = api_key or "EMPTY"
+        _apply_openai_body_options(body, opts)
     req = urllib.request.Request(
-        _base + "/chat/completions",
+        _url,
         data=json.dumps(body).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {_bearer}",
             "HTTP-Referer": "https://localhost/vmd-ai",
             "X-Title": "vmd-ai",
             "accept": "text/event-stream",
