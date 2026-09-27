@@ -1,51 +1,82 @@
+# init.tcl - ChatVMD entry points, module loading and the VMD menu (spec 2h).
+# Loaded by `package require vmd_ai` (pkgIndex.tcl, which the installer's
+# ~/.vmdrc line puts on auto_path) or sourced directly. Loading needs no Tk
+# and starts nothing: the runtime starts when the panel is opened.
+
 namespace eval ::vmdai {}
+package provide vmd_ai 2.0
 
-set _vmdai_here [file dirname [info script]]
-source [file join $_vmdai_here config.tcl]
-source [file join $_vmdai_here ui.tcl]
-source [file join $_vmdai_here bridge.tcl]
+source [file join [file dirname [file normalize [info script]]] config.tcl]
+source [file join $::vmdai::config::plugin_dir sched.tcl]
+source [file join $::vmdai::config::plugin_dir net.tcl]
+source [file join $::vmdai::config::plugin_dir runtime.tcl]
+source [file join $::vmdai::config::plugin_dir bridge.tcl]
+source [file join $::vmdai::config::plugin_dir executor.tcl]
+source [file join $::vmdai::config::plugin_dir ui.tcl]
 
+# Open the panel and make sure the runtime is up (launch, or attach with
+# VMD_AI_ATTACH). Returns the panel's window path, as VMD's menu expects.
 proc ::vmdai::start {} {
-    ::vmdai::ui::show_panel
+    set w [::vmdai::ui::show_panel]
+    ::vmdai::runtime::ensure
+    return $w
 }
 
-proc ::vmdai::stop {} {
-    # Close the panel and shut down the runtime. Idempotent — safe to
-    # call when the panel was never opened or the runtime never started.
-    catch {::vmdai::ui::_thinking_stop}
-    catch {destroy $::vmdai::ui::win}
-    catch {::vmdai::bridge::shutdown_runtime}
+# Close the panel and stop the runtime. An owned runtime is shut down; an
+# attached one keeps running (spec 2d). With -sync, wait (without an event
+# loop) until an owned runtime has exited, and give an attached runtime's
+# session.stop the same synchronous treatment, so it releases its chat lock
+# before a following cleanup resets the http tokens.
+proc ::vmdai::stop {args} {
+    if {[llength [info commands ::winfo]]} {
+        catch {destroy $::vmdai::ui::win}
+    }
+    if {[lsearch -exact $args -sync] >= 0} {
+        ::vmdai::bridge::shutdown -sync
+        ::vmdai::runtime::stop -sync
+    } else {
+        ::vmdai::bridge::shutdown
+        ::vmdai::runtime::stop
+    }
+    ::vmdai::executor::reset
 }
 
-proc ::vmdai::reload {} {
-    # Convenience helper: stop the current session, then re-source the
-    # plugin so edits to .tcl files take effect, then start fresh.
-    # Useful during plugin development.
-    ::vmdai::stop
-    set here [file dirname [info script]]
-    source [file join $here init.tcl]
-    ::vmdai::start
-}
-
+# Stop everything, then cancel every timer, fileevent and http token the
+# plugin registered (S4). The runtime is stopped with -sync first, because
+# teardown would cancel the timer that escalates to kill -9; -sync also
+# makes an attached runtime's session.stop synchronous, since teardown's
+# http::reset would otherwise close the socket before an async request was
+# ever written.
 proc ::vmdai::cleanup {} {
-    catch {::vmdai::bridge::shutdown_runtime}
+    catch {::vmdai::stop -sync}
+    ::vmdai::sched::teardown
 }
 
+# Development helper: tear everything down, re-source the plugin from
+# config::plugin_dir and, when Tk is loaded, open the panel again. Returns
+# the window path, or "" without Tk.
+proc ::vmdai::reload {} {
+    ::vmdai::cleanup
+    source [file join $::vmdai::config::plugin_dir init.tcl]
+    if {[llength [info commands ::winfo]]} {
+        return [::vmdai::start]
+    }
+    return ""
+}
+
+# Extensions > VMD AI. Outside VMD (tclsh tests) there is no menu.
 proc ::vmdai::register_extension {} {
-    if {[llength [info commands vmd_install_extension]] == 0} {
-        puts {[VMD AI] vmd_install_extension not found. Run ::vmdai::start manually.}
-        return
+    if {![llength [info commands ::vmd_install_extension]]} {
+        return 0
     }
-
-    # If this script is sourced repeatedly, remove old registration first.
-    if {[llength [info commands vmd_remove_extension]] > 0} {
-        catch {vmd_remove_extension vmd_ai}
+    if {[llength [info commands ::vmd_remove_extension]]} {
+        catch {::vmd_remove_extension vmd_ai}
     }
-
-    if {[catch {vmd_install_extension vmd_ai ::vmdai::start "Extensions/VMD AI"} err]} {
-        puts [format {[VMD AI] Extension registration failed: %s} $err]
-        puts {[VMD AI] You can still launch manually with ::vmdai::start}
+    if {[catch {::vmd_install_extension vmd_ai ::vmdai::start "VMD AI"} err]} {
+        ::vmdai::config::log "menu registration failed: $err"
+        return 0
     }
+    return 1
 }
 
 ::vmdai::register_extension
