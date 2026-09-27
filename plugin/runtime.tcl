@@ -29,6 +29,24 @@ namespace eval ::vmdai::runtime {
     variable ready_timer
     if {![::info exists ready_timer]} { set ready_timer "" }
     variable tail_max 50
+    # Connection state machine (P06-T06).
+    variable probe_timer
+    if {![::info exists probe_timer]} { set probe_timer "" }
+    variable attempt
+    if {![::info exists attempt]} { set attempt 0 }
+    variable probe_failures
+    if {![::info exists probe_failures]} { set probe_failures 0 }
+    variable respawns
+    if {![::info exists respawns]} { set respawns 0 }
+    variable respawning
+    if {![::info exists respawning]} { set respawning 0 }
+    variable last_ready_pid
+    if {![::info exists last_ready_pid]} { set last_ready_pid "" }
+    # Set while the transition to `ready` ends a reconnect or a respawn.
+    variable recovering
+    if {![::info exists recovering]} { set recovering 0 }
+    variable max_respawns 3
+    variable hung_probe_limit 5
 }
 
 proc ::vmdai::runtime::_log {msg} {
@@ -84,6 +102,7 @@ proc ::vmdai::runtime::_set_state {new {detail ""}} {
             _log "subscriber $cmd failed: $err"
         }
     }
+    _notice $old $new $detail
 }
 
 proc ::vmdai::runtime::_tail_add {line} {
@@ -251,7 +270,10 @@ proc ::vmdai::runtime::_pipe_eof {g} {
 
 # An owned runtime's pipe hit EOF after it was ready.
 proc ::vmdai::runtime::_process_exited {} {
-    _fail unreachable "The AI runtime exited."
+    variable state
+    if {$state eq "ready"} {
+        _enter_reconnecting "The AI runtime exited."
+    }
 }
 
 proc ::vmdai::runtime::_ready_timeout {g} {
@@ -278,13 +300,22 @@ proc ::vmdai::runtime::_fail {reason detail} {
     variable ready_timer
     ::vmdai::sched::cancel $ready_timer
     set ready_timer ""
-    set failure $reason
+    variable respawning
+    variable respawns
+    variable max_respawns
     if {[dict get $info owned]} {
         _close_pipe
         if {[_alive $child_pid]} {
             _terminate $child_pid 0
         }
     }
+    if {$respawning && $reason eq "didnt_start" && $respawns < $max_respawns} {
+        _set_state reconnecting $detail
+        _schedule_probe
+        return
+    }
+    set respawning 0
+    set failure $reason
     _set_state down $detail
 }
 
@@ -292,6 +323,10 @@ proc ::vmdai::runtime::_on_health {g purpose kind args} {
     variable gen
     variable info
     if {$g != $gen} {
+        return
+    }
+    if {$kind ne "ok" && $purpose eq "probe"} {
+        _probe_failed
         return
     }
     if {$kind ne "ok"} {
@@ -308,11 +343,38 @@ proc ::vmdai::runtime::_on_health {g purpose kind args} {
     catch {dict set info pid [dict get $body pid]}
     catch {dict set info version [dict get $body version]}
     dict set info protocol $protocol
+    if {$purpose eq "probe" && ![dict get $info owned]} {
+        # An attached runtime restarted on the same port has a new token.
+        set token [_read_token [dict get $info port]]
+        if {$token ne ""} {
+            dict set info launch_token $token
+        }
+    }
     _became_ready
 }
 
 proc ::vmdai::runtime::_became_ready {} {
+    variable info
+    variable attempt
+    variable probe_failures
+    variable probe_timer
+    variable respawning
+    variable last_ready_pid
+    variable recovering
+    variable state
+    ::vmdai::sched::cancel $probe_timer
+    set probe_timer ""
+    set attempt 0
+    set probe_failures 0
+    set recovering [expr {$respawning || $state eq "reconnecting"}]
+    set respawning 0
+    set previous $last_ready_pid
+    set last_ready_pid [dict get $info pid]
     _set_state ready
+    set recovering 0
+    if {$previous ne "" && $previous ne $last_ready_pid} {
+        _recover "new runtime pid $last_ready_pid (was $previous)"
+    }
 }
 
 # --- attach -----------------------------------------------------------------
@@ -388,10 +450,19 @@ proc ::vmdai::runtime::stop {args} {
     variable child_pid
     variable failure
     variable ready_timer
+    variable probe_timer
+    variable respawns
+    variable respawning
+    variable last_ready_pid
     set sync [expr {[lsearch -exact $args -sync] >= 0}]
     incr gen
     ::vmdai::sched::cancel $ready_timer
     set ready_timer ""
+    ::vmdai::sched::cancel $probe_timer
+    set probe_timer ""
+    set respawns 0
+    set respawning 0
+    set last_ready_pid ""
     catch {::vmdai::net::bump_epoch}
     if {[dict get $info owned]} {
         set token [dict get $info launch_token]
@@ -413,3 +484,195 @@ proc ::vmdai::runtime::stop {args} {
 }
 
 proc ::vmdai::runtime::_ignore {args} {}
+
+# --- connection state machine (spec 2d, 5, S3) ----------------------------
+
+# 500, 1000, 2000, 4000, 8000, 8000, ... ms for attempt 1, 2, 3, ...
+proc ::vmdai::runtime::backoff_ms {attempt} {
+    if {$attempt >= 5} {
+        return 8000
+    }
+    return [expr {500 << ($attempt - 1)}]
+}
+
+# The bridge calls this when an RPC fails at the transport level.
+proc ::vmdai::runtime::on_transport_error {reason} {
+    variable state
+    if {$state eq "ready"} {
+        _enter_reconnecting $reason
+    }
+}
+
+# The bridge calls this after any RPC that reached the runtime.
+proc ::vmdai::runtime::on_transport_ok {} {
+    variable state
+    variable gen
+    variable probe_timer
+    if {$state ne "reconnecting"} {
+        return
+    }
+    ::vmdai::sched::cancel $probe_timer
+    set probe_timer ""
+    _reconnect_tick $gen
+}
+
+# The bridge calls this when a session RPC answers AUTH_FAILED: the runtime
+# restarted behind the same port (attach) or lost the session.
+proc ::vmdai::runtime::on_auth_failed {} {
+    variable state
+    variable info
+    if {$state ne "ready"} {
+        return
+    }
+    if {![dict get $info owned]} {
+        set token [_read_token [dict get $info port]]
+        if {$token ne ""} {
+            dict set info launch_token $token
+        }
+    }
+    _recover "AUTH_FAILED"
+}
+
+# Banner "Retry": start over from down/stopped, or probe now while reconnecting.
+proc ::vmdai::runtime::retry_now {} {
+    variable state
+    variable gen
+    variable attempt
+    variable probe_timer
+    variable respawns
+    switch -- $state {
+        down - stopped {
+            set respawns 0
+            ensure
+        }
+        reconnecting {
+            set attempt 0
+            ::vmdai::sched::cancel $probe_timer
+            set probe_timer ""
+            _reconnect_tick $gen
+        }
+    }
+    return [state]
+}
+
+proc ::vmdai::runtime::_enter_reconnecting {detail} {
+    variable attempt
+    variable probe_failures
+    set attempt 0
+    set probe_failures 0
+    _set_state reconnecting $detail
+    _schedule_probe
+}
+
+proc ::vmdai::runtime::_schedule_probe {} {
+    variable gen
+    variable attempt
+    variable probe_timer
+    incr attempt
+    ::vmdai::sched::cancel $probe_timer
+    set probe_timer [::vmdai::sched::after [backoff_ms $attempt] \
+        [list ::vmdai::runtime::_reconnect_tick $gen]]
+}
+
+proc ::vmdai::runtime::_reconnect_tick {g} {
+    variable gen
+    variable state
+    variable info
+    variable chan
+    variable child_pid
+    variable probe_timer
+    set probe_timer ""
+    if {$g != $gen || $state ne "reconnecting"} {
+        return
+    }
+    if {[dict get $info owned] && ($chan eq "" || ![_alive $child_pid])} {
+        _respawn
+        return
+    }
+    _probe [list ::vmdai::runtime::_on_health $g probe]
+}
+
+proc ::vmdai::runtime::_probe_failed {} {
+    variable info
+    variable probe_failures
+    variable hung_probe_limit
+    variable child_pid
+    incr probe_failures
+    if {[dict get $info owned] && $probe_failures >= $hung_probe_limit} {
+        _log "owned runtime pid $child_pid is not answering; restarting it"
+        _close_pipe
+        _terminate $child_pid 0
+        _respawn
+        return
+    }
+    _schedule_probe
+}
+
+proc ::vmdai::runtime::_respawn {} {
+    variable respawns
+    variable respawning
+    variable max_respawns
+    if {$respawns >= $max_respawns} {
+        set respawning 0
+        _fail unreachable "The AI runtime stopped and did not come back after $max_respawns restarts."
+        return
+    }
+    incr respawns
+    set respawning 1
+    _launch
+}
+
+proc ::vmdai::runtime::_recover {why} {
+    _log "recover: $why"
+    if {[llength [::info commands ::vmdai::bridge::recover]]} {
+        if {[catch {::vmdai::bridge::recover} err]} {
+            _log "bridge::recover failed: $err"
+        }
+    }
+}
+
+# One transcript notice per state change (S3); the status bar shows the rest.
+proc ::vmdai::runtime::_notice {old new detail} {
+    variable failure
+    variable respawns
+    variable max_respawns
+    variable recovering
+    set level ""
+    switch -- $new {
+        reconnecting {
+            if {$old eq "ready"} {
+                set level warn
+                set text "Lost the connection to the AI runtime; reconnecting."
+            }
+        }
+        launching {
+            if {$old eq "reconnecting"} {
+                set level warn
+                set text "The AI runtime stopped; restarting it ($respawns of $max_respawns)."
+            }
+        }
+        ready {
+            if {$recovering} {
+                set level info
+                set text "Reconnected to the AI runtime."
+            }
+        }
+        down {
+            set level error
+            switch -- $failure {
+                didnt_start { set text "The AI runtime didn't start: $detail" }
+                too_old { set text $detail }
+                default { set text "Can't reach the AI runtime: $detail" }
+            }
+        }
+    }
+    if {$level eq ""} {
+        return
+    }
+    _log "notice $level: $text"
+    if {[llength [::info commands ::vmdai::ui::notify]]} {
+        if {[catch {::vmdai::ui::notify $level $text} err]} {
+            _log "ui::notify failed: $err"
+        }
+    }
+}
