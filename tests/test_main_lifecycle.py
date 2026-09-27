@@ -15,6 +15,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from helpers.runtime_fixture import make_app, serve_app
+
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "runtime" / "main.py"
 READY = "VMDAI_READY "
@@ -158,6 +160,31 @@ def test_runtime_shutdown_rpc_exits_within_2s(tmp_path):
         assert proc.returncode == 0
     finally:
         _stop(proc)
+
+
+def test_runtime_shutdown_reply_is_sent_before_the_shutdown_hook(tmp_path):
+    """The {ok: true} reply is on the wire before on_shutdown runs.
+
+    main.py's hook ends the process and request threads are daemons, so a
+    hook that ran before the write could cut the reply off (the
+    IncompleteRead flake in the test above). This hook freezes its thread,
+    as process exit would: the client gets the reply only if it came first.
+    """
+    token = "ab" * 16
+    called, release = threading.Event(), threading.Event()
+
+    def _freeze():
+        called.set()
+        release.wait(10)
+
+    app = make_app(tmp_path, launch_token=token, on_shutdown=_freeze)
+    try:
+        with serve_app(app) as port:
+            reply = _rpc(port, "runtime.shutdown", {"launch_token": token})
+            assert reply["result"] == {"ok": True}
+            assert called.wait(2), "on_shutdown never ran"
+    finally:
+        release.set()
 
 
 def test_sigterm_exits_within_2s(tmp_path):

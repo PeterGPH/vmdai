@@ -876,7 +876,15 @@ class RuntimeApp:
     # RPC dispatch
     # ------------------------------------------------------------------
 
-    def handle_rpc(self, payload: Dict[str, Any], session_token: str = "") -> Dict[str, Any]:
+    def handle_rpc(self, payload: Dict[str, Any], session_token: str = "",
+                   after_reply: Optional[List[Callable[[], None]]] = None) -> Dict[str, Any]:
+        """Dispatch one JSON-RPC call and return its response envelope.
+
+        A caller that sends the response on (server.py) passes ``after_reply``:
+        work that must wait until the reply is out, such as runtime.shutdown's
+        exit, is appended to it for the caller to run after sending. Without
+        it, that work runs before handle_rpc returns.
+        """
         # Pull req_id out of the raw payload up front so error responses
         # can echo it even if the rest of the body is malformed.
         req_id = payload.get("id") if isinstance(payload, dict) else None
@@ -887,7 +895,7 @@ class RuntimeApp:
             method = parsed["method"]
             params = validate_method_params(method, parsed["params"])
             req_id = parsed.get("id")
-            result = self._dispatch(method, params, session_token)
+            result = self._dispatch(method, params, session_token, after_reply=after_reply)
             return {"jsonrpc": "2.0", "id": req_id, "result": result}
         except RpcError as exc:
             if self.logger:
@@ -949,7 +957,8 @@ class RuntimeApp:
                 "this call needs a session started with the launch token",
             )
 
-    def _dispatch(self, method: str, params: Dict[str, Any], session_token: str) -> Dict[str, Any]:
+    def _dispatch(self, method: str, params: Dict[str, Any], session_token: str,
+                  after_reply: Optional[List[Callable[[], None]]] = None) -> Dict[str, Any]:
 
         # ---- Runtime lifecycle ----
 
@@ -959,7 +968,14 @@ class RuntimeApp:
             if self.logger:
                 self.logger.info("runtime.shutdown requested over RPC")
             if self._on_shutdown is not None:
-                self._on_shutdown()
+                # main.py's hook ends the process and request threads are
+                # daemons, so running it before the reply is written can cost
+                # the client its {ok: true} (IncompleteRead). Over HTTP,
+                # server.py runs it after sending.
+                if after_reply is not None:
+                    after_reply.append(self._on_shutdown)
+                else:
+                    self._on_shutdown()
             return {"ok": True}
 
         # ---- Session lifecycle ----
