@@ -37,9 +37,17 @@ from .provider import (
     resolve_anthropic_api_key,
     resolve_ollama_host,
     resolve_ollama_model,
+    resolve_openai_compatible_api_key,
     resolve_openrouter_api_key,
 )
 from .recorder import RunRecorder
+from .conversation import (
+    CONTEXT_WARN_FRACTION,
+    compact_tool_results,
+    compute_run_budget,
+    context_tokens_for,
+    messages_chars,
+)
 from .wiki_store import (
     WikiError,
     WikiNotFound,
@@ -161,9 +169,57 @@ class LoopOptions:
                     continue
                 if key == "num_ctx" and value is None:
                     continue
+                problem = option_type_error(key, value)
+                if problem is not None:
+                    # Plan 02 final review (a): a hand-edited settings.json cannot
+                    # break the loop; the preset value stays.
+                    logger.warning("ignoring profile option %s: %s", key, problem)
+                    continue
                 preset[key] = value
         preset["max_turns"] = int(max_turns)
         return cls(**preset)
+
+
+# Carry-forward ruling (a): the value types a profile's options may hold.
+# settings_store rejects an ill-typed value on write (SettingsError INVALID);
+# LoopOptions.product drops one with a warning and keeps the preset. null is
+# allowed exactly where the LoopOptions field defaults to None.
+OPTION_INT_KEYS = ("num_ctx", "seed", "context_length", "connect_retries", "turn_retry", "image_max_edge")
+OPTION_NUMBER_KEYS = ("temperature", "first_byte_timeout_s")
+OPTION_BOOL_KEYS = ("classify_unreachable", "classify_errors", "preflight", "cancellable_backoff",
+                    "report_cancelled", "raise_stream_errors", "guard_truncation", "compact_in_run",
+                    "ollama_tool_name", "loop_guard", "include_usage")
+OPTION_STR_KEYS = ("rescue", "result_format", "base_url")
+OPTION_DICT_KEYS = ("extra_body", "tool_overrides")
+OPTION_UNCHECKED_KEYS = ("think", "keep_alive", "supports_vision", "max_turns")
+RESCUE_MODES = ("all", "json", "off")
+
+
+def option_type_error(key: str, value: Any) -> Optional[str]:
+    """Why ``value`` cannot be the profile option ``key``, or None when it can.
+
+    Unknown keys and OPTION_UNCHECKED_KEYS are never an error.
+    """
+    if key in OPTION_UNCHECKED_KEYS:
+        return None
+    if value is None:
+        defaults = {f.name: f.default for f in dataclasses.fields(LoopOptions)}
+        return "must not be null" if key in defaults and defaults[key] is not None else None
+    if key in OPTION_INT_KEYS:
+        ok = isinstance(value, int) and not isinstance(value, bool)
+        return None if ok else "must be an integer, not %r" % (value,)
+    if key in OPTION_NUMBER_KEYS:
+        ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+        return None if ok else "must be a number, not %r" % (value,)
+    if key in OPTION_BOOL_KEYS:
+        return None if isinstance(value, bool) else "must be true or false, not %r" % (value,)
+    if key == "rescue":
+        return None if value in RESCUE_MODES else "must be one of all, json, off, not %r" % (value,)
+    if key in OPTION_STR_KEYS:
+        return None if isinstance(value, str) else "must be a string, not %r" % (value,)
+    if key in OPTION_DICT_KEYS:
+        return None if isinstance(value, dict) else "must be an object, not %r" % (value,)
+    return None
 
 
 @dataclass
@@ -1858,6 +1914,11 @@ class ClaudeToolLoop:
 
     MAX_TURNS = 28  # raised from 16: multi-step analysis tasks (RMSD/Rg/contacts) need more turns
 
+    # In-run compaction state (§2b); reset at the start of every run().
+    last_compactions = 0
+    _run_budget: Optional[int] = None
+    _context_warned = False
+
     def __init__(
         self,
         provider_name: str,
@@ -2226,6 +2287,34 @@ class ClaudeToolLoop:
             **extra,
         )
 
+    def _compact_for_call(self, messages: List[Dict]) -> Tuple[List[Dict], bool]:
+        """The message list for the next provider call (§2b In-run compaction).
+
+        At 90% of the run budget, emit one ``status context_near_full`` per
+        request. At 100%, return a copy in which the tool results of all but
+        the last 2 tool rounds are 300-character stubs (a C5 output-path note
+        stays as the last line) and every image but the newest is a text
+        stub. The in-run ``messages`` list, and therefore messages_out, keeps
+        the full bodies; the estimate is character-based on purpose.
+        """
+        budget = self._run_budget
+        if budget is None:
+            return messages, False
+        used = messages_chars(messages)
+        if used >= CONTEXT_WARN_FRACTION * budget and not self._context_warned:
+            self._context_warned = True
+            self._on_meta({
+                "kind": "status",
+                "phase": "context_near_full",
+                "message": "Context is nearly full; older tool output will be shortened.",
+                "used_chars": used,
+                "budget_chars": budget,
+            })
+        if used < budget:
+            return messages, False
+        self.last_compactions += 1
+        return compact_tool_results(messages, keep_rounds=2, keep_images=1), True
+
     def _on_meta(self, item: Dict[str, Any]) -> None:
         """Streamer→loop callback, wired only when ``options`` is set.
 
@@ -2505,6 +2594,18 @@ class ClaudeToolLoop:
         if self.wiki_store is not None:
             system_prompt = system_prompt + WIKI_SYSTEM_PROMPT_ADDENDUM
 
+        # In-run compaction (§2b): only with options.compact_in_run. The
+        # budget uses the final system prompt and the tools sent on turn 1.
+        self.last_compactions = 0
+        self._context_warned = False
+        self._run_budget = None
+        if self.options is not None and getattr(self.options, "compact_in_run", False):
+            self._run_budget = compute_run_budget(
+                context_tokens_for(self.provider_name, self.options),
+                len(system_prompt),
+                len(json.dumps(self._tools_for_turn())),
+            )
+
         self._ctx = ctx
         self._turn = 0
         self._turn_meta = {}
@@ -2544,8 +2645,13 @@ class ClaudeToolLoop:
                     # Real SSE streaming: on_text fires for each text delta
                     # as the provider produces it. cancel_event is checked
                     # between SSE events so Stop interrupts mid-generation.
+                    # Only the per-call copy is compacted; ``messages`` (and
+                    # therefore messages_out) keeps the full bodies.
+                    call_messages = messages
+                    if self._run_budget is not None:
+                        call_messages, _compacted = self._compact_for_call(messages)
                     text, tool_blocks = self._call_turn(
-                        messages, system_prompt, on_text, cancel_event,
+                        call_messages, system_prompt, on_text, cancel_event,
                     )
                 except (ClaudeLoopError, RunCancelled):
                     raise
@@ -2816,6 +2922,22 @@ def build_claude_loop(
             wiki_store=wiki_store,
         )
 
+    if name in ("openai-compatible", "openai_compatible"):
+        # A local vLLM/SGLang/LM Studio server. The key falls back to "EMPTY";
+        # on this env-driven path the URL comes from VMD_AI_OPENAI_BASE_URL.
+        key, _source = resolve_openai_compatible_api_key()
+        chosen = explicit_model or os.getenv("VMD_AI_MODEL") or ""
+        if not chosen:
+            logger.warning("openai-compatible provider requested but no model configured.")
+            return None
+        return ClaudeToolLoop(
+            provider_name="openai-compatible",
+            api_key=key,
+            model=chosen,
+            docs_search=docs_search,
+            wiki_store=wiki_store,
+        )
+
     return None
 
 
@@ -2823,7 +2945,7 @@ def build_claude_loop(
 # History → Anthropic messages conversion
 # ---------------------------------------------------------------------------
 
-def events_to_messages(events: List[Dict]) -> List[Dict]:
+def events_to_messages(events: List[Dict], drop_trailing_user: bool = False) -> List[Dict]:
     """Convert stored JSONL events into Anthropic-style alternating messages.
 
     Only ``user`` and ``assistant`` roles produce messages.  Consecutive events
@@ -2834,9 +2956,28 @@ def events_to_messages(events: List[Dict]) -> List[Dict]:
     don't have enough information to rebuild full tool_use/tool_result blocks
     from the JSONL log.  The resulting message list gives Claude *textual*
     context of the prior conversation, which is sufficient for continuity.
+
+    ``drop_trailing_user`` skips the last user message event when no
+    assistant message follows it: the prompt chat.send has just persisted,
+    which run() appends again (the resume dedupe fix, spec §2b).
     """
+    skip_index = -1
+    if drop_trailing_user:
+        for index in range(len(events) - 1, -1, -1):
+            ev = events[index]
+            if str(ev.get("type") or "") != "message" or not str(ev.get("text") or "").strip():
+                continue
+            role = str(ev.get("role") or "")
+            if role == "assistant":
+                break
+            if role == "user":
+                skip_index = index
+                break
+
     messages: List[Dict] = []
-    for ev in events:
+    for index, ev in enumerate(events):
+        if index == skip_index:
+            continue
         role = str(ev.get("role") or "")
         etype = str(ev.get("type") or "")
         text = str(ev.get("text") or "").strip()
@@ -2855,6 +2996,4 @@ def events_to_messages(events: List[Dict]) -> List[Dict]:
             else:
                 messages.append({"role": "assistant", "content": text})
 
-    # Ensure the list doesn't end with a user message that will be duplicated
-    # by the new prompt (the caller appends the new user message separately).
     return messages

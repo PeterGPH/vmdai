@@ -30,10 +30,10 @@ CAPABILITIES = {
     "tools": ["run_vmd_command", "capture_vmd_snapshot"],
     "agent_loop": True,     # Claude drives tool calls autonomously
     "history": True,
-    "keys": ["openrouter", "anthropic"],
+    "keys": ["openrouter", "anthropic", "openai-compatible"],
 }
 
-CONVERSATION_MODES = ("local_first", "hybrid_resume", "resume_only")
+CONVERSATION_MODES = ("local_first", "hybrid_resume", "resume_only", "full")
 
 # Runtime RPC/auth protocol, reported in the READY line, /health and
 # runtime.info (§2c). 2 = launch token + tool.ack. It is separate from the

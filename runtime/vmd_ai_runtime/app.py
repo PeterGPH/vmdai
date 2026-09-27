@@ -10,37 +10,70 @@ Key additions over the skeleton:
 """
 from __future__ import annotations
 
+import copy
 import hmac
+import json
+import logging
 import os
 import threading
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pathlib import Path
 
+from . import conversation
+from . import provider_catalog
+from . import settings_store as settings_mod
 from .claude_loop import (
     ClaudeLoopError,
     ClaudeToolLoop,
+    LoopOptions,
     RunContext,
     VMD_SYSTEM_PROMPT,
+    WIKI_SYSTEM_PROMPT_ADDENDUM,
     build_claude_loop,
-    events_to_messages,
 )
+from .locks import ChatLock
 from .recorder import RunRecorder
-from .constants import CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_VERSION
+from .constants import CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_PROTOCOL, RUNTIME_VERSION
 from .docs_search import DocsSearch
 from .errors import RpcError
 from .keys import KeyStore
-from .logging_utils import redact_sensitive
+from .logging_utils import default_log_path, redact_sensitive
 from .protocol import validate_method_params, validate_rpc_payload
 from .provider import (
     build_provider,
+    resolve_anthropic_api_key,
     resolve_ollama_model,
+    resolve_openai_compatible_api_key,
     resolve_openrouter_api_key,
+)
+from .settings_store import (
+    DEFAULT_BASE_URLS,
+    DEFAULT_PROFILE_NAMES,
+    TOP_LEVEL_DEFAULTS,
+    SettingsError,
+    SettingsStore,
+    checked_setting,
+    normalize_provider,
+    resolve_profile,
 )
 from .sessions import RequestState, SessionManager, SessionState
 from .store import ChatStore
 from .tool_bridge import VmdToolBridge
 from .wiki_store import WikiStore
+
+
+# §2f Rescue: shown once per token session whose profile opts into rescue "all".
+RESCUE_ALL_NOTICE = (
+    "This profile runs tool calls that the model writes as plain text "
+    "(options.rescue is \"all\"), including tcl code blocks in its answers. "
+    "Set options.rescue to \"json\" in ~/.vmdai/settings.json to run only "
+    "tool-call JSON that names an offered tool."
+)
+
+
+# settings.json keys settings.set may write (§2f Schema); they need a token session.
+PERSISTED_SETTING_KEYS = tuple(TOP_LEVEL_DEFAULTS)
 
 
 class RuntimeApp:
@@ -58,7 +91,15 @@ class RuntimeApp:
         allow_tokenless_v1: bool = True,
         on_shutdown: Optional[Callable[[], None]] = None,
         loop_factory: Optional[Callable[[Dict[str, Any]], Optional[ClaudeToolLoop]]] = None,
+        settings_store: Optional[SettingsStore] = None,
+        cli_provider: Optional[str] = None,
     ):
+        # Runtime-owned profiles (§2f). Only main.py passes a store; tests
+        # and the A/B scripts keep plan 02's env-driven behaviour.
+        self.settings_store = settings_store
+        self.cli_provider = (str(cli_provider).strip() or None) if cli_provider else None
+        self.first_run_servers: List[Dict[str, Any]] = []
+        self._profile_router: Optional[Callable[[Optional[Dict[str, Any]]], Optional[ClaudeToolLoop]]] = None
         self.sessions = SessionManager()
         # Launch token (§2e). main.py generates it; None (in-process tests)
         # means no session can authenticate and runtime.shutdown is refused.
@@ -115,7 +156,6 @@ class RuntimeApp:
             if openrouter_key:
                 env_provider = "openrouter"
             else:
-                from .provider import resolve_anthropic_api_key
                 anthropic_key, _src = resolve_anthropic_api_key()
                 if anthropic_key:
                     env_provider = "anthropic-direct"
@@ -147,6 +187,29 @@ class RuntimeApp:
                 self.provider_name,
                 self.has_agent_loop(),
             )
+
+        if settings_store is not None and loop_factory is None:
+            # Settings profiles (token sessions) get the product loop; the
+            # legacy {provider, model} profile keeps plan 02's factory. The
+            # router is the base factory, so provider.set's reset keeps it.
+            legacy_factory = self._base_loop_factory
+
+            def _route(profile: Optional[Dict[str, Any]]) -> Optional[ClaudeToolLoop]:
+                if profile is not None and "source" in profile:
+                    return self._profile_loop_factory(profile)
+                return legacy_factory(profile)
+
+            self._base_loop_factory = _route
+            self._loop_factory = _route
+            self._profile_router = _route
+        if settings_store is not None and not settings_store.exists():
+            # First run (§2f): probe :11435 then :11434, 300 ms each.
+            try:
+                self.first_run_servers = list(settings_mod.probe_local_ollama())
+                settings_store.first_run(self.first_run_servers)
+            except Exception:
+                if self.logger:
+                    self.logger.warning("first-run probe failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Loop factory (§3): a fresh ClaudeToolLoop per request
@@ -180,18 +243,39 @@ class RuntimeApp:
         )
 
     def profile_for_session(self, state: Optional[SessionState] = None) -> Optional[Dict[str, Any]]:
-        """The profile a request of ``state`` runs with.
+        """The profile a request of ``state`` runs with (§7 Precedence).
 
-        M1 foundation: the legacy profile {provider, model} from the
-        env/--provider choice and the last provider.set. Plan 03 makes
-        token sessions read the active profile in settings.json.
+        Token sessions of a runtime that owns settings.json use
+        resolve_profile (CLI flag > active profile; VMD_AI_PROVIDER is
+        seed-only and never used live); the
+        returned copy adds ``name`` and ``source``, and None means there is
+        no usable profile (NO_MODEL). Everything else gets the legacy
+        profile {provider, model}: the env/--provider choice and the model
+        of the last provider.set.
         """
+        if state is not None and getattr(state, "authenticated", False) and self.settings_store is not None:
+            name, profile, source = resolve_profile(self.settings_store, self.cli_provider, os.environ)
+            if profile is None:
+                return None
+            out = copy.deepcopy(profile)
+            out["name"] = name
+            out["source"] = source
+            return out
         return {"provider": self._loop_provider, "model": self._loop_model}
 
     def has_agent_loop(self, state: Optional[SessionState] = None) -> bool:
-        """True when a request of ``state`` would run the agent loop, not mock mode."""
+        """True when a request of ``state`` would run the agent loop, not mock mode.
+
+        Settings profiles get the cheap predicate (_can_build_profile), which
+        never builds a ClaudeToolLoop; everything else asks the active
+        factory (plan 02 review ruling (b)).
+        """
         try:
-            return self._loop_factory(self.profile_for_session(state)) is not None
+            profile = self.profile_for_session(state)
+            router = self._profile_router
+            if router is not None and self._loop_factory is router and profile is not None and "source" in profile:
+                return self._can_build_profile(profile)   # ruling (b): no loop is built
+            return self._loop_factory(profile) is not None
         except Exception:
             if self.logger:
                 self.logger.warning("loop factory failed", exc_info=True)
@@ -206,6 +290,288 @@ class RuntimeApp:
                 f"failed to build the agent loop: {exc}",
                 {"provider": (profile or {}).get("provider")},
             )
+
+    # ------------------------------------------------------------------
+    # Settings profiles (§2f)
+    # ------------------------------------------------------------------
+
+    def _profile_loop_parts(self, profile: Optional[Dict[str, Any]]) -> Optional[tuple]:
+        """(provider, model, api_key) for a settings profile, or None when no loop can be built.
+
+        Cheap: builds no ClaudeToolLoop. The factory and _can_build_profile share it."""
+        if not profile:
+            return None
+        provider_name = normalize_provider(profile.get("provider"))
+        model = str(profile.get("model") or "").strip()
+        if not provider_name or not model:
+            return None
+        if provider_name == "ollama":
+            api_key = str(profile.get("base_url") or DEFAULT_BASE_URLS["ollama"]).rstrip("/")
+        else:
+            api_key = self._api_key_for(provider_name)
+            if not api_key:
+                return None
+        return provider_name, model, api_key
+
+    def _can_build_profile(self, profile: Optional[Dict[str, Any]]) -> bool:
+        """Plan 02 final review (b): the profile factory's cheap can_build predicate."""
+        return self._profile_loop_parts(profile) is not None
+
+    def _profile_loop_factory(self, profile: Dict[str, Any]) -> Optional[ClaudeToolLoop]:
+        """One product loop for a settings profile (§2f, C7).
+
+        Options come from LoopOptions.product(profile) with max_turns from
+        settings.json; keys from provider.resolve_* (env, then keyring). The
+        wiki is wired only when settings.wiki_enabled is true (§2g). Returns
+        None when the profile has no model or a needed key is missing.
+        """
+        parts = self._profile_loop_parts(profile)
+        if parts is None:
+            return None
+        provider_name, model, api_key = parts
+        options = LoopOptions.product(profile, max_turns=int(self._setting("max_turns")))
+        wiki = self.wiki_store if self._setting("wiki_enabled") else None
+        return ClaudeToolLoop(provider_name=provider_name, api_key=api_key, model=model,
+                              docs_search=self.docs_search, wiki_store=wiki, options=options)
+
+    @staticmethod
+    def _api_key_for(provider_name: str) -> str:
+        if provider_name == "anthropic-direct":
+            return resolve_anthropic_api_key()[0]
+        if provider_name == "openrouter":
+            return resolve_openrouter_api_key()[0]
+        if provider_name == "openai-compatible":
+            return resolve_openai_compatible_api_key()[0]
+        return ""
+
+    def _setting(self, name: str) -> Any:
+        """A top-level settings.json value, or its default when there is no store
+        or the stored value is malformed (M1)."""
+        if self.settings_store is None:
+            return TOP_LEVEL_DEFAULTS[name]
+        return checked_setting(self.settings_store.load(), name)
+
+    def _profile_summary(self, state) -> Optional[Dict[str, Any]]:
+        profile = self.profile_for_session(state)
+        if profile is None or "source" not in profile:
+            return None
+        summary = {"name": profile.get("name"), "provider": profile.get("provider"),
+                   "model": profile.get("model", "")}
+        if profile.get("base_url"):
+            summary["base_url"] = profile["base_url"]
+        return summary
+
+    @staticmethod
+    def _no_model_error() -> RpcError:
+        return RpcError(
+            "NO_MODEL",
+            "No model configured. Choose a provider and model, or add a profile to ~/.vmdai/settings.json.",
+            {"action": "open_settings"},
+        )
+
+    # ------------------------------------------------------------------
+    # M1 RPC helpers (§2c, §3)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _turn_tracker(request) -> Callable[[Dict[str, Any]], None]:
+        """on_event for v1 sessions: keeps RequestState.turn current for runtime.info.
+
+        v1 sessions get no queue events from on_event (§2a Legacy callbacks);
+        P07-T01 replaces this with _make_on_event for v2 sessions.
+        """
+        def on_event(item: Dict[str, Any]) -> None:
+            metadata = item.get("metadata") or {}
+            if request is not None and metadata.get("kind") == "turn.started":
+                try:
+                    request.turn = int(metadata.get("turn") or 0)
+                except (TypeError, ValueError):
+                    pass
+        return on_event
+
+    @staticmethod
+    def _vision_for(loop: Optional[ClaudeToolLoop]) -> bool:
+        if loop is None:
+            return False
+        if loop.provider_name == "anthropic-direct":
+            return True
+        return getattr(getattr(loop, "options", None), "supports_vision", None) is True
+
+    def _max_turns_for(self, loop: Optional[ClaudeToolLoop]) -> int:
+        options = getattr(loop, "options", None) if loop is not None else None
+        if options is not None:
+            return int(options.max_turns)
+        if loop is not None:
+            return int(loop.MAX_TURNS)
+        return int(self._setting("max_turns"))
+
+    @staticmethod
+    def _log_path() -> str:
+        for handler in logging.getLogger().handlers:
+            name = getattr(handler, "baseFilename", None)
+            if name:
+                return str(name)
+        return default_log_path()
+
+    def _runtime_info(self, state) -> Dict[str, Any]:
+        loop = self._new_loop_for(state)
+        profile = self.profile_for_session(state) or {}
+        # A token session of a runtime that owns settings.json never runs the
+        # env/mock provider (§2f), so with no usable profile it reports "".
+        fallback = "" if (state.authenticated and self.settings_store is not None) else self.provider_name
+        info: Dict[str, Any] = {
+            "version": RUNTIME_VERSION,
+            "protocol": RUNTIME_PROTOCOL,
+            "pid": os.getpid(),
+            "provider": loop.provider_name if loop is not None else str(profile.get("provider") or fallback),
+            "model": loop.model if loop is not None else str(profile.get("model") or ""),
+            "agent_loop": loop is not None,
+            "vision": self._vision_for(loop),
+            "tools": [str(tool.get("name")) for tool in loop._tools_for_turn()] if loop is not None else [],
+            "rag": bool(self.docs_search is not None and getattr(self.docs_search, "is_available", False)),
+            "wiki": bool(loop is not None and loop.wiki_store is not None),
+            "max_turns": self._max_turns_for(loop),
+            "log_path": self._log_path(),
+            "settings_source": (self.settings_store.settings_source
+                                if self.settings_store is not None else "default"),
+            "first_run": {"servers": copy.deepcopy(self.first_run_servers)},
+        }
+        active = state.active_request
+        if self._request_running(state):
+            info["active_request"] = {
+                "request_id": active.request_id,
+                "turn": int(active.turn),
+                "started_at": float(active.started_at),
+                "last_seq": state.queue.last_seq,
+            }
+        return info
+
+    def _catalog_target(self, state, params: Dict[str, Any]) -> Tuple[str, str, str, str]:
+        """(provider, base_url, model, api_key) for models.list/provider.test.
+
+        Missing params come from the session's profile when the provider
+        matches, else from the provider's defaults.
+        """
+        profile = self.profile_for_session(state) or {}
+        profile_provider = normalize_provider(profile.get("provider"))
+        provider_name = normalize_provider(params.get("provider")) or profile_provider
+        same = provider_name == profile_provider
+        base_url = (params.get("base_url") or (profile.get("base_url") if same else "")
+                    or DEFAULT_BASE_URLS.get(provider_name) or "")
+        model = params.get("model") or (profile.get("model") if same else "") or ""
+        return provider_name, str(base_url), str(model), self._api_key_for(provider_name)
+
+    def _capabilities_for(self, profile: Dict[str, Any]) -> Dict[str, bool]:
+        provider_name = normalize_provider(profile.get("provider"))
+        options = profile.get("options") or {}
+        if provider_name == "ollama" and profile.get("model"):
+            base_url = profile.get("base_url") or DEFAULT_BASE_URLS["ollama"]
+            try:
+                show = provider_catalog.ollama_show(base_url, profile["model"], timeout=2.0)
+            except Exception:
+                return {"tools": False, "vision": False, "thinking": False}
+            return provider_catalog.model_capabilities(show)
+        return {"tools": True,
+                "vision": provider_name == "anthropic-direct" or options.get("supports_vision") is True,
+                "thinking": False}
+
+    def _settings_rpc_error(self, exc: SettingsError) -> RpcError:
+        if exc.code in ("IN_USE", "NOT_FOUND"):
+            return RpcError(exc.code, exc.message)
+        if exc.code == "READ_ONLY":
+            source = self.settings_store.settings_source if self.settings_store is not None else "default"
+            return RpcError("INVALID_PARAMS", exc.message, {"reason": "read_only", "settings_source": source})
+        return RpcError("INVALID_PARAMS", exc.message)
+
+    @staticmethod
+    def _apply_target(store: SettingsStore, provider_name: str) -> str:
+        """The profile name a provider *switch* (no explicit ``profile``) lands on (I1).
+
+        Prefers an existing profile of ``provider_name`` — the default-named
+        one, else the first one found — over creating a fresh profile, so
+        switching providers and back restores that profile's base_url and
+        options untouched instead of overwriting the active profile in place.
+        Only when no profile of this provider exists does it fall back to
+        creating one, trying ``<default>``, ``<default>-2``, ``<default>-3``, ...
+        """
+        profiles = store.load()["profiles"]
+        same = [n for n, p in profiles.items()
+                if isinstance(p, dict) and normalize_provider(p.get("provider")) == provider_name]
+        default_name = DEFAULT_PROFILE_NAMES[provider_name]
+        if default_name in same:
+            return default_name
+        if same:
+            return same[0]
+        name = default_name
+        suffix = 2
+        while name in profiles:
+            name = "%s-%d" % (default_name, suffix)
+            suffix += 1
+        return name
+
+    def _provider_set_profile(self, state, params: Dict[str, Any]) -> Dict[str, Any]:
+        """provider.set for a token session: persist into the active, named or
+        provider-matching profile.
+
+        Applies to the next request. With an explicit ``profile`` name it
+        edits (or creates) that profile in place, unchanged from before.
+        Without a name:
+          - if the active profile already runs the requested provider, it is
+            edited in place (M1 ui.tcl Apply, §2f) — a plain model change
+            never disturbs another profile;
+          - otherwise this is a provider *switch*: ``_apply_target`` picks
+            (or creates) a profile of that provider and activates it, so a
+            round trip through another provider and back restores the
+            original profile's base_url and options (whole-branch review I1)
+            instead of overwriting the active profile in place;
+          - with no active profile at all, the provider's default-named
+            profile is edited (or created) and activated: first run may have
+            seeded ``claude``/``openrouter`` from last_provider.txt without
+            activating it, and applying it is the user's explicit choice.
+        """
+        store = self.settings_store
+        provider_name = normalize_provider(params.get("provider"))
+        if not provider_name:
+            raise RpcError("INVALID_PARAMS",
+                           "provider must be one of anthropic-direct, openrouter, ollama, openai-compatible",
+                           {"provider": params.get("provider")})
+        model = str(params.get("model") or "").strip() or None
+        base_url = str(params.get("base_url") or "").strip() or None
+        options = params.get("options")
+        name = str(params.get("profile") or "").strip()
+        switch = False
+        try:
+            active_name, active = store.active_profile()
+            if not name:
+                if active is not None and normalize_provider(active.get("provider")) == provider_name:
+                    name = active_name
+                else:
+                    name = self._apply_target(store, provider_name)
+                    switch = True
+            if store.get_profile(name) is None:
+                profile: Dict[str, Any] = {"provider": provider_name, "model": model or "",
+                                           "options": dict(options or {})}
+                url = base_url or DEFAULT_BASE_URLS.get(provider_name)
+                if url:
+                    profile["base_url"] = url
+                store.save_profile(name, profile, activate=(active_name is None or switch))
+            else:
+                store.update_profile(name, provider=provider_name, model=model, base_url=base_url, options=options)
+                if active_name is None or switch:
+                    store.activate(name)
+        except SettingsError as exc:
+            raise self._settings_rpc_error(exc)
+        saved = store.get_profile(name) or {}
+        if saved.get("model"):
+            state.settings["model"] = saved["model"]
+        return {
+            "ok": True,
+            "provider": provider_name,
+            "model": saved.get("model", ""),
+            "profile": name,
+            "agent_loop": self.has_agent_loop(state),
+            "capabilities": self._capabilities_for(saved),
+        }
 
     # ------------------------------------------------------------------
     # RPC dispatch
@@ -312,7 +678,9 @@ class RuntimeApp:
                     "this runtime was started with --announce; "
                     "session.start needs the launch token",
                 )
-            chat_id = self.store.create_chat(title_hint="VMD AI Chat")
+            # Token sessions create their chat lazily on the first chat.send
+            # (§2b Lock lifecycle); tokenless sessions keep eager creation.
+            chat_id = None if authenticated else self.store.create_chat(title_hint="VMD AI Chat")
             state = self.sessions.create_session(
                 cwd=params["cwd"],
                 chat_id=chat_id,
@@ -351,84 +719,105 @@ class RuntimeApp:
             if authenticated:
                 result["event_protocol"] = state.event_protocol
                 result["runtime"] = {"version": RUNTIME_VERSION, "pid": os.getpid()}
+                result["profile"] = self._profile_summary(state)
             return result
 
         if method == "session.stop":
             state = self._get_session(params["session_id"], session_token)
-            self._cancel_active_request(state)
-            self.sessions.remove(state.session_id)
+            with state.lock:
+                self._cancel_active_request(state)
+                self._release_chat_lock(state)
+                self.sessions.remove(state.session_id)
             return {"ok": True}
 
         # ---- Chat ----
 
         if method == "chat.send":
             state = self._get_session(params["session_id"], session_token)
-            if params.get("model"):
+            # A token session always runs its profile's model (§2h).
+            if params.get("model") and not state.authenticated:
                 state.settings["model"] = params["model"]
             if params.get("mode"):
                 state.settings["mode"] = params["mode"]
             if params.get("conversation_mode"):
                 state.settings["conversation_mode"] = params["conversation_mode"]
 
-            # The session lock makes check-then-start atomic: two concurrent
-            # chat.send calls on one session can never both start a request.
+            # The session lock makes check-then-start atomic (plan 02). The
+            # chat is captured here, so the worker keeps writing to it even if
+            # the session later resumes another chat.
             with state.lock:
-                active = state.active_request
-                if active is not None and (active.thread is None or active.thread.is_alive()):
+                if self.sessions.get(state.session_id) is not state:
+                    # M4: a request that raced _get_session before session.stop
+                    # released this session's lock and removed it (§3).
+                    raise RpcError("AUTH_FAILED", "invalid session or token")
+                if self._request_running(state):
                     raise RpcError("REQUEST_CONFLICT", "an active request is already running")
-
-                # A fresh loop for this request (None → mock mode).
-                loop = self._build_loop(self.profile_for_session(state))
-
+                # A fresh loop for this request (None: mock mode).
+                loop = self._new_loop_for(state)
+                if loop is None and state.authenticated and self.settings_store is not None:
+                    # Mock mode is not reachable from the product (§2f).
+                    raise self._no_model_error()
+                loop_options = getattr(loop, "options", None)
+                if (state.authenticated and loop_options is not None
+                        and getattr(loop_options, "rescue", None) == "all"
+                        and not getattr(state, "rescue_all_noticed", False)):
+                    # §2f: rescue "all" is an explicit profile opt-in, and a
+                    # notice explains it (once per session).
+                    state.rescue_all_noticed = True
+                    state.queue.push("system", "message", RESCUE_ALL_NOTICE, {"notice": "rescue_all"})
+                if state.chat_id is None:
+                    self._open_new_chat(state)
+                chat_id = state.chat_id
                 request_id = f"req_{os.urandom(6).hex()}"
                 request = RequestState(request_id=request_id)
                 state.active_request = request
-
-                # Roll back on any failure before the worker starts (a store
-                # write error, a prompt the store cannot encode): a request
-                # left with thread=None would count as running forever.
                 try:
                     user_event = state.queue.push(
                         "user", "message", params["text"], {"request_id": request_id}
                     )
-                    self.store.append_events(state.chat_id, [user_event])
+                    self.store.append_events(chat_id, [user_event])
 
                     # Auto-set chat title from the first user message
-                    manifest = self.store.get_manifest(state.chat_id)
+                    manifest = self.store.get_manifest(chat_id)
                     if manifest and manifest.get("message_count", 0) <= 1:
                         title = params["text"][:60].strip()
                         if len(params["text"]) > 60:
                             title += "..."
-                        self.store.update_title(state.chat_id, title)
+                        self.store.update_title(chat_id, title)
 
-                    # Build prior context when conversation_mode asks for it
                     conv_mode = str(state.settings.get("conversation_mode") or "local_first")
-                    prior_messages = None
-                    if conv_mode in ("hybrid_resume", "resume_only") and loop is not None:
-                        try:
-                            raw_events = self.store.read_events(state.chat_id, limit=200)
-                            prior_messages = events_to_messages(raw_events)
-                        except Exception:
-                            prior_messages = None
-
-                    # Use the agent loop when there is one; fall back to the simple provider
                     if loop is not None:
-                        target = self._run_claude_loop_response
-                        args = (state.session_id, request_id, params["text"],
-                                request.cancel_event, prior_messages, loop)
+                        system_prompt = self._system_prompt_for_request(state)
+                        try:
+                            prior_messages = self._prior_for(state, chat_id, conv_mode, loop, system_prompt)
+                        except Exception:
+                            if self.logger:
+                                self.logger.warning("building the prior failed; sending without history",
+                                                    exc_info=True)
+                            prior_messages = None
+                        thread = threading.Thread(
+                            target=self._run_claude_loop_response,
+                            args=(state.session_id, request_id, params["text"], request.cancel_event,
+                                  prior_messages),
+                            kwargs={"loop": loop, "chat_id": chat_id, "system_prompt": system_prompt},
+                            daemon=True,
+                        )
                     else:
-                        target = self._run_provider_response
-                        args = (state.session_id, request_id, params["text"],
-                                request.cancel_event, prior_messages)
-
-                    thread = threading.Thread(target=target, args=args, daemon=True)
+                        thread = threading.Thread(
+                            target=self._run_provider_response,
+                            args=(state.session_id, request_id, params["text"], request.cancel_event, None),
+                            daemon=True,
+                        )
                     request.thread = thread
                     thread.start()
                 except Exception:
-                    if state.active_request is request:
-                        state.active_request = None
+                    self._clear_active(state, request_id)
                     raise
-            return {"request_id": request_id}
+
+            reply: Dict[str, Any] = {"request_id": request_id}
+            if state.authenticated:
+                reply["chat_id"] = chat_id
+            return reply
 
         if method == "chat.cancel":
             state = self._get_session(params["session_id"], session_token)
@@ -466,6 +855,8 @@ class RuntimeApp:
 
         if method == "chat.resume":
             state = self._get_session(params["session_id"], session_token)
+            if state.authenticated:
+                return self._resume_token_session(state, params["chat_id"])
             self._cancel_active_request(state)
             chat_id = params["chat_id"]
             manifest = self.store.get_manifest(chat_id)
@@ -497,10 +888,25 @@ class RuntimeApp:
         if method == "settings.set":
             state = self._get_session(params["session_id"], session_token)
             patch = dict(params.get("patch") or {})
+            persisted = {key: patch[key] for key in PERSISTED_SETTING_KEYS if key in patch}
+            owns_settings = bool(state.authenticated) and self.settings_store is not None
+            if persisted and not owns_settings and set(persisted) - {"reasoning_visible"}:
+                # reasoning_visible stays a per-session key for tokenless clients.
+                self._require_auth(state)
+            saved = None
+            if owns_settings and persisted:
+                try:
+                    saved = self.settings_store.patch(persisted)
+                except SettingsError as exc:
+                    raise self._settings_rpc_error(exc)
             for name in ("model", "mode", "conversation_mode", "reasoning_visible", "debug_mode"):
                 if name in patch:
                     state.settings[name] = patch[name]
-            return {"ok": True, "settings": dict(state.settings)}
+            reply: Dict[str, Any] = {"ok": True, "settings": dict(state.settings)}
+            if owns_settings:
+                reply["persisted"] = saved if saved is not None else {
+                    key: self._setting(key) for key in PERSISTED_SETTING_KEYS}
+            return reply
 
         # ---- Provider switching ----
         #
@@ -514,6 +920,12 @@ class RuntimeApp:
 
         if method == "provider.set":
             state = self._get_session(params["session_id"], session_token)
+            privileged = (bool(params.get("base_url")) or params.get("options") is not None
+                          or bool(params.get("profile")))
+            if privileged:
+                self._require_auth(state)
+            if state.authenticated and self.settings_store is not None:
+                return self._provider_set_profile(state, params)
             requested = str(params["provider"] or "").strip().lower()
             if not requested:
                 raise RpcError("INVALID_PARAMS", "provider is required")
@@ -664,6 +1076,35 @@ class RuntimeApp:
 
             return {"ok": True, "resolved": resolved}
 
+        # ---- M1 runtime RPCs (§2c Stage split, §3) ----
+
+        if method == "runtime.info":
+            state = self._get_session(params["session_id"], session_token)
+            return self._runtime_info(state)
+
+        if method == "session.set_cwd":
+            state = self._get_session(params["session_id"], session_token)
+            self._require_auth(state)
+            path = os.path.realpath(os.path.expanduser(params["cwd"]))
+            if not os.path.isdir(path):
+                raise RpcError("INVALID_PARAMS", "cwd is not a directory", {"cwd": params["cwd"]})
+            state.cwd = path
+            return {"ok": True, "cwd": path}
+
+        if method == "models.list":
+            state = self._get_session(params["session_id"], session_token)
+            if params.get("base_url"):
+                self._require_auth(state)
+            provider_name, base_url, _model, api_key = self._catalog_target(state, params)
+            return provider_catalog.list_models(provider_name, base_url, api_key=api_key)
+
+        if method == "provider.test":
+            state = self._get_session(params["session_id"], session_token)
+            if params.get("base_url"):
+                self._require_auth(state)
+            provider_name, base_url, model, api_key = self._catalog_target(state, params)
+            return provider_catalog.test_provider(provider_name, base_url, model, api_key=api_key)
+
         raise RpcError("METHOD_NOT_FOUND", f"Unknown method: {method}")
 
     # ------------------------------------------------------------------
@@ -709,32 +1150,34 @@ class RuntimeApp:
         request_id: str,
         prompt: str,
         cancel_event: threading.Event,
-        prior_messages: list | None = None,
-        loop: ClaudeToolLoop | None = None,
+        prior_messages: Optional[list] = None,
+        loop: Optional[ClaudeToolLoop] = None,
+        chat_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ) -> None:
-        """
-        Full agentic response: the model calls VMD tools as needed until done.
-        Runs on a daemon thread with the loop chat.send built for this
-        request; pushes chunk/lifecycle events to the queue.
+        """Full agentic response on a daemon thread.
+
+        chat.send passes the loop it built for this request, the chat it
+        captured when the request started, and the system prompt the prior
+        was budgeted for. Token sessions also get a messages.jsonl Appender
+        (full memory, §2b).
         """
         state = self.sessions.get(session_id)
         if state is None:
             return
         if loop is None:
-            if state.active_request and state.active_request.request_id == request_id:
-                state.active_request = None
+            self._clear_active(state, request_id)
             return
-
-        model = str(state.settings.get("model") or DEFAULT_SETTINGS["model"])
-        mode = str(state.settings.get("mode") or "work")
-        system_prompt = VMD_SYSTEM_PROMPT + f"\n\nMode: {mode}."
-        chunk_events = []
+        if chat_id is None:
+            chat_id = state.chat_id
+        if system_prompt is None:
+            system_prompt = self._system_prompt_for_request(state)
+        chunk_events: List[Dict[str, Any]] = []
 
         def on_chunk(chunk: str) -> None:
-            ev = state.queue.push(
-                "assistant", "chunk", chunk, {"request_id": request_id}
+            chunk_events.append(
+                state.queue.push("assistant", "chunk", chunk, {"request_id": request_id})
             )
-            chunk_events.append(ev)
 
         def on_tool_start(tool_name: str, tool_input: dict) -> None:
             # Tool start events are pushed directly by VmdToolBridge
@@ -744,10 +1187,13 @@ class RuntimeApp:
             # Transcript entry for tool results is written in tool.command_result handler
             pass
 
-        # The session's model setting overrides the loop's model, as before.
-        # A per-request loop is adjusted in place. An assigned loop is shared
-        # between requests, so it gets a copy, which now keeps the wiki store.
-        if model and model != loop.model:
+        # The session's model setting overrides the loop's model (plan 02).
+        # A per-request loop is adjusted in place; an assigned loop is shared
+        # between requests, so it gets a copy that keeps the wiki store.
+        # Token sessions always run their profile's model (§2h); the session
+        # model override stays for tokenless clients only.
+        model = str(state.settings.get("model") or DEFAULT_SETTINGS["model"])
+        if not state.authenticated and model and model != loop.model:
             if loop is self._assigned_loop:
                 loop = ClaudeToolLoop(
                     provider_name=loop.provider_name,
@@ -760,17 +1206,20 @@ class RuntimeApp:
             else:
                 loop.model = model
 
-        # Build a per-task RunRecorder for this chat.send. The recorder
-        # writes <state.cwd>/.vmdai_runs/<task_id>/transcript.tcl plus
-        # snapshots — every successful tool call deposits a replayable
-        # artifact on disk, automatically. Set VMD_AI_RECORDER=off to
-        # disable. Falls back to ~/.vmdai/runs/ when state.cwd is empty
-        # so we never silently drop artifacts.
-        recorder = self._build_recorder_for_session(state)
-        prev_recorder = loop.recorder
-        loop.recorder = recorder
-        ctx = RunContext(request_id=request_id, chat_id=state.chat_id)
+        messages_out = None
+        if state.authenticated and chat_id:
+            messages_out = conversation.Appender(self.store.chat_dir(chat_id), request_id)
+        request = state.active_request
+        if request is not None and request.request_id != request_id:
+            request = None
+        ctx = RunContext(request_id=request_id, chat_id=chat_id or "",
+                         on_event=self._turn_tracker(request), messages_out=messages_out)
 
+        # Per-request recorder; restored afterwards so an assigned (shared)
+        # loop never carries it into the next request.
+        prev_recorder = loop.recorder
+        loop.recorder = self._build_recorder_for_session(state)
+        events_to_persist: List[Dict[str, Any]] = []
         try:
             output = loop.run(
                 prompt=prompt,
@@ -786,52 +1235,27 @@ class RuntimeApp:
                 ctx=ctx,
             )
         except ClaudeLoopError as exc:
-            err_event = state.queue.push(
-                "error",
-                "message",
-                f"Agent error: {exc}",
+            events_to_persist.append(state.queue.push(
+                "error", "message", f"Agent error: {exc}",
                 {"request_id": request_id, "provider": self.provider_name},
-            )
-            self.store.append_events(state.chat_id, [err_event])
-            if state.active_request and state.active_request.request_id == request_id:
-                state.active_request = None
-            loop.recorder = prev_recorder
-            return
+            ))
         except Exception as exc:
-            err_event = state.queue.push(
-                "error",
-                "message",
-                f"Unexpected error: {exc}",
-                {"request_id": request_id},
-            )
-            self.store.append_events(state.chat_id, [err_event])
-            if state.active_request and state.active_request.request_id == request_id:
-                state.active_request = None
-            loop.recorder = prev_recorder
-            return
-
-        # Finalize
-        events_to_persist = list(chunk_events)
-        if cancel_event.is_set():
-            cancel_ev = state.queue.push(
-                "system", "lifecycle", "cancelled", {"request_id": request_id}
-            )
-            events_to_persist.append(cancel_ev)
+            events_to_persist.append(state.queue.push(
+                "error", "message", f"Unexpected error: {exc}", {"request_id": request_id},
+            ))
         else:
-            final_ev = state.queue.push(
-                "assistant", "message", output, {"request_id": request_id}
-            )
-            events_to_persist.append(final_ev)
-
-        if events_to_persist:
-            self.store.append_events(state.chat_id, events_to_persist)
-
-        if state.active_request and state.active_request.request_id == request_id:
-            state.active_request = None
-
-        # Unbind the per-task recorder so an assigned (shared) loop doesn't
-        # carry this run's recorder into the next chat.send.
-        loop.recorder = prev_recorder
+            events_to_persist.extend(chunk_events)
+            if cancel_event.is_set():
+                events_to_persist.append(state.queue.push(
+                    "system", "lifecycle", "cancelled", {"request_id": request_id}))
+            else:
+                events_to_persist.append(state.queue.push(
+                    "assistant", "message", output, {"request_id": request_id}))
+        finally:
+            loop.recorder = prev_recorder
+            if events_to_persist and chat_id:
+                self.store.append_events(chat_id, events_to_persist)
+            self._clear_active(state, request_id)
 
     # ------------------------------------------------------------------
     # Background thread: simple provider (mock / fallback)
@@ -906,6 +1330,120 @@ class RuntimeApp:
         if not active:
             return
         active.cancel_event.set()
+
+    # ------------------------------------------------------------------
+    # Memory, chats and locks (§2b)
+    # ------------------------------------------------------------------
+
+    def _new_loop_for(self, state) -> Optional[ClaudeToolLoop]:
+        """A fresh loop for one request of this session, or None (mock mode).
+
+        The one place request code builds a loop: plan 02's _build_loop
+        (PROVIDER_INIT_FAILED on errors) over profile_for_session.
+        """
+        return self._build_loop(self.profile_for_session(state))
+
+    @staticmethod
+    def _request_running(state) -> bool:
+        active = state.active_request
+        return active is not None and (active.thread is None or active.thread.is_alive())
+
+    @staticmethod
+    def _clear_active(state, request_id: str) -> None:
+        if state.active_request is not None and state.active_request.request_id == request_id:
+            state.active_request = None
+
+    @staticmethod
+    def _release_chat_lock(state) -> None:
+        lock = getattr(state, "chat_lock", None)
+        if lock is not None:
+            lock.release()
+        state.chat_lock = None
+
+    def _open_new_chat(self, state) -> str:
+        """Create this session's chat on its first chat.send and lock it."""
+        chat_id = self.store.create_chat(title_hint="VMD AI Chat")
+        lock = ChatLock(self.store.chat_dir(chat_id))
+        if not lock.acquire():
+            raise RpcError("CHAT_LOCKED", "could not lock the new chat", {"chat_id": chat_id})
+        self._release_chat_lock(state)
+        state.chat_lock = lock
+        state.chat_id = chat_id
+        return chat_id
+
+    def _resume_token_session(self, state, chat_id: str) -> Dict[str, Any]:
+        """chat.resume for a token session: conflicts, per-chat lock, last_seq."""
+        with state.lock:
+            if self.sessions.get(state.session_id) is not state:
+                # M4: a request that raced _get_session before session.stop
+                # released this session's lock and removed it (§3).
+                raise RpcError("AUTH_FAILED", "invalid session or token")
+            if self._request_running(state):
+                raise RpcError("REQUEST_CONFLICT",
+                               "a request is running; stop it before switching chats",
+                               {"chat_id": chat_id})
+            manifest = self.store.get_manifest(chat_id)
+            if manifest is None:
+                raise RpcError("NOT_FOUND", f"chat {chat_id} not found")
+            if chat_id != state.chat_id:
+                lock = ChatLock(self.store.chat_dir(chat_id))
+                if not lock.acquire():
+                    raise RpcError("CHAT_LOCKED", "This chat is open in another VMD window.",
+                                   {"chat_id": chat_id})
+                self._release_chat_lock(state)
+                state.chat_lock = lock
+                state.chat_id = chat_id
+            state.queue.clear()
+            # Polling after last_seq delivers the chat_resumed event below.
+            last_seq = state.queue.last_seq
+            state.queue.push("system", "lifecycle", "chat_resumed", {"chat_id": chat_id})
+        return {
+            "ok": True,
+            "chat_id": chat_id,
+            "title": manifest.get("title", ""),
+            "message_count": manifest.get("message_count", 0),
+            "last_seq": last_seq,
+        }
+
+    def _system_prompt_for_request(self, state) -> str:
+        mode = str(state.settings.get("mode") or "work")
+        return VMD_SYSTEM_PROMPT + f"\n\nMode: {mode}."
+
+    def _run_budget_for(self, loop: ClaudeToolLoop, system_prompt: str) -> int:
+        """run_budget for this loop (§2b Budget), counting the wiki addendum run() adds."""
+        prompt = system_prompt
+        if loop.wiki_store is not None:
+            prompt = prompt + WIKI_SYSTEM_PROMPT_ADDENDUM
+        tools_chars = len(json.dumps(loop._tools_for_turn()))
+        context_tokens = conversation.context_tokens_for(loop.provider_name, getattr(loop, "options", None))
+        return conversation.compute_run_budget(context_tokens, len(prompt), tools_chars)
+
+    def _prior_for(self, state, chat_id: str, conv_mode: str, loop: ClaudeToolLoop,
+                   system_prompt: str) -> Optional[List[Dict[str, Any]]]:
+        """Prior messages for this request (§2b), or None.
+
+        Token sessions in "full" mode read messages.jsonl, seeding it once
+        from a legacy chat's text history. hybrid_resume/resume_only (and
+        "full" from a tokenless session) use the legacy text path with the
+        duplicate-prompt fix. local_first sends no history.
+        """
+        if state.authenticated and conv_mode == "full":
+            chat_dir = self.store.chat_dir(chat_id)
+            if not conversation.messages_path(chat_dir).exists():
+                legacy = conversation.legacy_prior(
+                    self.store.read_events(chat_id, limit=conversation.ALL_EVENTS))
+                conversation.import_legacy(chat_dir, legacy)
+            prior = conversation.build_prior(
+                chat_dir,
+                self._run_budget_for(loop, system_prompt),
+                conversation.max_images_for(loop.provider_name),
+            )
+            return prior or None
+        if conv_mode in ("hybrid_resume", "resume_only", "full"):
+            events = self.store.read_events(chat_id, limit=conversation.ALL_EVENTS)
+            return conversation.trim_text_prior(
+                conversation.legacy_prior(events), self._run_budget_for(loop, system_prompt)) or None
+        return None
 
     @staticmethod
     def _system_prompt_for_mode(mode: str) -> str:

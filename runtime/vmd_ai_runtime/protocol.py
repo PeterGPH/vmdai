@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import urllib.parse
 from typing import Any, Dict, Optional
 
 from .constants import CONVERSATION_MODES
@@ -71,6 +72,36 @@ def _sanitize_vmd_env(value: Any) -> Optional[Dict[str, str]]:
         if text:
             out[key] = text
     return out or None
+
+
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _as_base_url(value: Any) -> str:
+    """'' when absent; otherwise an http(s) URL with a host, at most 512 characters."""
+    text = _as_str(value, "base_url", required=False)
+    if not text:
+        return ""
+    parts = urllib.parse.urlsplit(text)
+    if (parts.scheme not in ("http", "https") or not parts.netloc or len(text) > 512
+            or any(ch.isspace() for ch in text)):
+        raise RpcError("INVALID_PARAMS", "base_url must be an http(s) URL", {"base_url": text[:80]})
+    return text
+
+
+def _as_optional_dict(value: Any, field: str) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise RpcError("INVALID_PARAMS", f"{field} must be an object")
+    return value
+
+
+def _as_profile_name(value: Any) -> str:
+    text = _as_str(value, "profile", required=False)
+    if text and not _PROFILE_NAME_RE.match(text):
+        raise RpcError("INVALID_PARAMS", "profile must be 1-64 letters, digits, '.', '_' or '-'")
+    return text
 
 
 def validate_rpc_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -169,13 +200,15 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
         return {"session_id": _as_str(p.get("session_id"), "session_id"), "patch": patch}
 
     if method == "provider.set":
-        # Posted by the Tcl UI when the user changes the provider
-        # dropdown. The runtime rebuilds its provider + claude_loop in
-        # place; model is optional and just updates settings.model.
+        # {provider, model} is today's ui.tcl call; base_url, options and
+        # profile need a token session (checked in app.py, §2e).
         return {
             "session_id": _as_str(p.get("session_id"), "session_id"),
             "provider":   _as_str(p.get("provider"), "provider"),
             "model":      _as_str(p.get("model") or "", "model", required=False),
+            "base_url":   _as_base_url(p.get("base_url")),
+            "options":    _as_optional_dict(p.get("options"), "options"),
+            "profile":    _as_profile_name(p.get("profile")),
         }
 
     if method in ("keys.save", "keys.test"):
@@ -214,6 +247,30 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
             # snapshot_file: local path written by VMD's render command.
             # Python runtime reads this file, encodes as PNG, then discards it.
             "snapshot_file": _as_str(p.get("snapshot_file") or "", "snapshot_file", required=False),
+        }
+
+    if method == "runtime.info":
+        return {"session_id": _as_str(p.get("session_id"), "session_id")}
+
+    if method == "session.set_cwd":
+        return {
+            "session_id": _as_str(p.get("session_id"), "session_id"),
+            "cwd": _as_str(p.get("cwd"), "cwd"),
+        }
+
+    if method == "models.list":
+        return {
+            "session_id": _as_str(p.get("session_id"), "session_id"),
+            "provider": _as_str(p.get("provider") or "", "provider", required=False),
+            "base_url": _as_base_url(p.get("base_url")),
+        }
+
+    if method == "provider.test":
+        return {
+            "session_id": _as_str(p.get("session_id"), "session_id"),
+            "provider": _as_str(p.get("provider") or "", "provider", required=False),
+            "base_url": _as_base_url(p.get("base_url")),
+            "model": _as_str(p.get("model") or "", "model", required=False),
         }
 
     raise RpcError("METHOD_NOT_FOUND", f"Unknown method: {method}")

@@ -23,6 +23,12 @@ READY = "VMDAI_READY "
 def _env(extra=None):
     # The hermetic conftest already cleared VMD_AI_*/ANTHROPIC_*/... and set a temp HOME.
     env = dict(os.environ)
+    # An empty settings.json in the temp HOME keeps the runtime's first-run
+    # probe (plan 03) away from the real ports 11435/11434 (§6).
+    settings = Path(env["HOME"]) / ".vmdai" / "settings.json"
+    if not settings.exists():
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text('{"version": 1, "active": null, "profiles": {}}\n', encoding="utf-8")
     env["PYTHON_KEYRING_BACKEND"] = "keyring.backends.null.Keyring"
     env.update(extra or {})
     return env
