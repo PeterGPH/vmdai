@@ -1,0 +1,33 @@
+block.open b1 user 0 1790208001
+block.append b1 "load 1hck"
+run.open r1 req_000000000001 qwen3.8:27b 1790208001
+status busy Thinking 1790208001
+block.open b2 assistant 1
+block.append b2 "Loading "
+status busy Writing 1790208002
+block.append b2 1h
+block.discard b2
+block.open b3 assistant 1
+block.append b3 "Loading "
+block.append b3 "1hck "
+block.append b3 now.
+block.seal b3 "Loading 1hck now."
+tool.open 000000000001 run_vmd_command "mol new 1hck.pdb" tcl model "Load it."
+run.chip r1 000000000001 running
+status busy "Step 1 · running VMD command" 1790208006
+tool.close 000000000001 ok "0.5 s" "label {} error {} inline {} preview {} output 0 output_path {} total 1 applied 1 failed_index {} failed_text {} late 0" ""
+run.chip r1 000000000001 ok
+status busy Thinking 1790208007
+block.open b4 assistant 2
+block.append b4 "Done: "
+status busy Writing 1790208008
+block.append b4 "1hck "
+block.append b4 "is "
+block.append b4 loaded.
+block.discard b4
+rule r1
+block.open b5 assistant 2
+block.seal b5 "Done: 1hck is loaded."
+footer r1 1 ""
+run.close r1 complete 1 0 0 10 0 28
+status idle

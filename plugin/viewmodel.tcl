@@ -1,0 +1,539 @@
+# viewmodel.tcl -- ChatVMD view-model: v2 display events -> render ops.
+#
+# Pure Tcl, no Tk (spec §2h). The state lives in a dict held by the caller:
+#
+#   ::vmdai::vm::init  stateVar ?options?
+#   ::vmdai::vm::apply stateVar event      -> list of ops
+#
+# An event is a decoded §2c envelope, {seq ts role type text metadata}, as
+# json::json2dict returns it: JSON null is the string "null" and booleans
+# are "true"/"false"; _get and _bool normalise both. The op vocabulary and
+# argument lists are fixed by spec §2h and Part B V4 so that op goldens can
+# be written before any widget exists. Optional trailing arguments added by
+# this plan: block.open ?time?, tool.open ?rationale?, run.close ?max_turns?,
+# snapshot ?renderer?.
+
+namespace eval ::vmdai::vm {}
+
+proc ::vmdai::vm::init {stateVar {options {}}} {
+    upvar 1 $stateVar S
+    set S [dict create \
+        opts [dict merge {reasoning_visible 1} $options] \
+        bseq 0 rseq 0 \
+        open {} \
+        texts {} \
+        reasons {} \
+        rsealed {} \
+        runs {} \
+        tools {} \
+        warned {} \
+        request "" \
+        busy 0 phase "" phase_t0 "" stopping 0 \
+        conn "" \
+        trust_notice 0]
+    return
+}
+
+# ---- small helpers ----------------------------------------------------------
+
+proc ::vmdai::vm::_get {d key {default ""}} {
+    if {[catch {dict exists $d $key} has] || !$has} { return $default }
+    set v [dict get $d $key]
+    if {$v eq "null"} { return $default }
+    return $v
+}
+
+proc ::vmdai::vm::_bool {v} {
+    if {[string is boolean -strict $v]} { return [expr {$v ? 1 : 0}] }
+    return 0
+}
+
+proc ::vmdai::vm::_secs {ts} {
+    if {![string is double -strict $ts]} { return 0 }
+    return [expr {wide(floor($ts))}]
+}
+
+proc ::vmdai::vm::_first_line {s} {
+    foreach line [split $s "\n"] {
+        if {[string trim $line] ne ""} { return [string trim $line] }
+    }
+    return ""
+}
+
+proc ::vmdai::vm::_dur_text {ms} {
+    if {![string is double -strict $ms]} { return "" }
+    if {$ms < 10000} { return [format "%.1f s" [expr {$ms / 1000.0}]] }
+    return [format "%d s" [expr {int(round($ms / 1000.0))}]]
+}
+
+proc ::vmdai::vm::_new_block {sv} {
+    upvar 1 $sv S
+    dict incr S bseq
+    return b[dict get $S bseq]
+}
+
+# Encode one op as a single line that `lindex` parses back exactly
+# (tests/fixtures/ops/<name>.ops holds one op per line).
+proc ::vmdai::vm::format_op {op} {
+    set words {}
+    foreach w $op {
+        if {$w ne "" && [regexp {^[A-Za-z0-9_.:/+@%,=-]+$} $w]} {
+            lappend words $w
+        } else {
+            lappend words "\"[string map {\\ \\\\ \" \\\" \n \\n \r \\r \t \\t} $w]\""
+        }
+    }
+    return [join $words " "]
+}
+
+# ---- runs, phases -----------------------------------------------------------
+
+proc ::vmdai::vm::_ensure_run {sv req ts} {
+    upvar 1 $sv S
+    if {$req eq "" || [dict exists $S runs $req]} { return {} }
+    return [_open_run S $req "" 28 1 $ts]
+}
+
+proc ::vmdai::vm::_open_run {sv req model max_turns vision ts} {
+    upvar 1 $sv S
+    dict incr S rseq
+    set run r[dict get $S rseq]
+    dict set S runs $req [dict create id $run model $model t0 [_secs $ts] \
+        max_turns $max_turns vision $vision steps 0 failed 0 last_tcl "" \
+        applied 0 status running]
+    dict set S request $req
+    return [list [list run.open $run $req $model [_secs $ts]]]
+}
+
+proc ::vmdai::vm::_run_id {sv req} {
+    upvar 1 $sv S
+    if {$req ne "" && [dict exists $S runs $req]} { return [dict get $S runs $req id] }
+    return ""
+}
+
+# Set the busy phase; returns a status op only when the text changes.
+proc ::vmdai::vm::_phase {sv text ts {timed 1}} {
+    upvar 1 $sv S
+    if {[dict get $S busy] && [dict get $S phase] eq $text} { return {} }
+    dict set S busy 1
+    dict set S phase $text
+    dict set S phase_t0 [expr {$timed ? [_secs $ts] : ""}]
+    return [list [list status busy $text [dict get $S phase_t0]]]
+}
+
+proc ::vmdai::vm::_tool_phase {name n} {
+    switch -glob -- $name {
+        run_vmd_command      { return "Step $n · running VMD command" }
+        capture_vmd_snapshot { return "Step $n · rendering snapshot" }
+        search_docs          { return "Step $n · searching docs" }
+        wiki_*               { return "Step $n · reading the wiki" }
+        default              { return "Step $n · running $name" }
+    }
+}
+
+# ---- blocks -----------------------------------------------------------------
+
+# Close the open block. A reasoning block is sealed here (the thinking is
+# over once anything else arrives); a text block stays unsealed until its
+# assistant/message.
+proc ::vmdai::vm::_close_open {sv ts} {
+    upvar 1 $sv S
+    set open [dict get $S open]
+    dict set S open {}
+    if {$open eq "" || [dict get $open kind] ne "reasoning"} { return {} }
+    return [_seal_reason S [dict get $open id] [expr {[_secs $ts] - [dict get $open t0]}]]
+}
+
+proc ::vmdai::vm::_seal_reason {sv b secs} {
+    upvar 1 $sv S
+    if {[lsearch -exact [dict get $S rsealed] $b] >= 0} { return {} }
+    dict lappend S rsealed $b
+    if {$secs < 0} { set secs 0 }
+    return [list [list reasoning.seal $b $secs]]
+}
+
+proc ::vmdai::vm::_on_text_chunk {sv md text ts} {
+    upvar 1 $sv S
+    set req [_get $md request_id]
+    set turn [_get $md turn 0]
+    set open [dict get $S open]
+    if {$open ne "" && [dict get $open kind] eq "text"
+            && [dict get $open request_id] eq $req && [dict get $open turn] eq $turn} {
+        return [list [list block.append [dict get $open id] $text]]
+    }
+    set ops [_close_open S $ts]
+    lappend ops {*}[_ensure_run S $req $ts]
+    set b [_new_block S]
+    dict set S open [dict create kind text id $b request_id $req turn $turn t0 [_secs $ts]]
+    dict lappend S texts "$req|$turn" $b
+    lappend ops [list block.open $b assistant $turn] [list block.append $b $text]
+    if {$req ne ""} { lappend ops {*}[_phase S "Writing" $ts] }
+    return $ops
+}
+
+proc ::vmdai::vm::_on_reason_chunk {sv md text ts} {
+    upvar 1 $sv S
+    set req [_get $md request_id]
+    set turn [_get $md turn 0]
+    set open [dict get $S open]
+    if {$open ne "" && [dict get $open kind] eq "reasoning"
+            && [dict get $open request_id] eq $req && [dict get $open turn] eq $turn} {
+        return [list [list reasoning.append [dict get $open id] $text]]
+    }
+    set ops [_close_open S $ts]
+    lappend ops {*}[_ensure_run S $req $ts]
+    set b [_new_block S]
+    dict set S open [dict create kind reasoning id $b request_id $req turn $turn t0 [_secs $ts]]
+    dict lappend S reasons "$req|$turn" $b
+    lappend ops [list reasoning.open $b $turn] [list reasoning.append $b $text]
+    if {$req ne ""} { lappend ops {*}[_phase S "Thinking" $ts] }
+    return $ops
+}
+
+# The per-turn assistant/message replaces the streamed text (§2c Sealing).
+# A final answer is re-opened under a rule so that live and replayed chats
+# render the same (the rule separates the work log from the answer).
+proc ::vmdai::vm::_on_assistant_message {sv md text ts} {
+    upvar 1 $sv S
+    set req [_get $md request_id]
+    set turn [_get $md turn 0]
+    set final [_bool [_get $md final false]]
+    set key "$req|$turn"
+    set pending [_get [dict get $S texts] $key]
+    dict unset S texts $key
+    set ops [_ensure_run S $req $ts]
+    if {[string trim $text] eq ""} {
+        foreach b $pending { lappend ops [list block.discard $b] }
+        return $ops
+    }
+    if {$final && $req ne ""} {
+        foreach b $pending { lappend ops [list block.discard $b] }
+        set b [_new_block S]
+        lappend ops [list rule [_run_id S $req]] [list block.open $b assistant $turn] \
+            [list block.seal $b $text]
+        return $ops
+    }
+    if {[llength $pending]} {
+        set b [lindex $pending 0]
+        lappend ops [list block.seal $b $text]
+        foreach extra [lrange $pending 1 end] { lappend ops [list block.discard $extra] }
+        return $ops
+    }
+    set b [_new_block S]
+    lappend ops [list block.open $b assistant $turn] [list block.seal $b $text]
+    return $ops
+}
+
+# A sealed reasoning/message: seals the live block, or renders the whole
+# block when replaying a stored chat (no chunks were seen).
+proc ::vmdai::vm::_on_reasoning_message {sv md text ts} {
+    upvar 1 $sv S
+    set req [_get $md request_id]
+    set turn [_get $md turn 0]
+    set secs [_get $md duration_s ""]
+    if {![string is double -strict $secs]} {
+        set ms [_get $md duration_ms ""]
+        set secs [expr {[string is double -strict $ms] ? $ms / 1000.0 : 0}]
+    }
+    set secs [expr {int(round($secs))}]
+    set blocks [_get [dict get $S reasons] "$req|$turn"]
+    if {[llength $blocks]} {
+        return [_seal_reason S [lindex $blocks end] $secs]
+    }
+    if {[string trim $text] eq ""} { return {} }
+    set ops [_ensure_run S $req $ts]
+    set b [_new_block S]
+    dict lappend S reasons "$req|$turn" $b
+    lappend ops [list reasoning.open $b $turn] [list reasoning.append $b $text]
+    lappend ops {*}[_seal_reason S $b $secs]
+    return $ops
+}
+
+proc ::vmdai::vm::_on_user_message {sv text ts} {
+    upvar 1 $sv S
+    set b [_new_block S]
+    return [list [list block.open $b user 0 [_secs $ts]] [list block.append $b $text]]
+}
+
+# turn.retry discards everything the dropped attempt of that turn showed.
+proc ::vmdai::vm::_on_turn_retry {sv md} {
+    upvar 1 $sv S
+    set key "[_get $md request_id]|[_get $md turn 0]"
+    set ops {}
+    foreach b [_get [dict get $S texts] $key] { lappend ops [list block.discard $b] }
+    foreach b [_get [dict get $S reasons] $key] { lappend ops [list block.discard $b] }
+    dict unset S texts $key
+    dict unset S reasons $key
+    return $ops
+}
+
+# ---- tools ------------------------------------------------------------------
+
+proc ::vmdai::vm::_tool_text {name input} {
+    switch -glob -- $name {
+        run_vmd_command      { return [_get $input command] }
+        capture_vmd_snapshot { return [_get $input purpose] }
+        search_docs          { return [_get $input query] }
+        wiki_*               { return [_get $input page] }
+        default              { return [_get $input command] }
+    }
+}
+
+proc ::vmdai::vm::_on_tool_started {sv md ts} {
+    upvar 1 $sv S
+    set k [_get $md call_key]
+    if {$k eq "" || [dict exists $S tools $k]} { return {} }
+    set req [_get $md request_id]
+    set ops [_ensure_run S $req $ts]
+    set run [_run_id S $req]
+    set n 1
+    if {[dict exists $S runs $req]} {
+        set n [expr {[dict get $S runs $req steps] + 1}]
+        dict set S runs $req steps $n
+    }
+    set name [_get $md tool_name]
+    set input [_get $md input]
+    dict set S tools $k [dict create run $run request_id $req tool_name $name \
+        executor [_get $md executor tcl] state running index $n finished 0]
+    lappend ops [list tool.open $k $name [_tool_text $name $input] \
+        [_get $md executor tcl] [_get $md origin model] [_get $input rationale]]
+    if {$run ne ""} { lappend ops [list run.chip $run $k running] }
+    lappend ops {*}[_phase S [_tool_phase $name $n] $ts]
+    return $ops
+}
+
+proc ::vmdai::vm::tool_state {md} {
+    switch -- [_get $md executed yes] {
+        no      { return notrun }
+        unknown { return unknown }
+    }
+    if {[_bool [_get $md ok false]]} { return ok }
+    return err
+}
+
+# Inline result and preview lines for a tool's output (Part B V4 Results).
+proc ::vmdai::vm::_result_view {output} {
+    set o [string trim $output]
+    if {$o eq "" || [regexp {^(0|1|atomselect[0-9]+)$} $o]} { return [list "" {}] }
+    if {[string first "\n" $o] < 0 && [string length $o] <= 24} {
+        if {[string is double -strict $o] && [regexp {[.eE]} $o]} {
+            set o [format %.6g $o]
+        }
+        return [list $o {}]
+    }
+    set lines [split [string trimright $output "\n"] "\n"]
+    if {[llength $lines] <= 4} { return [list "" $lines] }
+    set more [expr {[llength $lines] - 3}]
+    return [list "" [concat [lrange $lines 0 2] [list "… $more more lines"]]]
+}
+
+proc ::vmdai::vm::_tool_detail {md state} {
+    set output [_get $md output]
+    lassign [_result_view $output] inline preview
+    set label ""
+    set error ""
+    switch -- $state {
+        notrun  { set label "not run"; set inline ""; set preview {} }
+        unknown { set label "stopped while running · outcome unknown" }
+        err     { set error [_first_line [_get $md error]]; set inline "" }
+    }
+    set stmts [_get $md statements]
+    set failed [_get $stmts failed]
+    return [dict create label $label error $error inline $inline preview $preview \
+        output $output output_path [_get $md output_path] \
+        total [_get $stmts total] applied [_get $stmts applied] \
+        failed_index [_get $failed index] failed_text [_get $failed text] \
+        late 0]
+}
+
+proc ::vmdai::vm::_chip_state {state k warned} {
+    if {$state eq "unknown"} { return warn }
+    if {$state eq "ok" && [lsearch -exact $warned $k] >= 0} { return warn }
+    return $state
+}
+
+proc ::vmdai::vm::_on_tool_finished {sv md ts} {
+    upvar 1 $sv S
+    set k [_get $md call_key]
+    if {$k eq "" || ![dict exists $S tools $k]} { return {} }
+    set tool [dict get $S tools $k]
+    if {[dict get $tool finished]} { return {} }
+    set state [tool_state $md]
+    set was [dict get $tool state]
+    dict set S tools $k state $state
+    dict set S tools $k finished 1
+    set run [dict get $tool run]
+    set req [dict get $tool request_id]
+    set image [_get $md image]
+    set thumb [expr {$image eq "" ? "" : [_get $image thumb_path]}]
+    set ops [list [list tool.close $k $state [_dur_text [_get $md duration_ms ""]] \
+        [_tool_detail $md $state] $thumb]]
+    if {$run ne ""} {
+        lappend ops [list run.chip $run $k [_chip_state $state $k [dict get $S warned]]]
+    }
+    if {$image ne ""} {
+        set vision 1
+        if {[dict exists $S runs $req]} { set vision [dict get $S runs $req vision] }
+        set w [_get $image src_width [_get $image width]]
+        set h [_get $image src_height [_get $image height]]
+        lappend ops [list snapshot $k $thumb [_get $image path] $w $h \
+            [_get $md saved_path] $vision [_get $image renderer TachyonInternal]]
+    }
+    if {[dict exists $S runs $req] && [dict get $tool executor] eq "tcl"
+            && [dict get $tool tool_name] eq "run_vmd_command"} {
+        if {$state eq "err" && $was ne "err"} {
+            dict set S runs $req failed [expr {[dict get $S runs $req failed] + 1}]
+        }
+        if {$state in {ok err}} { dict set S runs $req last_tcl $state }
+        set stmts [_get $md statements]
+        set applied [_get $stmts applied ""]
+        if {![string is integer -strict $applied]} {
+            set applied [expr {$state eq "ok" ? 1 : 0}]
+        }
+        dict set S runs $req applied [expr {[dict get $S runs $req applied] + $applied}]
+    }
+    if {[dict get $S request] eq $req && [dict get $S busy]} {
+        lappend ops {*}[_phase S "Thinking" $ts]
+    }
+    return $ops
+}
+
+# ---- status, errors, request lifecycle ------------------------------------
+
+proc ::vmdai::vm::_on_status {sv md ts} {
+    upvar 1 $sv S
+    set req [_get $md request_id]
+    switch -- [_get $md phase] {
+        retrying {
+            set text "Retrying [_get $md attempt ?]/[_get $md max_attempts ?] in [_get $md wait_s ?] s"
+            return [_phase S $text $ts 0]
+        }
+        loading_model {
+            set model ""
+            if {[dict exists $S runs $req]} { set model [dict get $S runs $req model] }
+            return [_phase S [string trim "Loading $model"] $ts]
+        }
+        wrapping_up   { return [_phase S "Writing a summary" $ts] }
+        loop_detected {
+            set k [_get $md call_key]
+            if {$k eq ""} { return {} }
+            dict lappend S warned $k
+            if {![dict exists $S tools $k]} { return {} }
+            set run [dict get $S tools $k run]
+            set state [dict get $S tools $k state]
+            if {$run eq "" || $state eq "running"} { return {} }
+            return [list [list run.chip $run $k [_chip_state $state $k [dict get $S warned]]]]
+        }
+        context_near_full {
+            return [list [list notice info "Context is nearly full; older tool output is shortened"]]
+        }
+        turn_truncated {
+            return [list [list notice info "The reply was cut off, so its tool calls were not run"]]
+        }
+        think_unsupported {
+            return [list [list notice info "This model does not support thinking; continuing without it"]]
+        }
+    }
+    return {}
+}
+
+proc ::vmdai::vm::_on_request_started {sv md ts} {
+    upvar 1 $sv S
+    set req [_get $md request_id]
+    if {$req eq "" || [dict exists $S runs $req]} { return {} }
+    set max_turns [_get $md max_turns 28]
+    set ops [_open_run S $req [_get $md model] $max_turns [_bool [_get $md vision true]] $ts]
+    dict set S stopping 0
+    lappend ops {*}[_phase S "Thinking" $ts]
+    return $ops
+}
+
+proc ::vmdai::vm::_on_turn_started {sv md ts} {
+    upvar 1 $sv S
+    if {[dict get $S request] ne [_get $md request_id]} { return {} }
+    return [_phase S "Thinking" $ts]
+}
+
+proc ::vmdai::vm::_close_run {sv req status final_text_empty duration_s} {
+    upvar 1 $sv S
+    set run [dict get $S runs $req]
+    dict set S runs $req status $status
+    set failed [dict get $run failed]
+    set recovered [expr {$failed > 0 && [dict get $run last_tcl] eq "ok" && $status ne "error"}]
+    set ops {}
+    if {[dict get $run applied] > 0} {
+        lappend ops [list footer [dict get $run id] [dict get $run applied] ""]
+    }
+    lappend ops [list run.close [dict get $run id] $status [dict get $run steps] $failed \
+        $recovered $duration_s $final_text_empty [dict get $run max_turns]]
+    if {[dict get $S request] eq $req} {
+        dict set S request ""
+        dict set S busy 0
+        dict set S phase ""
+        dict set S phase_t0 ""
+        dict set S stopping 0
+        lappend ops [list status idle]
+    }
+    return $ops
+}
+
+proc ::vmdai::vm::_on_request_finished {sv md ts} {
+    upvar 1 $sv S
+    set req [_get $md request_id]
+    if {$req eq "" || ![dict exists $S runs $req]} { return {} }
+    if {[dict get $S runs $req status] ne "running"} { return {} }
+    set status [_get $md status complete]
+    set ms [_get $md duration_ms ""]
+    if {[string is double -strict $ms]} {
+        set secs [expr {int(round($ms / 1000.0))}]
+    } else {
+        set secs [expr {[_secs $ts] - [dict get $S runs $req t0]}]
+    }
+    set empty [_bool [_get $md final_text_empty false]]
+    return [_close_run S $req $status $empty $secs]
+}
+
+# ---- entry point ------------------------------------------------------------
+
+proc ::vmdai::vm::apply {stateVar event} {
+    upvar 1 $stateVar S
+    set role [_get $event role]
+    set type [_get $event type]
+    set text [_get $event text]
+    set md [_get $event metadata]
+    set ts [_get $event ts 0]
+    if {$type eq "chunk"} {
+        switch -- $role {
+            assistant { return [_on_text_chunk S $md $text $ts] }
+            reasoning { return [_on_reason_chunk S $md $text $ts] }
+        }
+        return {}
+    }
+    set ops [_close_open S $ts]
+    set kind [_get $md kind]
+    switch -- $role/$type {
+        user/message      { lappend ops {*}[_on_user_message S $text $ts] }
+        assistant/message { lappend ops {*}[_on_assistant_message S $md $text $ts] }
+        reasoning/message { lappend ops {*}[_on_reasoning_message S $md $text $ts] }
+        system/message {
+            if {[_get $md notice] eq "tcl_trust_boundary"} {
+                dict set S trust_notice 1
+            } elseif {[string trim $text] ne ""} {
+                lappend ops [list notice info $text]
+            }
+        }
+        system/state {
+            switch -glob -- $kind {
+                request.started  { lappend ops {*}[_on_request_started S $md $ts] }
+                request.finished { lappend ops {*}[_on_request_finished S $md $ts] }
+                turn.started     { lappend ops {*}[_on_turn_started S $md $ts] }
+                turn.retry       { lappend ops {*}[_on_turn_retry S $md] }
+                tool.started     { lappend ops {*}[_on_tool_started S $md $ts] }
+                tool.finished    { lappend ops {*}[_on_tool_finished S $md $ts] }
+                status           { lappend ops {*}[_on_status S $md $ts] }
+                usage            { }
+            }
+        }
+    }
+    return $ops
+}
