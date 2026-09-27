@@ -69,7 +69,7 @@ def _drive_call(turns: List[Tuple[str, List[dict]]]):
 
 def _stub_bridge_execute(self_bridge, *, session_id, tool_call_id,
                          tool_name, tool_input, session_queue,
-                         cancel_event):
+                         cancel_event, **kw):
     """Drop-in for VmdToolBridge.execute_tool — canned successful result."""
     if tool_name == "capture_vmd_snapshot":
         png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64

@@ -235,6 +235,21 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
             "include_state": bool(p.get("include_state", True)),
         }
 
+    if method == "tool.ack":
+        # Posted by the M1 executor before it runs a tool_start (C2).
+        state = _as_str(p.get("state") or "running", "state", required=False)
+        if state not in ("running", "awaiting_user"):
+            raise RpcError(
+                "INVALID_PARAMS",
+                "state must be 'running' or 'awaiting_user'",
+                {"allowed": ["running", "awaiting_user"]},
+            )
+        return {
+            "session_id": _as_str(p.get("session_id"), "session_id"),
+            "call_key": _as_str(p.get("call_key"), "call_key"),
+            "state": state,
+        }
+
     if method == "tool.command_result":
         # Posted by the Tcl bridge after executing a VMD tool call.
         # tool_call_id must match a pending call in VmdToolBridge.

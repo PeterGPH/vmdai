@@ -16,6 +16,7 @@ import hmac
 import json
 import logging
 import os
+import tempfile
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -60,7 +61,7 @@ from .settings_store import (
 )
 from .sessions import RequestState, SessionManager, SessionState
 from .store import ChatStore
-from .tool_bridge import VmdToolBridge
+from .tool_bridge import BridgeSession, VmdToolBridge
 from .wiki_store import WikiStore
 
 
@@ -114,7 +115,9 @@ class RuntimeApp:
         # OS keychain, so the provider auto-detect below sees them.
         self.keys = KeyStore()
         self.logger = logger
-        self.tool_bridge = VmdToolBridge()
+        self._snapshot_lock = threading.Lock()
+        self._snapshot_dirs: Dict[str, str] = {}
+        self.tool_bridge = VmdToolBridge(session_lookup=self._bridge_session)
         # Round-2 hook (spec 1, 2g): each callable returns extra per-request
         # context (for example scene state) appended after the <session> block.
         self.context_providers: List[Callable[[SessionState], str]] = []
@@ -1032,6 +1035,21 @@ class RuntimeApp:
 
         # ---- Tool result callback (posted by Tcl bridge) ----
 
+        if method == "tool.ack":
+            # C2: the executor acks before running a tool_start. Any ack stops
+            # the pickup deadline; the answer is atomic against Stop.
+            state = self._get_session(params["session_id"], session_token)
+            owner = self.tool_bridge.get_call_session(params["call_key"])
+            if owner is None:
+                return {"proceed": False, "reason": "unknown call"}
+            if owner != state.session_id:
+                raise RpcError(
+                    "AUTH_FAILED",
+                    "call_key does not belong to this session",
+                    {"call_key": params["call_key"]},
+                )
+            return self.tool_bridge.ack(state.session_id, params["call_key"], params["state"])
+
         if method == "tool.command_result":
             # tool.command_result is the only inbound channel from the Tcl
             # bridge after VMD has executed a tool call. Three checks:
@@ -1150,6 +1168,66 @@ class RuntimeApp:
                     "recorder construction failed", exc_info=True,
                 )
             return None
+
+    # ------------------------------------------------------------------
+    # Product bridge support (plan 05)
+    # ------------------------------------------------------------------
+
+    def _bridge_session(self, session_id: str) -> Optional[BridgeSession]:
+        """What VmdToolBridge needs to know about ``session_id`` (None if unknown)."""
+        state = self.sessions.get(session_id)
+        if state is None:
+            return None
+        chat_dir = None
+        if state.chat_id:
+            try:
+                chat_dir = Path(self.store.chat_dir(state.chat_id))
+            except Exception:
+                chat_dir = None
+        exec_s, grace_s = self._tool_timeouts()
+        return BridgeSession(
+            chat_dir=chat_dir,
+            cwd=str(state.cwd or ""),
+            authenticated=bool(getattr(state, "authenticated", False)),
+            snapshot_dir=self._snapshot_dir_for(state.session_id),
+            exec_timeout_s=exec_s,
+            cancel_grace_s=grace_s,
+        )
+
+    def _snapshot_dir_for(self, session_id: str) -> Path:
+        """Per-session 0700 temp dir where the plugin renders snapshots (spec 2d)."""
+        with self._snapshot_lock:
+            path = self._snapshot_dirs.get(session_id)
+            if path is None or not os.path.isdir(path):
+                path = tempfile.mkdtemp(prefix="vmdai_snap_")
+                self._snapshot_dirs[session_id] = path
+        return Path(path)
+
+    def _tool_timeouts(self) -> Tuple[Optional[float], Optional[float]]:
+        """(tool_exec_timeout_s, cancel_grace_s) from settings.json; None = bridge default.
+
+        Read on every tool call, so a changed setting applies to the next
+        call. settings_store validates exec >= 1 and grace >= 0 (0 = do not
+        wait for a running command after Stop).
+        """
+        store = getattr(self, "settings_store", None)
+        if store is None:
+            return None, None
+        try:
+            data = store.load()
+        except Exception:
+            return None, None
+        if not isinstance(data, dict):
+            return None, None
+
+        def _number(key: str, minimum: float) -> Optional[float]:
+            try:
+                value = float(data.get(key))
+            except (TypeError, ValueError):
+                return None
+            return value if value >= minimum else None
+
+        return _number("tool_exec_timeout_s", 1.0), _number("cancel_grace_s", 0.0)
 
     # ------------------------------------------------------------------
     # Background thread: Claude agent loop

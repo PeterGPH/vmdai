@@ -6,20 +6,29 @@ Architecture:
   2. execute_tool() pushes a 'tool_start' event onto the session's EventQueue
   3. The Tcl bridge polls that queue, sees the event, runs the VMD command
   4. The Tcl bridge POSTs tool.command_result back to the Python RPC server
-  5. The RPC handler calls resolve() which unblocks execute_tool()
+  5. The RPC handler resolves the pending call, which unblocks execute_tool()
   6. execute_tool() returns the result dict to the Claude loop
 
-This is a loopback callback — both sides are on 127.0.0.1 and share nothing
-except the session's EventQueue and this bridge's pending-call registry.
+Two paths share this class:
+  * Token-authenticated sessions (the M1 plugin) use the call registry keyed
+    by ``call_key``: ``tool.ack {call_key, state}`` answers ``proceed``
+    atomically against cancellation; a pickup deadline (45 s) runs until the
+    first ack; a ``running`` ack starts the exec deadline (900 s); Stop waits
+    ``cancel_grace_s`` for a running command (spec 2d, C2).
+  * Tokenless sessions (old plugins) keep today's protocol: ``tool_call_id``,
+    one 45 s timeout, ``resolve()``.
 """
 from __future__ import annotations
 
 import base64
+import collections
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Callable, Deque, Dict, Optional
 
 from .image_utils import read_image_as_png_bytes
 
@@ -27,6 +36,21 @@ logger = logging.getLogger("vmdai.tool_bridge")
 
 # How long (seconds) to wait for Tcl to execute a tool and post the result.
 TOOL_TIMEOUT_SEC = 45
+
+ACK_STATES = ("running", "awaiting_user")
+_POLL_S = 0.05
+_KEEP_FINISHED = 512
+
+
+@dataclass
+class BridgeSession:
+    """What the bridge needs to know about the session that owns a call."""
+    chat_dir: Optional[Path]
+    cwd: str
+    authenticated: bool
+    snapshot_dir: Path
+    exec_timeout_s: Optional[float] = None
+    cancel_grace_s: Optional[float] = None
 
 
 @dataclass
@@ -36,6 +60,22 @@ class _PendingCall:
     session_id: str = ""
     done: threading.Event = field(default_factory=threading.Event)
     result: Optional[Dict[str, Any]] = None
+    # --- token-session fields (unused on the legacy path) ---
+    call_key: str = ""
+    request_id: str = ""
+    tool_input: Dict[str, Any] = field(default_factory=dict)
+    chat_dir: Optional[Path] = None
+    cwd: str = ""
+    snapshot_path: str = ""
+    exec_timeout_s: float = 900.0
+    started: float = field(default_factory=time.monotonic)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    state: str = "pending"              # pending | awaiting_user | running
+    exec_deadline: Optional[float] = None
+    cancelled: bool = False
+    finished: bool = False              # execute_tool has returned
+    raw: Optional[Dict[str, Any]] = None
+    late: bool = False
 
 
 class VmdToolBridge:
@@ -45,20 +85,44 @@ class VmdToolBridge:
     One instance lives on RuntimeApp and is shared across all sessions.
     """
 
-    def __init__(self):
+    # The loop passes call_key= and request_id= only to bridges whose CLASS
+    # declares this (spec 2a); wrappers that delegate via __getattr__ never
+    # opt in by accident.
+    supports_call_meta = True
+
+    def __init__(
+        self,
+        pickup_timeout_s: float = 45.0,
+        exec_timeout_s: float = 900.0,
+        cancel_grace_s: float = 30.0,
+        session_lookup: Optional[Callable[[str], Optional[BridgeSession]]] = None,
+    ):
         self._lock = threading.Lock()
         self._pending: Dict[str, _PendingCall] = {}
+        self._calls: Dict[str, _PendingCall] = {}
+        self._finished_order: Deque[str] = collections.deque()
+        self.pickup_timeout_s = float(pickup_timeout_s)
+        self.exec_timeout_s = float(exec_timeout_s)
+        self.cancel_grace_s = float(cancel_grace_s)
+        self.session_lookup = session_lookup
 
     def get_pending_session(self, tool_call_id: str) -> Optional[str]:
         """Return the session_id that owns a pending call, or None if unknown.
 
         Used by the RPC handler to verify that a tool.command_result POST
-        belongs to the session that originated the tool call. Without this
-        check any local process able to guess a tool_call_id could resolve
-        another session's pending tool call.
+        belongs to the session that originated the tool call.
         """
+        tcid = str(tool_call_id or "")
         with self._lock:
-            pending = self._pending.get(str(tool_call_id or ""))
+            pending = self._pending.get(tcid)
+        if pending is None:
+            pending = self._token_call_by_tool_call_id(tcid)
+        return pending.session_id if pending else None
+
+    def get_call_session(self, call_key: str) -> Optional[str]:
+        """Return the session_id that owns ``call_key`` (pending or finished)."""
+        with self._lock:
+            pending = self._calls.get(str(call_key or ""))
         return pending.session_id if pending else None
 
     # ------------------------------------------------------------------
@@ -75,16 +139,48 @@ class VmdToolBridge:
         session_queue,          # EventQueue from sessions.py
         cancel_event: threading.Event,
         timeout: float = TOOL_TIMEOUT_SEC,
+        call_key: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Push a tool-start event to the session's event queue, then block
-        until the Tcl bridge posts the result via tool.command_result.
+        """Run one VMD tool call through the plugin and return its result dict."""
+        sess = self._lookup(session_id)
+        if call_key and sess is not None and sess.authenticated:
+            return self._execute_token(
+                sess,
+                session_id=str(session_id or ""),
+                tool_call_id=str(tool_call_id or ""),
+                tool_name=tool_name,
+                tool_input=dict(tool_input or {}),
+                session_queue=session_queue,
+                cancel_event=cancel_event,
+                call_key=str(call_key),
+                request_id=str(request_id or ""),
+            )
+        return self._execute_legacy(
+            sess,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            session_queue=session_queue,
+            cancel_event=cancel_event,
+            timeout=timeout,
+            call_key=call_key,
+        )
 
-        Returns a dict with at least:
-            {"ok": bool, "output": str, "error": str}
-        and optionally:
-            {"image_b64": str, "image_mime": str}  # for capture_vmd_snapshot
-        """
+    def _lookup(self, session_id: str) -> Optional[BridgeSession]:
+        if self.session_lookup is None:
+            return None
+        try:
+            return self.session_lookup(str(session_id or ""))
+        except Exception:
+            logger.warning("session_lookup failed for %s", session_id, exc_info=True)
+            return None
+
+    # ---- legacy (tokenless) path ----------------------------------------
+
+    def _execute_legacy(self, sess: Optional[BridgeSession], *, session_id, tool_call_id,
+                        tool_name, tool_input, session_queue, cancel_event, timeout, call_key):
         pending = _PendingCall(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
@@ -94,7 +190,6 @@ class VmdToolBridge:
             self._pending[tool_call_id] = pending
 
         try:
-            # Emit the tool_start event so the Tcl bridge sees it on next poll.
             session_queue.push(
                 "tool_start",
                 "message",
@@ -106,11 +201,8 @@ class VmdToolBridge:
                     "session_id": session_id,
                 },
             )
-            logger.debug(
-                "tool_start pushed tool=%s id=%s", tool_name, tool_call_id
-            )
+            logger.debug("tool_start pushed tool=%s id=%s", tool_name, tool_call_id)
 
-            # Wait for Tcl bridge to resolve this call.
             deadline = timeout
             poll_interval = 0.1
             while deadline > 0:
@@ -120,9 +212,7 @@ class VmdToolBridge:
                     break
                 deadline -= poll_interval
             else:
-                logger.warning(
-                    "tool timed out tool=%s id=%s", tool_name, tool_call_id
-                )
+                logger.warning("tool timed out tool=%s id=%s", tool_name, tool_call_id)
                 return {
                     "ok": False,
                     "output": "",
@@ -139,7 +229,6 @@ class VmdToolBridge:
                     if png_bytes:
                         result["image_b64"] = base64.b64encode(png_bytes).decode()
                         result["image_mime"] = "image/png"
-                    # Clean up the temp file
                     try:
                         os.unlink(snap_file)
                     except Exception:
@@ -151,22 +240,191 @@ class VmdToolBridge:
             with self._lock:
                 self._pending.pop(tool_call_id, None)
 
+    # ---- token path ------------------------------------------------------
+
+    def _execute_token(self, sess: BridgeSession, *, session_id, tool_call_id, tool_name,
+                       tool_input, session_queue, cancel_event, call_key, request_id):
+        exec_s = sess.exec_timeout_s if sess.exec_timeout_s is not None else self.exec_timeout_s
+        grace_s = sess.cancel_grace_s if sess.cancel_grace_s is not None else self.cancel_grace_s
+        snapshot_path = ""
+        if tool_name == "capture_vmd_snapshot":
+            snapshot_path = str(Path(sess.snapshot_dir) / ("vmdai_snap_%s.tga" % call_key))
+        pending = _PendingCall(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            session_id=session_id,
+            call_key=call_key,
+            request_id=request_id,
+            tool_input=tool_input,
+            chat_dir=sess.chat_dir,
+            cwd=sess.cwd,
+            snapshot_path=snapshot_path,
+            exec_timeout_s=float(exec_s),
+        )
+        with self._lock:
+            self._calls[call_key] = pending
+
+        session_queue.push(
+            "tool_start",
+            "message",
+            _format_tool_label(tool_name, tool_input),
+            {
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "session_id": session_id,
+                "call_key": call_key,
+                "request_id": request_id,
+                "approval": "auto",
+                "snapshot_path": snapshot_path,
+            },
+        )
+        pickup_deadline = time.monotonic() + self.pickup_timeout_s
+
+        while not pending.done.is_set():
+            if cancel_event.is_set():
+                return self._cancel(pending, grace_s)
+            now = time.monotonic()
+            with pending.lock:
+                state = pending.state
+                exec_deadline = pending.exec_deadline
+            if state == "pending" and now >= pickup_deadline:
+                out = self._give_up(
+                    pending, "no",
+                    "VMD did not pick up the command (no reply within %g s)." % self.pickup_timeout_s,
+                )
+                if out is not None:
+                    return out
+                continue
+            if state == "running" and exec_deadline is not None and now >= exec_deadline:
+                out = self._give_up(
+                    pending, "unknown",
+                    "VMD did not finish the command within %g s; outcome unknown." % exec_s,
+                )
+                if out is not None:
+                    return out
+                continue
+            pending.done.wait(timeout=_POLL_S)
+        return self._take_result(pending)
+
+    def _cancel(self, pending: _PendingCall, grace_s: float) -> Dict[str, Any]:
+        """Stop (spec 2d): not acked or awaiting_user -> 'no' at once; running -> grace."""
+        with pending.lock:
+            if not pending.done.is_set() and pending.state != "running":
+                pending.cancelled = True
+                return self._finish_without_result(pending, "no", "cancelled")
+        if pending.done.wait(timeout=max(0.0, grace_s)):
+            return self._take_result(pending)
+        out = self._give_up(pending, "unknown", "stopped while running; outcome unknown")
+        return out if out is not None else self._take_result(pending)
+
+    def _give_up(self, pending: _PendingCall, executed: str, error: str) -> Optional[Dict[str, Any]]:
+        """Stop waiting. Returns None if a result slipped in first."""
+        with pending.lock:
+            if pending.done.is_set():
+                return None
+            pending.cancelled = True
+            return self._finish_without_result(pending, executed, error)
+
+    def _finish_without_result(self, pending: _PendingCall, executed: str,
+                               error: str) -> Dict[str, Any]:
+        """Caller holds ``pending.lock``."""
+        pending.finished = True
+        self._retire(pending.call_key)
+        result = _empty_result()
+        result.update({
+            "ok": False,
+            "executed": executed,
+            "error": error,
+            "duration_ms": int((time.monotonic() - pending.started) * 1000),
+        })
+        return result
+
+    def _take_result(self, pending: _PendingCall) -> Dict[str, Any]:
+        with pending.lock:
+            pending.finished = True
+        self._retire(pending.call_key)
+        return self._finalize(pending)
+
+    def _retire(self, call_key: str) -> None:
+        """Keep finished calls (dedupe, late results), bounded."""
+        with self._lock:
+            self._finished_order.append(call_key)
+            while len(self._finished_order) > _KEEP_FINISHED:
+                self._calls.pop(self._finished_order.popleft(), None)
+
+    def _finalize(self, pending: _PendingCall) -> Dict[str, Any]:
+        """Turn the posted result into the product result dict."""
+        raw = dict(pending.raw or {})
+        executed = "no" if str(raw.get("executed") or "yes") == "no" else "yes"
+        ok = bool(raw.get("ok", False)) and executed == "yes"
+        error = str(raw.get("error") or "")
+        if executed == "no" and not error:
+            error = "not executed"
+        result = _empty_result()
+        result.update({
+            "ok": ok,
+            "output": str(raw.get("output") or ""),
+            "error": error,
+            "executed": executed,
+            "duration_ms": int((time.monotonic() - pending.started) * 1000),
+        })
+        return result
+
+    def _token_call_by_tool_call_id(self, tool_call_id: str) -> Optional[_PendingCall]:
+        """Compat: an unresolved token call that a client names by tool_call_id."""
+        with self._lock:
+            for pending in reversed(list(self._calls.values())):
+                if (pending.tool_call_id == tool_call_id and not pending.finished
+                        and pending.raw is None):
+                    return pending
+        return None
+
     # ------------------------------------------------------------------
-    # Called by the RPC handler (tool.command_result)
+    # Called by the RPC handler
     # ------------------------------------------------------------------
+
+    def ack(self, session_id: str, call_key: str, state: str = "running") -> Dict[str, Any]:
+        """``tool.ack``: answer ``proceed`` atomically against cancellation (C2).
+
+        Any ack stops the pickup deadline. ``running`` starts the exec
+        deadline; ``awaiting_user`` starts none.
+        """
+        if state not in ACK_STATES:
+            raise ValueError("state must be one of %s" % (ACK_STATES,))
+        with self._lock:
+            pending = self._calls.get(str(call_key or ""))
+        if pending is None or pending.session_id != str(session_id or ""):
+            return {"proceed": False, "reason": "unknown call"}
+        with pending.lock:
+            if pending.cancelled or pending.finished:
+                return {"proceed": False, "reason": "cancelled"}
+            if pending.done.is_set():
+                return {"proceed": False, "reason": "already resolved"}
+            if state == "running":
+                pending.state = "running"
+                pending.exec_deadline = time.monotonic() + pending.exec_timeout_s
+            else:
+                pending.state = "awaiting_user"
+        return {"proceed": True}
 
     def resolve(self, tool_call_id: str, result: Dict[str, Any]) -> bool:
         """
-        Called when the Tcl bridge POSTs tool.command_result.
+        Called when the Tcl bridge POSTs tool.command_result by tool_call_id.
         Unblocks the waiting execute_tool() call.
         Returns True if the call was found, False if it was already gone/timed-out.
         """
         with self._lock:
             pending = self._pending.get(tool_call_id)
         if pending is None:
-            logger.warning(
-                "resolve: unknown tool_call_id=%s (timed out?)", tool_call_id
-            )
+            token_call = self._token_call_by_tool_call_id(str(tool_call_id or ""))
+            if token_call is not None:
+                with token_call.lock:
+                    if token_call.raw is None and not token_call.finished:
+                        token_call.raw = dict(result)
+                        token_call.done.set()
+                        return True
+            logger.warning("resolve: unknown tool_call_id=%s (timed out?)", tool_call_id)
             return False
         pending.result = result
         pending.done.set()
@@ -177,6 +435,16 @@ class VmdToolBridge:
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
+
+def _empty_result() -> Dict[str, Any]:
+    """The product result dict with every key present (plan-specific constraint)."""
+    return {
+        "ok": False, "output": "", "error": "", "executed": "yes",
+        "truncated": False, "duration_ms": 0, "statements": None, "blocked": None,
+        "output_path": None, "output_bytes": 0, "image": None, "saved_path": None,
+        "applied_text": "",
+    }
+
 
 def _format_tool_label(tool_name: str, tool_input: Dict[str, Any]) -> str:
     """Human-readable summary for the tool_start transcript event."""
