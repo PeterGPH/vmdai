@@ -127,16 +127,48 @@ def _wants_v2(state: Any) -> bool:
         return False
 
 
+# §2c Persistence: the system/state kinds events.jsonl keeps. Chunks,
+# turn.started, usage, status and turn.retry are live-only.
+PERSISTED_STATE_KINDS = frozenset({"request.started", "tool.started", "tool.finished", "request.finished"})
+
+
+def is_display_event(event: Dict[str, Any]) -> bool:
+    """True for the events a chat's display log (events.jsonl) keeps (§2c Persistence).
+
+    Kept: user messages, request.started, tool.started, one assistant
+    message per turn, one sealed reasoning/message per turn, tool.finished
+    (late ones too), error, request.finished and lifecycle events.
+    Never kept: chunks and role=tool_start (the execution channel).
+    """
+    role = str(event.get("role") or "")
+    event_type = str(event.get("type") or "")
+    if event_type == "chunk" or role == "tool_start":
+        return False
+    if event_type == "lifecycle":
+        return True
+    if event_type == "state":
+        return (event.get("metadata") or {}).get("kind") in PERSISTED_STATE_KINDS
+    return event_type == "message" and role in ("user", "assistant", "reasoning", "error")
+
+
 class _EventMapper:
     """The ``ctx.on_event`` sink of one request (§2a Legacy callbacks, §2c).
 
     Every loop item keeps ``RequestState.turn`` current for runtime.info.
     For a v2 session the item also becomes a queue event (``push``); for a
     v1 session it is dropped, because v1 events come from the legacy
-    callbacks. The recorder's task directory is captured at the first loop
-    event for ``request.finished.run_dir`` (the recorder has ended its task
-    by the time the worker builds request.finished). A failure here is
-    logged and never reaches the loop.
+    callbacks. ``push`` also:
+
+    * collects a turn's reasoning chunks and pushes one sealed
+      ``reasoning/message`` just before the first non-reasoning event that
+      follows them (or before request.finished). ``turn.retry`` drops the
+      unsealed reasoning, because the retried attempt streams it again;
+    * writes the display kinds to events.jsonl (``is_display_event``) and
+      touches the manifest once, at request.finished.
+
+    The recorder's task directory is captured at the first loop event for
+    ``request.finished.run_dir``. A failure here is logged and never
+    reaches the loop.
     """
 
     def __init__(self, app: "RuntimeApp", state: "SessionState", request: "RequestState") -> None:
@@ -148,6 +180,10 @@ class _EventMapper:
         self.v2 = _wants_v2(state)
         self.recorder: Any = None
         self.run_dir: Optional[str] = None
+        self._reasoning_open = False
+        self._reasoning_turn: Any = None
+        self._reasoning_parts: List[str] = []
+        self._reasoning_t0 = 0.0
 
     def __call__(self, item: Dict[str, Any]) -> None:
         try:
@@ -181,7 +217,48 @@ class _EventMapper:
             return None
         meta = dict(metadata or {})
         meta.setdefault("request_id", self.request_id)
-        return self.app._push_v2(self.state, role, event_type, text, meta)
+        kind = meta.get("kind")
+        if role == "reasoning" and event_type == "chunk":
+            self._buffer_reasoning(meta.get("turn"), text)
+        elif kind == "turn.retry":
+            self._drop_reasoning()
+        else:
+            self.seal_reasoning()
+        event = self.app._push_v2(self.state, role, event_type, text, meta)
+        self.app._persist_display(self.chat_id, event)
+        if kind == "request.finished" and self.chat_id:
+            self.app.store.touch_manifest(self.chat_id)
+        return event
+
+    def _buffer_reasoning(self, turn: Any, text: str) -> None:
+        if self._reasoning_open and turn != self._reasoning_turn:
+            self.seal_reasoning()
+        if not self._reasoning_open:
+            self._reasoning_open = True
+            self._reasoning_turn = turn
+            self._reasoning_parts = []
+            self._reasoning_t0 = time.monotonic()
+        self._reasoning_parts.append(text)
+
+    def _drop_reasoning(self) -> None:
+        self._reasoning_open = False
+        self._reasoning_turn = None
+        self._reasoning_parts = []
+
+    def seal_reasoning(self) -> Optional[Dict[str, Any]]:
+        """Push the open reasoning as one ``reasoning/message`` (live and persisted)."""
+        if not self._reasoning_open:
+            return None
+        meta: Dict[str, Any] = {
+            "request_id": self.request_id,
+            "turn": self._reasoning_turn,
+            "duration_ms": int(round((time.monotonic() - self._reasoning_t0) * 1000)),
+        }
+        text = "".join(self._reasoning_parts)
+        self._drop_reasoning()
+        event = self.app._push_v2(self.state, "reasoning", "message", text, meta)
+        self.app._persist_display(self.chat_id, event)
+        return event
 
 
 class RuntimeApp:
@@ -1482,7 +1559,9 @@ class RuntimeApp:
         meta = _tool_finished_meta(call_key, str(info.get("tool_name") or ""), "tcl", info,
                                    float(duration), late=True)
         meta["request_id"] = str(info.get("request_id") or "")
-        return self._push_v2(state, "system", "state", "", meta)
+        event = self._push_v2(state, "system", "state", "", meta)
+        self._persist_display(chat_id, event)      # "tool.finished (including late:true ones)"
+        return event
 
     # ------------------------------------------------------------------
     # Background thread: Claude agent loop
@@ -1503,6 +1582,22 @@ class RuntimeApp:
         meta = dict(metadata or {})
         meta["v"] = 2
         return state.queue.push(role, event_type, text, meta)
+
+    def _persist_display(self, chat_id: Optional[str], event: Optional[Dict[str, Any]]) -> bool:
+        """Append one v2 display event to chats/<id>/events.jsonl (§2c Persistence).
+
+        Live-only kinds are skipped. The manifest is not touched here;
+        _EventMapper touches it once per request, at request.finished.
+        """
+        if not chat_id or not isinstance(event, dict) or not is_display_event(event):
+            return False
+        try:
+            self.store.append_display_events(chat_id, [event])
+        except Exception:
+            if self.logger:
+                self.logger.warning("could not persist a display event to %s", chat_id, exc_info=True)
+            return False
+        return True
 
     def _run_claude_loop_response(
         self,
@@ -1918,7 +2013,7 @@ class RuntimeApp:
             "ok": True,
             "chat_id": chat_id,
             "title": manifest.get("title", ""),
-            "message_count": manifest.get("message_count", 0),
+            "message_count": self.store.recount_messages(chat_id),
             "last_seq": last_seq,
         }
 

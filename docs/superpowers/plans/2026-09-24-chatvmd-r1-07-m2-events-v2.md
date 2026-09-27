@@ -51,7 +51,7 @@ Part C wins where it conflicts with Parts A/B.
 
 - A v1 session gets exactly today's events and persistence, whether it is tokenless or a token session that asked for (or defaulted to) `event_protocol: 1`. Every v2-only branch tests `_wants_v2(state)`, which is true only when `state.event_protocol >= 2`. A tokenless session can never reach 2.
 - Every v2 event the runtime pushes gets `metadata.v = 2` in exactly one place, `RuntimeApp._push_v2`. Events emitted while a request's worker runs travel through that request's `_EventMapper.push`, which adds `request_id`, seals reasoning and persists display kinds. Two events bypass the mapper. The user message is pushed by `chat.send` before the worker exists, and `chat.send` persists it as it does today. The late `tool.finished` goes through `_push_late_finished`.
-- The v2 display log is written with `ChatStore.append_display_events`, which appends lines and does not touch the manifest. The manifest (and `index.jsonl`) is touched once per request, when `request.finished` is pushed. `message_count` is recomputed from `events.jsonl` on every touch.
+- The v2 display log is written with `ChatStore.append_display_events`, which appends lines and does not touch the manifest. The manifest (and `index.jsonl`) is touched twice per request: once when `chat.send` persists the user message (pre-existing; auto-title reads `message_count`), and once when `request.finished` is pushed. It is never touched per display event. `message_count` is recomputed from `events.jsonl` on every touch.
 - `role=tool_start` stays the only instruction to run Tcl. This plan never changes its metadata, never tags it `v: 2`, never persists it, and never replays it from history.
 - Line numbers under **Files** are from commit 6f5f937. Plans 02–06 move them. Find each edit by its quoted anchor text; Task 0 prints every anchor.
 - The claude_loop change (`_tool_finished_meta(..., late=False)`) is additive. The S7 guards (golden requests, hashes, bridge guard, retry pin) must stay green after every task that touches `claude_loop.py`.
@@ -4345,7 +4345,7 @@ Expected:
 7. **Counting and writes (P07-T04).**
    - `message_count` is recomputed from `events.jsonl` on every manifest touch instead of adding a delta. This is what §7's "recomputed when a manifest is next touched" needs, and it cannot lose counts under concurrent appends.
    - Empty assistant messages (tool-only turns) are not counted.
-   - New store methods: `append_display_events` (no manifest touch), `touch_manifest`, `counts_as_message` and `_count_messages`. The v2 display log is appended per event while the manifest is touched once per request, so `index.jsonl` grows one row per request, not one per event.
+   - New store methods: `append_display_events` (no manifest touch), `touch_manifest`, `counts_as_message` and `_count_messages`. The v2 display log is appended per event while the manifest is touched at chat.send and at request.finished, so `index.jsonl` grows two rows per request, not one per event.
    - `recount_messages` is also used by a token session's `chat.resume`.
    - Plan 03's `tests/test_store_locks.py` concurrency test now appends assistant messages instead of chunks (its count of 161 is unchanged).
 8. **Sealed reasoning is also pushed live (P07-T04),** not only persisted. The view-model then sees the same `reasoning/message` live and on replay, and seals the reasoning block before the answer or tool row. `turn.retry` drops unsealed reasoning.
