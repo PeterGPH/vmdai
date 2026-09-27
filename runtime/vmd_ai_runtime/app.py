@@ -11,6 +11,7 @@ Key additions over the skeleton:
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hmac
 import json
 import logging
@@ -28,7 +29,6 @@ from .claude_loop import (
     ClaudeToolLoop,
     LoopOptions,
     RunContext,
-    VMD_SYSTEM_PROMPT,
     WIKI_SYSTEM_PROMPT_ADDENDUM,
     build_claude_loop,
 )
@@ -39,6 +39,7 @@ from .docs_search import DocsSearch
 from .errors import RpcError
 from .keys import KeyStore
 from .logging_utils import default_log_path, redact_sensitive
+from .prompts import NON_VISION_TOOL_OVERRIDES, chatvmd_system_prompt, session_block
 from .protocol import validate_method_params, validate_rpc_payload
 from .provider import (
     build_provider,
@@ -114,6 +115,9 @@ class RuntimeApp:
         self.keys = KeyStore()
         self.logger = logger
         self.tool_bridge = VmdToolBridge()
+        # Round-2 hook (spec 1, 2g): each callable returns extra per-request
+        # context (for example scene state) appended after the <session> block.
+        self.context_providers: List[Callable[[SessionState], str]] = []
         # docs_search is constructed even when no index has been built —
         # ``is_available`` is False until ``vmd-ai-index --rebuild`` runs.
         # Pass enable_rag=False to force-disable for the no-RAG arm of an
@@ -792,7 +796,7 @@ class RuntimeApp:
 
                     conv_mode = str(state.settings.get("conversation_mode") or "local_first")
                     if loop is not None:
-                        system_prompt = self._system_prompt_for_request(state)
+                        system_prompt = self._system_prompt_for_request(state, loop)
                         try:
                             prior_messages = self._prior_for(state, chat_id, conv_mode, loop, system_prompt)
                         except Exception:
@@ -1176,7 +1180,7 @@ class RuntimeApp:
         if chat_id is None:
             chat_id = state.chat_id
         if system_prompt is None:
-            system_prompt = self._system_prompt_for_request(state)
+            system_prompt = self._system_prompt_for_request(state, loop)
         chunk_events: List[Dict[str, Any]] = []
 
         def on_chunk(chunk: str) -> None:
@@ -1410,9 +1414,35 @@ class RuntimeApp:
             "last_seq": last_seq,
         }
 
-    def _system_prompt_for_request(self, state) -> str:
+    def _system_prompt_for_request(self, state, loop) -> str:
+        """The CHATVMD prompt for one request of ``loop`` (spec 2g).
+
+        Picks the vision or non-vision variant from the loop's resolved
+        vision and gives a non-vision product loop the tool-description
+        overrides, so the prompt and the tool list agree. Then appends
+        today's mode line, the per-request <session> block and any
+        context_providers text. Resolving vision here also means images
+        that build_prior returns are handled correctly from the first call."""
+        try:
+            vision = bool(loop._vision_enabled())
+        except Exception:
+            vision = False
+        options = getattr(loop, "options", None)
+        if options is not None and not vision and not options.tool_overrides:
+            loop.options = dataclasses.replace(options, tool_overrides=dict(NON_VISION_TOOL_OVERRIDES))
         mode = str(state.settings.get("mode") or "work")
-        return VMD_SYSTEM_PROMPT + f"\n\nMode: {mode}."
+        prompt = chatvmd_system_prompt(vision) + f"\n\nMode: {mode}."
+        prompt += session_block(str(state.cwd or ""), str(getattr(loop, "model", "") or ""))
+        for provider in list(self.context_providers):
+            try:
+                extra = str(provider(state) or "").strip()
+            except Exception:
+                if self.logger:
+                    self.logger.warning("context provider failed", exc_info=True)
+                continue
+            if extra:
+                prompt += "\n\n" + extra
+        return prompt
 
     def _run_budget_for(self, loop: ClaudeToolLoop, system_prompt: str) -> int:
         """run_budget for this loop (§2b Budget), counting the wiki addendum run() adds."""

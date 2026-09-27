@@ -19,7 +19,11 @@ Four largely-independent subsystems:
   rendered pixels, not LLM-judged completion*.
 - **`integrations/scivisagentbench/`** — a harness that wraps the unchanged `ClaudeToolLoop`
   (via a `BaseAgent` adapter) through headless VMD to score it on SciVisAgentBench tasks and a
-  portable structure×metric grid, across arms (none / rag / wiki / autorag / inject).
+  portable structure×metric grid, across arms (none / rag / wiki / autorag / inject). It
+  measures the loop's `options=None` preset (`VMD_SYSTEM_PROMPT`, rescue `all`, no tool
+  overrides), not the shipped ChatVMD product (`CHATVMD_SYSTEM_PROMPT` from
+  `runtime/vmd_ai_runtime/prompts.py` with `LoopOptions.product()`); a product-preset arm is
+  round-2 work.
 - **`scripts/`** — tooling, notably the ATLAS MD-trajectory → benchmark-case pipeline.
 
 ⚠️ **Security:** the agent evaluates **Tcl at global scope, which is not sandboxed** (`exec`,

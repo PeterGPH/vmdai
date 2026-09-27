@@ -2,9 +2,13 @@
 vmd_ai_agent.py — SciVisAgentBench adapter for the vmd_ai (ChatVMD) runtime.
 
 Wraps your existing ``ClaudeToolLoop`` so it can be evaluated by
-SciVisAgentBench's framework. The loop is driven exactly as in production —
-same system prompt, same tool surface — except VMD tool calls are executed by
-an in-process headless VMD (see headless_vmd_bridge.py) instead of the Tk panel.
+SciVisAgentBench's framework. The loop is built with ``options=None``, the
+benchmark preset: ``VMD_SYSTEM_PROMPT``, text-to-tool rescue ``all`` and the
+frozen tool descriptions. That is not the shipped ChatVMD product, which runs
+``CHATVMD_SYSTEM_PROMPT`` (runtime/vmd_ai_runtime/prompts.py) with
+``LoopOptions.product()``; a product-preset arm is round-2 work. VMD tool
+calls are executed by an in-process headless VMD (see headless_vmd_bridge.py)
+instead of the Tk panel.
 
 Install: drop this file + headless_vmd_bridge.py into
 ``benchmark/evaluation_framework/agents/`` and add to that package's

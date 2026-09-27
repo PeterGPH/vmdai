@@ -187,7 +187,7 @@ def test_legacy_text_prior_within_budget(tmp_path):
     result(send(app, session, "new question", conversation_mode="hybrid_resume"))
     wait_idle(app, session)
     state = state_of(app, session)
-    budget = app._run_budget_for(loop, app._system_prompt_for_request(state))
+    budget = app._run_budget_for(loop, app._system_prompt_for_request(state, loop))
     prior = loop.calls[0][:-1]
     assert loop.calls[0][-1] == {"role": "user", "content": "new question"}
     assert prior          # the trim kept something to test the invariants against

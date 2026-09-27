@@ -1244,6 +1244,19 @@ def _images_for_call(messages: List[Dict], *, vision: bool, max_edge: int) -> Li
     return out if changed else messages
 
 
+def _apply_tool_overrides(tools: List[Dict[str, Any]], overrides: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Copy of ``tools`` with descriptions replaced by name (spec 2g). The
+    frozen schema dicts are never mutated."""
+    out: List[Dict[str, Any]] = []
+    for tool in tools:
+        name = str(tool.get("name") or "")
+        if name in overrides:
+            tool = dict(tool)
+            tool["description"] = overrides[name]
+        out.append(tool)
+    return out
+
+
 def _stream_anthropic_direct(
     messages: List[Dict],
     model: str,
@@ -2641,7 +2654,11 @@ class ClaudeToolLoop:
         # Optional extra tool schemas wired in by an embedder (e.g. semantic
         # vmd_measure / vmd_represent tools); dispatched to the tool_bridge.
         extra = getattr(self, "extra_tools", None)
-        return (tools + list(extra)) if extra else tools
+        tools = (tools + list(extra)) if extra else tools
+        options = getattr(self, "options", None)
+        if options is not None and options.tool_overrides:
+            tools = _apply_tool_overrides(tools, options.tool_overrides)
+        return tools
 
     # ------------------------------------------------------------------
     # Wiki tool dispatchers
