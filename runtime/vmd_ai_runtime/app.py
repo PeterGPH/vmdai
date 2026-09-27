@@ -21,6 +21,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pathlib import Path
@@ -40,7 +41,7 @@ from .claude_loop import (
 )
 from .locks import ChatLock
 from .recorder import RunRecorder
-from .constants import CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_PROTOCOL, RUNTIME_VERSION
+from .constants import ACTION_FOR_CODE, CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_PROTOCOL, RUNTIME_VERSION
 from .docs_search import DocsSearch
 from .errors import RpcError
 from .keys import KeyStore
@@ -131,7 +132,10 @@ class _EventMapper:
     Every loop item keeps ``RequestState.turn`` current for runtime.info.
     For a v2 session the item also becomes a queue event (``push``); for a
     v1 session it is dropped, because v1 events come from the legacy
-    callbacks. A failure here is logged and never reaches the loop.
+    callbacks. The recorder's task directory is captured at the first loop
+    event for ``request.finished.run_dir`` (the recorder has ended its task
+    by the time the worker builds request.finished). A failure here is
+    logged and never reaches the loop.
     """
 
     def __init__(self, app: "RuntimeApp", state: "SessionState", request: "RequestState") -> None:
@@ -141,6 +145,8 @@ class _EventMapper:
         self.request_id = str(request.request_id)
         self.chat_id: Optional[str] = state.chat_id
         self.v2 = _wants_v2(state)
+        self.recorder: Any = None
+        self.run_dir: Optional[str] = None
 
     def __call__(self, item: Dict[str, Any]) -> None:
         try:
@@ -156,9 +162,16 @@ class _EventMapper:
                 self.request.turn = int(metadata.get("turn") or 0)
             except (TypeError, ValueError):
                 pass
+        self._note_run_dir()
         if self.v2:
             self.push(str(item.get("role") or ""), str(item.get("type") or ""),
                       str(item.get("text") or ""), metadata)
+
+    def _note_run_dir(self) -> None:
+        if self.run_dir is None and self.recorder is not None:
+            task_dir = getattr(self.recorder, "current_task_dir", None)
+            if task_dir:
+                self.run_dir = str(task_dir)
 
     def push(self, role: str, event_type: str, text: str = "",
              metadata: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -1475,9 +1488,12 @@ class RuntimeApp:
         chat.send passes the per-request loop, the chat captured when the
         request started, and the system prompt the prior was budgeted for.
         Token sessions also get a messages.jsonl Appender (full memory, §2b).
-        The loop's on_event items go to _make_on_event: a v2 session gets
-        them as queue events and the legacy callbacks below do nothing; a v1
-        session keeps today's chunk/message/error events (§2a, §2c).
+
+        v2 sessions: request.started is the first event, and request.finished
+        comes from the ``finally`` on every path, including failures before
+        loop.run (§2c "request.finished is guaranteed"). An error becomes one
+        v2 error event with code, http_status, hint and action (§2f). The
+        legacy callbacks do nothing. v1 sessions keep today's events.
         """
         state = self.sessions.get(session_id)
         if state is None:
@@ -1495,8 +1511,11 @@ class RuntimeApp:
         mapper = self._make_on_event(state, request)
         mapper.chat_id = chat_id
         v2 = mapper.v2
+        started = time.monotonic()
         chunk_events: List[Dict[str, Any]] = []
         events_to_persist: List[Dict[str, Any]] = []
+        failure_text: Optional[str] = None
+        entered_run = False
 
         def on_chunk(chunk: str) -> None:
             if v2:
@@ -1532,6 +1551,8 @@ class RuntimeApp:
 
         prev_recorder = loop.recorder
         try:
+            if v2:
+                mapper.push("system", "state", "", self._request_started_meta(loop, request_id, chat_id))
             if system_prompt is None:
                 system_prompt = self._system_prompt_for_request(state, loop)
             meta = None
@@ -1542,12 +1563,15 @@ class RuntimeApp:
                     meta = None
                     if self.logger:
                         self.logger.warning("recorder provenance failed", exc_info=True)
-            loop.recorder = self._build_recorder_for_session(state, meta)
+            recorder = self._build_recorder_for_session(state, meta)
+            loop.recorder = recorder
+            mapper.recorder = recorder
             messages_out = None
             if getattr(state, "authenticated", False) and chat_id:
                 messages_out = conversation.Appender(self.store.chat_dir(chat_id), request_id)
             ctx = RunContext(request_id=request_id, chat_id=chat_id or "",
                              on_event=mapper, messages_out=messages_out)
+            entered_run = True
             output = loop.run(
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -1562,14 +1586,22 @@ class RuntimeApp:
                 ctx=ctx,
             )
         except ClaudeLoopError as exc:
-            events_to_persist.append(state.queue.push(
-                "error", "message", f"Agent error: {exc}",
-                {"request_id": request_id, "provider": self.provider_name},
-            ))
+            failure_text = str(exc) or exc.__class__.__name__
+            if v2:
+                mapper.push("error", "message", failure_text, self._error_meta(exc))
+            else:
+                events_to_persist.append(state.queue.push(
+                    "error", "message", f"Agent error: {exc}",
+                    {"request_id": request_id, "provider": self.provider_name},
+                ))
         except Exception as exc:
-            events_to_persist.append(state.queue.push(
-                "error", "message", f"Unexpected error: {exc}", {"request_id": request_id},
-            ))
+            failure_text = f"Unexpected error: {exc}"
+            if v2:
+                mapper.push("error", "message", failure_text, self._error_meta(exc))
+            else:
+                events_to_persist.append(state.queue.push(
+                    "error", "message", failure_text, {"request_id": request_id},
+                ))
         else:
             if not v2:
                 events_to_persist.extend(chunk_events)
@@ -1581,9 +1613,95 @@ class RuntimeApp:
                         "assistant", "message", output, {"request_id": request_id}))
         finally:
             loop.recorder = prev_recorder
+            if v2:
+                try:
+                    mapper.push("system", "state", "", self._request_finished_meta(
+                        loop, mapper, entered_run=entered_run,
+                        failure_text=failure_text, started=started))
+                except Exception:
+                    if self.logger:
+                        self.logger.warning("request.finished failed for %s", request_id, exc_info=True)
             if events_to_persist and chat_id:
                 self.store.append_events(chat_id, events_to_persist)
             self._clear_active(state, request_id)
+
+    def _request_started_meta(self, loop: Any, request_id: str, chat_id: Optional[str]) -> Dict[str, Any]:
+        """request.started metadata (§2c): what this request runs with."""
+        options = getattr(loop, "options", None)
+        try:
+            vision = bool(loop._vision_enabled())
+        except Exception:
+            vision = False
+        try:
+            max_turns = int(self._max_turns_for(loop))
+        except Exception:
+            max_turns = int(getattr(loop, "MAX_TURNS", 28))
+        return {
+            "kind": "request.started",
+            "request_id": request_id,
+            "chat_id": chat_id,
+            "provider": str(getattr(loop, "provider_name", "") or ""),
+            "model": str(getattr(loop, "model", "") or ""),
+            "max_turns": max_turns,
+            "vision": vision,
+            "think": getattr(options, "think", None) if options is not None else None,
+        }
+
+    @staticmethod
+    def _request_finished_meta(loop: Any, mapper: "_EventMapper", *, entered_run: bool,
+                               failure_text: Optional[str], started: float) -> Dict[str, Any]:
+        """request.finished metadata (§2c), filled from whatever is known.
+
+        Before loop.run is entered nothing ran: status error, zero turns.
+        After it, the loop's last_* fields describe this run (run() resets
+        them first). C4: a wrap-up that failed leaves its message in error.
+        """
+        if entered_run:
+            status = "error" if failure_text is not None else str(getattr(loop, "last_status", None) or "complete")
+            turns = int(getattr(loop, "last_turns", 0) or 0)
+            tool_calls = int(getattr(loop, "last_tool_calls", 0) or 0)
+            final_text_empty = bool(getattr(loop, "last_final_text_empty", True))
+            usage = dict(getattr(loop, "last_usage", None) or {})
+            wrapped_up = bool(getattr(loop, "last_wrapped_up", False))
+        else:
+            status, turns, tool_calls, final_text_empty, usage, wrapped_up = "error", 0, 0, True, {}, False
+        error = failure_text
+        if error is None and getattr(loop, "last_wrap_up_error", None):
+            error = str(loop.last_wrap_up_error)
+        return {
+            "kind": "request.finished",
+            "request_id": mapper.request_id,
+            "status": status,
+            "wrapped_up": wrapped_up,
+            "turns": turns,
+            "tool_calls": tool_calls,
+            "final_text_empty": final_text_empty,
+            "duration_ms": int(round((time.monotonic() - started) * 1000)),
+            "usage": {"input_tokens_evaluated": usage.get("input_tokens_evaluated"),
+                      "output_tokens": usage.get("output_tokens")},
+            "error": error,
+            "run_dir": mapper.run_dir,
+        }
+
+    @staticmethod
+    def _error_meta(exc: BaseException) -> Dict[str, Any]:
+        """Metadata of a v2 error event (§2c, §2f Error codes).
+
+        code is ClaudeLoopError.code (unreachable, auth, billing,
+        model_not_found) or "other" for anything else; action follows code.
+        """
+        code = str(getattr(exc, "code", "") or "") if isinstance(exc, ClaudeLoopError) else ""
+        if code not in ACTION_FOR_CODE:
+            code = "other"
+        http_status = getattr(exc, "http_status", None)
+        if isinstance(http_status, bool) or not isinstance(http_status, int):
+            http_status = None
+        return {
+            "code": code,
+            "http_status": http_status,
+            "hint": str(getattr(exc, "hint", "") or ""),
+            "action": ACTION_FOR_CODE[code],
+        }
 
     # ------------------------------------------------------------------
     # Background thread: simple provider (mock / fallback)
@@ -1595,59 +1713,98 @@ class RuntimeApp:
         request_id: str,
         prompt: str,
         cancel_event: threading.Event,
-        prior_messages: list | None = None,
+        prior_messages: Optional[list] = None,
     ) -> None:
-        """Simple non-agentic streaming: used when no API key is set (mock mode)."""
+        """Simple non-agentic streaming: used when no API key is set (mock mode).
+
+        v1 sessions keep today's events. v2 sessions get the envelope of a
+        one-turn run: request.started, turn.started, chunks, the sealed final
+        assistant/message and request.finished from the ``finally`` (§2c).
+        """
         state = self.sessions.get(session_id)
         if state is None:
             return
-        chunk_events = []
+        request = state.active_request
+        if request is None or request.request_id != request_id:
+            request = RequestState(request_id=request_id)
+        mapper = self._make_on_event(state, request)
+        v2 = mapper.v2
+        started = time.monotonic()
+        model = str(state.settings.get("model") or DEFAULT_SETTINGS["model"])
+        chunk_events: List[Dict[str, Any]] = []
+        events_to_persist: List[Dict[str, Any]] = []
+        failure_text: Optional[str] = None
+        output = ""
 
         def on_chunk(chunk: str) -> None:
-            event = state.queue.push(
-                "assistant", "chunk", chunk, {"request_id": request_id}
+            if v2:
+                mapper.push("assistant", "chunk", chunk, {"turn": 1})
+                return
+            chunk_events.append(
+                state.queue.push("assistant", "chunk", chunk, {"request_id": request_id})
             )
-            chunk_events.append(event)
 
         try:
+            if v2:
+                mapper.push("system", "state", "", {
+                    "kind": "request.started", "request_id": request_id, "chat_id": state.chat_id,
+                    "provider": self.provider_name, "model": model, "max_turns": 1,
+                    "vision": False, "think": None,
+                })
+                request.turn = 1
+                mapper.push("system", "state", "", {"kind": "turn.started", "turn": 1})
             output = self.provider.stream_response(
                 prompt=prompt,
                 cancel_event=cancel_event,
                 on_chunk=on_chunk,
-                model=str(state.settings.get("model") or DEFAULT_SETTINGS["model"]),
+                model=model,
                 system_prompt=self._system_prompt_for_mode(
                     str(state.settings.get("mode") or "work")
                 ),
             )
         except Exception as exc:
-            err_event = state.queue.push(
-                "error",
-                "message",
-                f"Provider error: {exc}",
-                {"request_id": request_id, "provider": self.provider_name},
-            )
-            self.store.append_events(state.chat_id, [err_event])
-            if state.active_request and state.active_request.request_id == request_id:
-                state.active_request = None
-            return
-
-        events_to_persist = list(chunk_events)
-        if cancel_event.is_set():
-            cancel_ev = state.queue.push(
-                "system", "lifecycle", "cancelled", {"request_id": request_id}
-            )
-            events_to_persist.append(cancel_ev)
+            failure_text = f"Provider error: {exc}"
+            if v2:
+                mapper.push("error", "message", failure_text, self._error_meta(exc))
+            else:
+                events_to_persist.append(state.queue.push(
+                    "error", "message", failure_text,
+                    {"request_id": request_id, "provider": self.provider_name},
+                ))
         else:
-            final_ev = state.queue.push(
-                "assistant", "message", output, {"request_id": request_id}
-            )
-            events_to_persist.append(final_ev)
-
-        if events_to_persist:
-            self.store.append_events(state.chat_id, events_to_persist)
-
-        if state.active_request and state.active_request.request_id == request_id:
-            state.active_request = None
+            if v2:
+                mapper.push("assistant", "message", output, {"turn": 1, "final": True})
+            else:
+                events_to_persist.extend(chunk_events)
+                if cancel_event.is_set():
+                    events_to_persist.append(state.queue.push(
+                        "system", "lifecycle", "cancelled", {"request_id": request_id}))
+                else:
+                    events_to_persist.append(state.queue.push(
+                        "assistant", "message", output, {"request_id": request_id}))
+        finally:
+            if v2:
+                if failure_text is not None:
+                    status = "error"
+                elif cancel_event.is_set():
+                    status = "cancelled"
+                else:
+                    status = "complete"
+                try:
+                    mapper.push("system", "state", "", {
+                        "kind": "request.finished", "request_id": request_id, "status": status,
+                        "wrapped_up": False, "turns": 1, "tool_calls": 0,
+                        "final_text_empty": not output,
+                        "duration_ms": int(round((time.monotonic() - started) * 1000)),
+                        "usage": {"input_tokens_evaluated": None, "output_tokens": None},
+                        "error": failure_text, "run_dir": None,
+                    })
+                except Exception:
+                    if self.logger:
+                        self.logger.warning("request.finished failed for %s", request_id, exc_info=True)
+            if events_to_persist and state.chat_id:
+                self.store.append_events(state.chat_id, events_to_persist)
+            self._clear_active(state, request_id)
 
     # ------------------------------------------------------------------
     # Helpers
