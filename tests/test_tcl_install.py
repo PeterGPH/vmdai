@@ -10,7 +10,8 @@ from typing import Any, Dict, List
 import pytest
 
 from helpers.fake_rpc_server import FakeRpcServer
-from helpers.tcl import REPO, TclTestResult, find_tclsh, run_tcl, run_tcltest, tcl_skip_reason, tcl_word
+from helpers.tcl import (REPO, TclTestResult, find_tclsh, module_result, module_run, run_tcl,
+                         run_tcltest, tcl_skip_reason, tcl_word)
 from vmd_ai_runtime.launch import write_token_file
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_init.tcl"
@@ -37,8 +38,8 @@ def _handler():
     return handler
 
 
-@pytest.fixture(scope="module")
-def init_session(tmp_path_factory):
+@module_run
+def _run(tmp_path_factory):
     home = tmp_path_factory.mktemp("init") / "home"
     home.mkdir()
     with FakeRpcServer(_handler()) as fake:
@@ -48,6 +49,11 @@ def init_session(tmp_path_factory):
         started = [f"sess_{n}" for n in range(1, len(fake.calls("session.start")) + 1)]
         stopped = [c.params.get("session_id") for c in fake.calls("session.stop")]
     return result, started, stopped
+
+
+@pytest.fixture(scope="module")
+def init_session(request):
+    return module_result(request)
 
 
 @pytest.fixture(scope="module")

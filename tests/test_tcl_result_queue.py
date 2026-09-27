@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 import pytest
 
 from helpers.fake_rpc_server import FakeRpcServer, Recorded, Reply
-from helpers.tcl import REPO, TclTestResult, run_tcltest
+from helpers.tcl import REPO, TclTestResult, module_result, module_run, run_tcltest
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_result_queue.tcl"
 TOTAL = 7
@@ -61,12 +61,17 @@ class QueueRun:
     seen: Dict[str, int]
 
 
-@pytest.fixture(scope="module")
-def queue_run() -> QueueRun:
+@module_run
+def _run(tmp_path_factory) -> QueueRun:
     handler = QueueHandler()
     with FakeRpcServer(handler) as server:
         result = run_tcltest(str(TCL_FILE), env={"VMDAI_FAKE_URL": server.base_url})
         return QueueRun(result, list(server.requests), dict(handler.seen))
+
+
+@pytest.fixture(scope="module")
+def queue_run(request) -> QueueRun:
+    return module_result(request)
 
 
 def _assert_passed(result: TclTestResult, names: List[str]) -> None:

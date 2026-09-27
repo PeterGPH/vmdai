@@ -10,15 +10,20 @@ from typing import List
 
 import pytest
 
-from helpers.tcl import REPO, TclTestResult, run_tcltest
+from helpers.tcl import REPO, TclTestResult, module_result, module_run, run_tcltest
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_bridge_unit.tcl"
 TOTAL = 17
 
 
-@pytest.fixture(scope="module")
-def result() -> TclTestResult:
+@module_run
+def _run(tmp_path_factory) -> TclTestResult:
     return run_tcltest(str(TCL_FILE))
+
+
+@pytest.fixture(scope="module")
+def result(request) -> TclTestResult:
+    return module_result(request)
 
 
 def _assert_passed(result: TclTestResult, names: List[str]) -> None:

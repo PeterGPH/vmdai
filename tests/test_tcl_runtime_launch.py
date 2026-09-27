@@ -17,7 +17,7 @@ from typing import List
 import pytest
 
 from helpers.fake_rpc_server import FakeRpcServer, Recorded
-from helpers.tcl import REPO, TclTestResult, run_tcltest
+from helpers.tcl import REPO, TclTestResult, module_result, module_run, run_tcltest
 from vmd_ai_runtime.launch import write_token_file
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_runtime_launch.tcl"
@@ -40,8 +40,8 @@ def _kill_quietly(pid: int) -> None:
         pass
 
 
-@pytest.fixture(scope="module")
-def launch_run(tmp_path_factory) -> LaunchRun:
+@module_run
+def _run(tmp_path_factory) -> LaunchRun:
     base = tmp_path_factory.mktemp("launch")
     home = base / "home dir"
     home.mkdir()
@@ -79,6 +79,11 @@ def launch_run(tmp_path_factory) -> LaunchRun:
             _kill_quietly(int(line))
         sleeper.kill()
         sleeper.wait()
+
+
+@pytest.fixture(scope="module")
+def launch_run(request) -> LaunchRun:
+    return module_result(request)
 
 
 def _assert_passed(result: TclTestResult, names: List[str]) -> None:
