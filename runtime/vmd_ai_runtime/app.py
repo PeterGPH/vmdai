@@ -45,6 +45,7 @@ from .recorder import RunRecorder
 from .constants import ACTION_FOR_CODE, CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_PROTOCOL, RUNTIME_VERSION
 from .docs_search import DocsSearch
 from .errors import RpcError
+from .events import display_log
 from .keys import KeyStore
 from .logging_utils import default_log_path, redact_sensitive
 from .prompts import NON_VISION_TOOL_OVERRIDES, chatvmd_system_prompt, session_block
@@ -1036,12 +1037,17 @@ class RuntimeApp:
 
         if method == "chat.history.get":
             state = self._get_session(params["session_id"], session_token)
-            _ = state
             chat_id = params["chat_id"]
             manifest = self.store.get_manifest(chat_id)
             if manifest is None:
                 raise RpcError("NOT_FOUND", f"chat {chat_id} not found")
-            events = self.store.read_events(chat_id, limit=params["limit"])
+            if getattr(state, "authenticated", False):
+                # A token session replays the whole display log through
+                # vm::apply (§2c Persistence): no tail cut and no tool_start,
+                # and a v1 request's chunks are dropped when its message was stored.
+                events = display_log(self.store.read_events(chat_id, limit=conversation.ALL_EVENTS))
+            else:
+                events = self.store.read_events(chat_id, limit=params["limit"])
             return {"chat_id": chat_id, "manifest": manifest, "events": events}
 
         if method == "chat.resume":
@@ -2005,8 +2011,9 @@ class RuntimeApp:
                 self._release_chat_lock(state)
                 state.chat_lock = lock
                 state.chat_id = chat_id
-            state.queue.clear()
-            # Polling after last_seq delivers the chat_resumed event below.
+            # §2c: a token session's seq never resets; resume drops what is
+            # queued and polling after last_seq delivers chat_resumed below.
+            state.queue.drop_pending()
             last_seq = state.queue.last_seq
             state.queue.push("system", "lifecycle", "chat_resumed", {"chat_id": chat_id})
         return {
