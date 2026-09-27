@@ -179,6 +179,33 @@ def test_truncated_tool_calls_not_run():
         assert any((e.get("metadata") or {}).get("phase") == "turn_truncated" for e in events)
 
 
+def test_truncated_ollama_tool_call_not_run_derived():
+    """The real tool_call recording with its done line forced to done_reason 'length'."""
+    cas = copy.deepcopy(load_cassette("ollama", "tool_call"))
+    for ex in cas["exchanges"]:
+        if ex["path"] == "/api/chat":
+            out = []
+            for line in ex["body_lines"]:
+                if line.strip():
+                    obj = json.loads(line)
+                    if obj.get("done"):
+                        obj["done_reason"] = "length"
+                    line = json.dumps(obj)
+                out.append(line)
+            ex["body_lines"] = out
+    assert field(chat_lines(cas), "tool_calls")
+    model = cas["meta"]["model"]
+    opts = product(model, think=False, max_turns=1, loop_guard=False, supports_vision=False)
+    loop = ClaudeToolLoop(provider_name="ollama", api_key=BASE, model=model, options=opts)
+    bridge, events = RecordingBridge(), []
+    with play(cas):
+        run_loop(loop, "Load 1hck.pdb", bridge=bridge,
+                 ctx=RunContext(request_id="req_trunc2", chat_id="chat_000000000001",
+                                on_event=events.append))
+    assert bridge.calls == []
+    assert any((e.get("metadata") or {}).get("phase") == "turn_truncated" for e in events)
+
+
 def test_model_not_found_hint_from_404():
     cas = load_cassette("ollama", "model_not_found")
     model = cas["meta"]["model"]

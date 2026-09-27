@@ -103,6 +103,10 @@ def _hermetic(tmp_path: Path) -> Iterator[HermeticState]:
         if provider_catalog is not None and hasattr(provider_catalog, "clear_caches"):
             provider_catalog.clear_caches()
 
+        no_think = getattr(claude_loop, "_NO_THINK", None)
+        if no_think is not None:
+            no_think.clear()
+
         yield state
 
 

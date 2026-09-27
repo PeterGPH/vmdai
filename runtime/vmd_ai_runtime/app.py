@@ -333,6 +333,8 @@ class RuntimeApp:
         if parts is None:
             return None
         provider_name, model, api_key = parts
+        if not profile.get("base_url") and provider_name in DEFAULT_BASE_URLS:
+            profile = dict(profile, base_url=DEFAULT_BASE_URLS[provider_name])
         options = LoopOptions.product(profile, max_turns=int(self._setting("max_turns")))
         wiki = self.wiki_store if self._setting("wiki_enabled") else None
         return ClaudeToolLoop(provider_name=provider_name, api_key=api_key, model=model,

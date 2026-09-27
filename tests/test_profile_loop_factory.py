@@ -66,6 +66,14 @@ def test_ollama_profile_builds_product_options(tmp_path):
     assert fresh.wiki_store is app.wiki_store and fresh is not loop
 
 
+def test_openai_compatible_profile_without_base_url_uses_local_default(tmp_path):
+    app = make_token_app(tmp_path, settings_store=_store({"provider": "openai-compatible", "model": "x", "options": {}}))
+    session = start(app, tmp_path)
+    loop = app._new_loop_for(state_of(app, session))
+    assert loop.provider_name == "openai-compatible"
+    assert loop.options.base_url == settings_store.DEFAULT_BASE_URLS["openai-compatible"] == "http://localhost:8000/v1"
+
+
 def test_profile_beats_env_provider(tmp_path, monkeypatch):
     monkeypatch.setenv("VMD_AI_PROVIDER", "anthropic-direct")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
