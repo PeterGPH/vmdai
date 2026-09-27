@@ -34,6 +34,9 @@ proc settle {{ms 30}} {
     set ::_settled 0
     after $ms {set ::_settled 1}
     vwait ::_settled
+    # A process descheduled for longer than $ms sees this timer come due in
+    # the same pass as the after-0 chain it waits for; finish what is due.
+    update
 }
 proc fresh {} {
     ::vmdai::executor::reset
