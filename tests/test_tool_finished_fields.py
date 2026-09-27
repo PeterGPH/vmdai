@@ -8,6 +8,7 @@ from helpers.app_driver import call, make_token_app, result, send, wait_idle
 from helpers.events_v2 import (FakePlugin, MetaScriptedLoop, ProductBridge, ScriptTurn, of_kind,
                                poll_all, product_options, product_result, run_cmd, start_v2, tool_block)
 from vmd_ai_runtime.claude_loop import _tool_finished_meta
+from vmd_ai_runtime import conversation
 
 TINY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
 BLOCKED = [{"id": "cmd_exec", "word": "exec", "text": "exec ls"}]
@@ -130,3 +131,30 @@ def test_late_after_next_request(tmp_path, monkeypatch):
     late_at, = _index(events, lambda m: m.get("late") is True)
     assert started2 < late_at < finished2
     assert of_kind(events, "request.finished")[1]["status"] == "complete"
+
+
+def test_late_after_chat_switch_stays_in_issuing_chat(tmp_path, monkeypatch):
+    """M7 for v2 (plan-05 carry-forward): a late result for a call issued in
+    chat A that arrives after chat.resume moved the session to chat B is
+    noted in chat A only. The session, now on chat B, gets no late
+    tool.finished, and chat B's logs never mention the call_key."""
+    app, session = _held_run(tmp_path, monkeypatch, [ScriptTurn(tool_blocks=[run_cmd("tc_1", "long_job")])])
+    with FakePlugin(app, session, answer=lambda meta: None) as plugin:
+        first = result(send(app, session, "run the long job"))
+        key, = plugin.wait_held()
+        result(call(app, "chat.cancel", {}, session))
+        wait_idle(app, session)
+        chat_a = first["chat_id"]
+        chat_b = app.store.create_chat(title_hint="Chat B")
+        result(call(app, "chat.resume", {"chat_id": chat_b}, session))
+        reply = plugin.post(key, ok=True, output="3 atoms")
+    assert reply == {"accepted": True, "late": True, "duplicate": False}
+    assert app.sessions.get(session.session_id).chat_id == chat_b
+    events = poll_all(app, session)
+    assert not [m for m in of_kind(events, "tool.finished") if m["call_key"] == key and m["late"]]
+    assert not [e for e in app.store.read_events(chat_b, limit=10 ** 6)
+                if (e.get("metadata") or {}).get("call_key") == key]
+    late_a = [ln for ln in conversation.read_lines(app.store.chat_dir(chat_a)) if ln["kind"] == "late_result"]
+    assert [(ln["call_key"], ln["request_id"], ln["executed"]) for ln in late_a] == [
+        (key, first["request_id"], "yes")]
+    assert not [ln for ln in conversation.read_lines(app.store.chat_dir(chat_b)) if ln.get("call_key") == key]
