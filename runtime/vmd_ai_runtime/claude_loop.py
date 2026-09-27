@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import copy
 import dataclasses
+import functools
 import http.client
 import json
 import logging
@@ -27,11 +28,13 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import image_scale, provider_catalog
 from .provider import (
     ProviderError,
     resolve_anthropic_api_key,
@@ -846,6 +849,15 @@ def _stream_request(
                 _retry_status(on_meta, attempt, net_limit, wait, None)
                 _backoff_sleep(wait, opts, should_cancel)
                 continue
+            if (
+                opts is not None
+                and opts.classify_unreachable
+                and provider_catalog.classify_unreachable(exc) in ("refused", "reset")
+            ):
+                raise ProviderUnreachableError(
+                    f"network error: {exc}",
+                    hint=_generic_unreachable_hint(req.full_url),
+                ) from exc
             raise ClaudeLoopError(f"network error: {exc}") from exc
 
 
@@ -860,6 +872,389 @@ def _open_stream(
     if opts is None:
         return _stream_request(req, timeout)
     return _stream_request(req, timeout, opts=opts, should_cancel=should_cancel, on_meta=on_meta)
+
+
+# ---------------------------------------------------------------------------
+# Unreachable classification and the Ollama preflight (spec 2f). Only the
+# options path reaches this code; options=None never does.
+# ---------------------------------------------------------------------------
+
+
+def _url_base(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _unreachable_case(exc: BaseException) -> Optional[str]:
+    """'refused', 'reset' or 'timeout' when ``exc``, or an exception it was
+    raised from, is a connection failure; None for anything else.
+
+    provider_catalog.classify_unreachable judges each exception in the chain.
+    A URLError whose reason is only text (for example a DNS failure, or
+    ``URLError("Connection refused")``) is read by its words and counts as
+    'refused' when they say nothing more specific."""
+    current: Optional[BaseException] = exc
+    for _ in range(8):
+        if current is None:
+            return None
+        case = provider_catalog.classify_unreachable(current)
+        if case is not None:
+            return case
+        if isinstance(current, urllib.error.URLError) and not isinstance(
+            current, urllib.error.HTTPError
+        ):
+            text = str(current.reason).lower()
+            if "timed out" in text:
+                return "timeout"
+            if "reset" in text or "closed" in text:
+                return "reset"
+            return "refused"
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _reason_text(exc: BaseException) -> str:
+    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
+        return str(exc.reason)
+    return str(exc) or exc.__class__.__name__
+
+
+def _generic_unreachable_hint(url: str) -> str:
+    """Hint for a refused or reset connection when the provider is unknown
+    (the wording provider_catalog.test_provider uses for non-Ollama servers)."""
+    return f"Could not reach {_url_base(url)}. Check that the server is running."
+
+
+def _http_status_of(exc: BaseException) -> Optional[int]:
+    """The HTTP status behind a ClaudeLoopError: its http_status (plan 02
+    sets it when classify_errors is on), else the HTTPError it came from."""
+    status = getattr(exc, "http_status", None)
+    if isinstance(status, int):
+        return status
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, urllib.error.HTTPError):
+        return int(cause.code)
+    return None
+
+
+def _ollama_unreachable_error(
+    base_url: str,
+    exc: BaseException,
+    opts: Any,
+    case: Optional[str] = None,
+) -> "ClaudeLoopError":
+    """Error for an Ollama server that cannot be reached. The message keeps
+    today's wording; ``hint`` carries the case-specific advice (2f table)."""
+    case = case or _unreachable_case(exc) or "refused"
+    message = f"Ollama unreachable at {base_url!r}: {_reason_text(exc)}."
+    if case == "refused":
+        message += " Is `ollama serve` running?"
+    hint = provider_catalog.unreachable_hint(base_url, case)
+    if opts is not None and (opts.classify_unreachable or opts.classify_errors):
+        return ProviderUnreachableError(message, hint=hint)
+    return ClaudeLoopError(message, hint=hint)
+
+
+def _ps_entry(models: Any, model: str) -> Optional[Dict[str, Any]]:
+    """The /api/ps entry for ``model`` ('name' and 'name:latest' match)."""
+    def _norm(name: Any) -> str:
+        text = str(name or "")
+        return text if ":" in text else text + ":latest"
+
+    want = _norm(model)
+    for entry in models or []:
+        if isinstance(entry, dict) and want in (_norm(entry.get("name")), _norm(entry.get("model"))):
+            return entry
+    return None
+
+
+def _ollama_preflight(
+    base_url: str,
+    model: str,
+    opts: Any,
+    on_meta: Optional[Callable[[Dict[str, Any]], None]],
+) -> None:
+    """GET /api/version (2 s, cached 30 s by provider_catalog), then GET
+    /api/ps (2 s, never cached) before every /api/chat, so a dead or stale
+    server fails in about 2 s even with a warm version cache (S6). Emits
+    status 'loading_model' when the model is not resident, else the resident
+    model's digest (C6)."""
+    timeout = provider_catalog.PREFLIGHT_TIMEOUT_S
+    try:
+        provider_catalog.ollama_version(base_url, timeout=timeout)
+        running = provider_catalog.ollama_ps(base_url, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        raise ClaudeLoopError(
+            f"Ollama preflight failed at {base_url!r}: HTTP {exc.code}",
+            http_status=int(exc.code),
+        ) from exc
+    except Exception as exc:
+        case = _unreachable_case(exc)
+        if case is None:
+            raise ClaudeLoopError(f"Ollama preflight failed at {base_url!r}: {exc}") from exc
+        raise _ollama_unreachable_error(base_url, exc, opts, case) from exc
+    if on_meta is None:
+        return
+    entry = _ps_entry(running, model)
+    if entry is None:
+        on_meta({"kind": "status", "phase": "loading_model", "message": f"Loading {model}…"})
+    elif entry.get("digest"):
+        on_meta({"kind": "model_digest", "value": str(entry["digest"])})
+
+
+# Per-(base_url, model) memo of servers that answered HTTP 400 to "think"
+# (spec 2f). Module-level so it outlives the per-request loop; tests clear it.
+_NO_THINK: set = set()
+_NO_THINK_LOCK = threading.Lock()
+
+
+def _think_key(base_url: str, model: str) -> Tuple[str, str]:
+    return (str(base_url or "").rstrip("/"), str(model or ""))
+
+
+def _think_disabled(base_url: str, model: str) -> bool:
+    with _NO_THINK_LOCK:
+        return _think_key(base_url, model) in _NO_THINK
+
+
+def _remember_no_think(base_url: str, model: str) -> None:
+    with _NO_THINK_LOCK:
+        _NO_THINK.add(_think_key(base_url, model))
+
+
+def _ollama_body_options(opts: Any) -> Dict[str, Any]:
+    """The /api/chat ``options`` object on the options path: num_ctx from the
+    profile (LoopOptions.product() fills 32768 when the profile has none,
+    C7; a bare LoopOptions() keeps 8192), temperature and seed only when
+    set. No environment reads."""
+    options: Dict[str, Any] = {"num_ctx": int(opts.num_ctx) if opts.num_ctx else 8192}
+    if opts.temperature is not None:
+        options["temperature"] = float(opts.temperature)
+    if opts.seed is not None:
+        options["seed"] = int(opts.seed)
+    return options
+
+
+# ---------------------------------------------------------------------------
+# Usage parsing (spec 2c "Usage semantics"): a value the provider did not
+# report is None, never 0. Emitted once per turn through on_meta.
+# ---------------------------------------------------------------------------
+
+def _usage_int(value: Any) -> Optional[int]:
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _usage_meta(source: str, evaluated: Any, output: Any, cache_read: Any) -> Dict[str, Any]:
+    return {
+        "kind": "usage",
+        "input_tokens_evaluated": _usage_int(evaluated),
+        "output_tokens": _usage_int(output),
+        "cache_read_tokens": _usage_int(cache_read),
+        "source": source,
+    }
+
+
+def _anthropic_usage_update(event: Dict[str, Any], etype: str, acc: Dict[str, Any]) -> None:
+    """message_start carries input and cache-read tokens; message_delta the
+    final output count."""
+    if etype == "message_start":
+        usage = (event.get("message") or {}).get("usage") or {}
+        acc["input"] = usage.get("input_tokens")
+        acc["cache_read"] = usage.get("cache_read_input_tokens")
+    elif etype == "message_delta":
+        usage = event.get("usage") or {}
+        if "output_tokens" in usage:
+            acc["output"] = usage.get("output_tokens")
+
+
+def _openai_usage_meta(usage: Any) -> Dict[str, Any]:
+    """The final chunk's usage (stream_options.include_usage). Cached prompt
+    tokens are reported separately and left out of input_tokens_evaluated."""
+    if not isinstance(usage, dict):
+        return _usage_meta("openai", None, None, None)
+    prompt = usage.get("prompt_tokens")
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    evaluated = prompt
+    if isinstance(prompt, int) and isinstance(cached, int):
+        evaluated = prompt - cached
+    return _usage_meta("openai", evaluated, usage.get("completion_tokens"), cached)
+
+
+def _ollama_usage_meta(done_event: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Ollama's prompt_eval_count leaves out the cached prefix, so it is
+    input_tokens_evaluated, never context used."""
+    event = done_event or {}
+    return _usage_meta("ollama", event.get("prompt_eval_count"), event.get("eval_count"), None)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible endpoints (spec 2f): per-loop base_url and body extras.
+# ---------------------------------------------------------------------------
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+_PROTECTED_BODY_KEYS = ("model", "messages", "tools", "stream")
+
+
+def _openai_chat_url(base_url: str) -> str:
+    """Join a /v1 base URL and /chat/completions without doubling slashes or
+    the path (a base that already ends in /chat/completions is kept)."""
+    base = str(base_url or "").strip().rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    return base + "/chat/completions"
+
+
+def _apply_openai_body_options(body: Dict[str, Any], opts: Any) -> None:
+    """Options-path body fields: temperature/seed when set, the opt-in
+    stream_options.include_usage (older vLLM rejects it), then extra_body
+    merged at top level (it may not replace model, messages, tools or stream)."""
+    if opts.temperature is not None:
+        body["temperature"] = float(opts.temperature)
+    if opts.seed is not None:
+        body["seed"] = int(opts.seed)
+    if opts.include_usage:
+        body["stream_options"] = {"include_usage": True}
+    for key, value in dict(opts.extra_body or {}).items():
+        if key in _PROTECTED_BODY_KEYS:
+            continue
+        body[key] = copy.deepcopy(value)
+
+
+# ---------------------------------------------------------------------------
+# Vision (spec 2f): which providers get images, and at what size.
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_DIRECT_NAMES = ("anthropic-direct", "anthropic_api", "anthropic-direct-api")
+_IMAGE_NOT_SHOWN = "[Snapshot captured — image not shown in this provider mode]"
+
+
+def resolve_supports_vision(provider: str, value: Any, capabilities: Optional[Dict[str, bool]]) -> bool:
+    """Resolve LoopOptions.supports_vision to a bool.
+
+    True/False are explicit. None keeps today's rule (images only to
+    anthropic-direct). "auto" is True for anthropic-direct, the /api/show
+    ``vision`` capability for Ollama, and False for openai-compatible and
+    openrouter, which have no capability probe (a manual toggle)."""
+    name = str(provider or "").lower()
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return name in _ANTHROPIC_DIRECT_NAMES
+    if str(value).lower() == "auto":
+        if name in _ANTHROPIC_DIRECT_NAMES:
+            return True
+        if name in _OLLAMA_PROVIDER_NAMES:
+            return bool((capabilities or {}).get("vision"))
+    return False
+
+
+def _images_allowed(opts: Any) -> bool:
+    """Converters inline image blocks only when vision resolved to True."""
+    return opts is not None and opts.supports_vision is True
+
+
+def _image_block_b64(block: Dict[str, Any]) -> str:
+    source = block.get("source") or {}
+    if source.get("type") != "base64":
+        return ""
+    return str(source.get("data") or "")
+
+
+@functools.lru_cache(maxsize=16)
+def _downscaled_b64(data: str, max_edge: int) -> str:
+    """Base64 of the PNG ``data`` fitted to ``max_edge`` (cached, so a
+    snapshot that stays in the history is resized once, not every turn)."""
+    try:
+        png = base64.b64decode(data)
+        small, _width, _height = image_scale.downscale_png(png, max_edge)
+    except Exception:
+        logger.warning("snapshot downscale failed; sending the original", exc_info=True)
+        return data
+    if small is png:
+        return data
+    return base64.b64encode(small).decode("ascii")
+
+
+def _has_image(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    if block.get("type") == "image":
+        return True
+    content = block.get("content")
+    return block.get("type") == "tool_result" and isinstance(content, list) and any(
+        isinstance(b, dict) and b.get("type") == "image" for b in content
+    )
+
+
+def _messages_have_images(messages: List[Dict]) -> bool:
+    return any(
+        isinstance(m, dict) and isinstance(m.get("content"), list)
+        and any(_has_image(b) for b in m["content"])
+        for m in messages
+    )
+
+
+def _image_for_call(block: Dict[str, Any], vision: bool, max_edge: int) -> Dict[str, Any]:
+    if not vision:
+        return {"type": "text", "text": _IMAGE_NOT_SHOWN}
+    source = block.get("source") or {}
+    data = _image_block_b64(block)
+    if not data or max_edge <= 0 or str(source.get("media_type") or "image/png") != "image/png":
+        return block
+    small = _downscaled_b64(data, int(max_edge))
+    if small == data:
+        return block
+    return dict(block, source=dict(source, data=small))
+
+
+def _block_for_call(block: Any, vision: bool, max_edge: int) -> Any:
+    if not isinstance(block, dict):
+        return block
+    if block.get("type") == "image":
+        return _image_for_call(block, vision, max_edge)
+    content = block.get("content")
+    if block.get("type") == "tool_result" and isinstance(content, list):
+        return dict(block, content=[
+            _image_for_call(b, vision, max_edge)
+            if isinstance(b, dict) and b.get("type") == "image" else b
+            for b in content
+        ])
+    return block
+
+
+def _images_for_call(messages: List[Dict], *, vision: bool, max_edge: int) -> List[Dict]:
+    """Per-call view of ``messages`` for the options path (spec 2f Vision).
+
+    With vision, every base64 PNG image block (top level or inside a
+    tool_result) is downscaled to fit ``max_edge`` (1024 px local, 1568 px
+    Anthropic); without vision, each becomes the text marker, so no provider
+    ever receives an image. Covers this run's snapshots and the images
+    build_prior hydrates from disk. Messages without images are shared, the
+    in-run list is never modified, and ``messages`` itself comes back when
+    no message holds an image."""
+    out: List[Dict] = []
+    changed = False
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list) and any(_has_image(b) for b in content):
+            out.append(dict(msg, content=[_block_for_call(b, vision, max_edge) for b in content]))
+            changed = True
+        else:
+            out.append(msg)
+    return out if changed else messages
+
+
+def _apply_tool_overrides(tools: List[Dict[str, Any]], overrides: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Copy of ``tools`` with descriptions replaced by name (spec 2g). The
+    frozen schema dicts are never mutated."""
+    out: List[Dict[str, Any]] = []
+    for tool in tools:
+        name = str(tool.get("name") or "")
+        if name in overrides:
+            tool = dict(tool)
+            tool["description"] = overrides[name]
+        out.append(tool)
+    return out
 
 
 def _stream_anthropic_direct(
@@ -942,6 +1337,7 @@ def _anthropic_consume(
     """Open one Anthropic request and consume its SSE stream."""
     text_parts: List[str] = []
     blocks_in_progress: Dict[int, Dict[str, Any]] = {}
+    usage_acc: Dict[str, Any] = {"input": None, "output": None, "cache_read": None}
     final_tool_blocks: List[Dict[str, Any]] = []
     raise_errors = opts is not None and opts.raise_stream_errors
 
@@ -953,6 +1349,9 @@ def _anthropic_consume(
                 break
 
             etype = str(event.get("type") or "")
+
+            if on_meta is not None:
+                _anthropic_usage_update(event, etype, usage_acc)
 
             if etype == "content_block_start":
                 idx = int(event.get("index") or 0)
@@ -1012,6 +1411,9 @@ def _anthropic_consume(
             if etype == "message_stop":
                 break
 
+    if on_meta is not None:
+        on_meta(_usage_meta("anthropic", usage_acc["input"], usage_acc["output"],
+                            usage_acc["cache_read"]))
     return "".join(text_parts), final_tool_blocks
 
 
@@ -1033,7 +1435,12 @@ def _stream_openrouter(
     or_messages = []
     if system_prompt:
         or_messages.append({"role": "system", "content": system_prompt})
-    or_messages.extend(_to_openrouter_messages(messages))
+    if opts is None:
+        or_messages.extend(_to_openrouter_messages(messages))
+    else:
+        or_messages.extend(
+            _to_openrouter_messages(messages, include_images=_images_allowed(opts))
+        )
 
     tools_list = list(tools) if tools is not None else VMD_TOOLS
     body: Dict[str, Any] = {
@@ -1047,13 +1454,22 @@ def _stream_openrouter(
     # Endpoint is configurable so the same OpenAI-style path can target any
     # OpenAI-compatible server (OpenRouter by default, or a local vLLM/SGLang/
     # Ollama-OpenAI endpoint via VMD_AI_OPENAI_BASE_URL=http://host:8000/v1).
-    _base = os.environ.get("VMD_AI_OPENAI_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+    # With options set, the URL, key and body extras come from opts alone;
+    # the environment is read only on the options=None (benchmark) path.
+    if opts is None:
+        _base = os.environ.get("VMD_AI_OPENAI_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+        _url = _base + "/chat/completions"
+        _bearer = api_key
+    else:
+        _url = _openai_chat_url(opts.base_url or OPENROUTER_BASE_URL)
+        _bearer = api_key or "EMPTY"
+        _apply_openai_body_options(body, opts)
     req = urllib.request.Request(
-        _base + "/chat/completions",
+        _url,
         data=json.dumps(body).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {_bearer}",
             "HTTP-Referer": "https://localhost/vmd-ai",
             "X-Title": "vmd-ai",
             "accept": "text/event-stream",
@@ -1065,6 +1481,7 @@ def _stream_openrouter(
     # tool_calls_acc keyed by integer index; OpenAI streams arguments
     # as small string fragments we have to concatenate before json.loads.
     tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+    usage_seen: Any = None
 
     with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
         for event in _iter_sse_events(resp):
@@ -1073,6 +1490,8 @@ def _stream_openrouter(
             if should_cancel():
                 break
 
+            if on_meta is not None and isinstance(event.get("usage"), dict):
+                usage_seen = event["usage"]
             choices = event.get("choices") or []
             if not choices:
                 continue
@@ -1081,6 +1500,12 @@ def _stream_openrouter(
                 if finish:
                     on_meta({"kind": "stop_reason", "value": str(finish)})
             delta = (choices[0] or {}).get("delta") or {}
+            if on_meta is not None:
+                reasoning = delta.get("reasoning_content")
+                if not isinstance(reasoning, str) or not reasoning:
+                    reasoning = delta.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    on_meta({"kind": "reasoning", "text": reasoning})
 
             content = delta.get("content")
             if isinstance(content, str) and content:
@@ -1114,6 +1539,9 @@ def _stream_openrouter(
                     slot["function"]["name"] = str(fn["name"])
                 if isinstance(fn.get("arguments"), str):
                     slot["function"]["arguments"] += fn["arguments"]
+
+    if on_meta is not None:
+        on_meta(_openai_usage_meta(usage_seen))
 
     final_tool_blocks: List[Dict[str, Any]] = []
     for idx in sorted(tool_calls_acc.keys()):
@@ -1186,7 +1614,12 @@ def _ollama_tools(tools: List[Dict]) -> List[Dict]:
     return out
 
 
-def _to_ollama_messages(messages: List[Dict]) -> List[Dict]:
+def _to_ollama_messages(
+    messages: List[Dict],
+    *,
+    include_images: bool = False,
+    tool_name: bool = False,
+) -> List[Dict]:
     """Convert internal Anthropic-style messages to Ollama format.
 
     Ollama's ``/api/chat`` accepts an OpenAI-ish message list with
@@ -1198,11 +1631,19 @@ def _to_ollama_messages(messages: List[Dict]) -> List[Dict]:
       * ``arguments`` in tool_calls is an OBJECT (not a JSON string)
       * Ollama doesn't track ``tool_call_id`` the same way — we still
         emit it for round-trip clarity, but Ollama will ignore it.
-      * Images in ``tool_result`` are dropped (Ollama vision models
-        accept images differently; we keep this path text-only for
-        now and surface a text marker instead).
+      * Images in ``tool_result`` become a text marker unless
+        include_images is set (vision on, LoopOptions path): then they
+        move to a ``{"role": "user", "content": "Snapshot from
+        capture_vmd_snapshot (call <id>).", "images": [b64]}`` message
+        placed right after that turn's tool messages, and top-level image
+        blocks ride on their own message's ``images``.
+
+    tool_name (LoopOptions.ollama_tool_name) adds the name of the tool that
+    produced each ``role=tool`` message, looked up from the earlier
+    assistant ``tool_use`` block with the same id.
     """
     out: List[Dict] = []
+    names_by_id: Dict[str, str] = {}
     for msg in messages:
         role = msg["role"]
         content = msg["content"]
@@ -1218,12 +1659,15 @@ def _to_ollama_messages(messages: List[Dict]) -> List[Dict]:
         text_parts: List[str] = []
         tool_calls: List[Dict] = []
         tool_results: List[Dict] = []
+        snapshot_messages: List[Dict] = []
+        top_images: List[str] = []
 
         for block in content:
             btype = block.get("type", "")
             if btype == "text":
                 text_parts.append(str(block.get("text") or ""))
             elif btype == "tool_use":
+                names_by_id[str(block.get("id", ""))] = str(block.get("name", ""))
                 tool_calls.append({
                     "id": block.get("id", ""),
                     "type": "function",
@@ -1236,28 +1680,44 @@ def _to_ollama_messages(messages: List[Dict]) -> List[Dict]:
                 tc_content = block.get("content", "")
                 if isinstance(tc_content, list):
                     parts = []
+                    images: List[str] = []
                     for b in tc_content:
                         if not isinstance(b, dict):
                             continue
                         if b.get("type") == "image":
-                            parts.append(
-                                "[Snapshot captured — image not shown in "
-                                "this provider mode]"
-                            )
+                            data = _image_block_b64(b)
+                            if include_images and data:
+                                images.append(data)
+                            else:
+                                parts.append(_IMAGE_NOT_SHOWN)
                         else:
                             parts.append(str(b.get("text") or ""))
                     tc_content = " ".join(p for p in parts if p)
-                tool_results.append({
+                    if images:
+                        snapshot_messages.append({
+                            "role": "user",
+                            "content": "Snapshot from capture_vmd_snapshot "
+                                       f"(call {block.get('tool_use_id', '')}).",
+                            "images": images,
+                        })
+                entry: Dict[str, Any] = {
                     "role": "tool",
                     "tool_call_id": block.get("tool_use_id", ""),
                     "content": str(tc_content),
-                })
-            # ``image`` blocks at top level are dropped — Ollama's
-            # vision path requires multipart images on the user msg,
-            # which we don't use here.
+                }
+                if tool_name and names_by_id.get(str(block.get("tool_use_id", ""))):
+                    entry["tool_name"] = names_by_id[str(block.get("tool_use_id", ""))]
+                tool_results.append(entry)
+            elif btype == "image" and include_images:
+                data = _image_block_b64(block)
+                if data:
+                    top_images.append(data)
+            # Without include_images, top-level ``image`` blocks are dropped
+            # as before.
 
         if tool_results:
             out.extend(tool_results)
+            out.extend(snapshot_messages)
         elif tool_calls:
             msg_out: Dict[str, Any] = {
                 "role": role,
@@ -1266,7 +1726,10 @@ def _to_ollama_messages(messages: List[Dict]) -> List[Dict]:
             }
             out.append(msg_out)
         else:
-            out.append({"role": role, "content": "".join(text_parts)})
+            plain: Dict[str, Any] = {"role": role, "content": "".join(text_parts)}
+            if top_images:
+                plain["images"] = top_images
+            out.append(plain)
 
     return out
 
@@ -1465,6 +1928,7 @@ def _stream_ollama(
     on_meta: Optional[Callable[[Dict[str, Any]], None]] = None,
     opts: Optional[LoopOptions] = None,
     tool_mode: Optional[str] = None,
+    _no_think_retry: bool = False,
 ) -> Tuple[str, List[Dict]]:
     """Stream one turn from Ollama's ``/api/chat`` with tool support.
 
@@ -1480,32 +1944,44 @@ def _stream_ollama(
       * We synthesize ``tool_call_id``s when Ollama doesn't provide
         them, so downstream code can correlate tool_use ↔ tool_result.
     """
+    if opts is not None and opts.preflight:
+        _ollama_preflight(base_url, model, opts, on_meta)
     ol_messages: List[Dict] = []
     if system_prompt:
         ol_messages.append({"role": "system", "content": system_prompt})
-    ol_messages.extend(_to_ollama_messages(messages))
+    if opts is None:
+        ol_messages.extend(_to_ollama_messages(messages))
+    else:
+        ol_messages.extend(_to_ollama_messages(
+            messages,
+            include_images=_images_allowed(opts),
+            tool_name=bool(opts.ollama_tool_name),
+        ))
 
     tools_list = list(tools) if tools is not None else VMD_TOOLS
-    options: Dict[str, Any] = {
-        # Bigger context so multi-turn tool-calling sessions don't
-        # rotate the agent's prior reasoning out of the window.
-        "num_ctx": 8192,
-    }
-    # Temperature / seed pass-through. Read at request time (not loop
-    # construction) so a wrapper script can set them between trials —
-    # this is how the seed-bench plan gets independent runs.
-    _temp_env = os.getenv("VMD_AI_TEMPERATURE")
-    if _temp_env:
-        try:
-            options["temperature"] = float(_temp_env)
-        except ValueError:
-            pass
-    _seed_env = os.getenv("VMD_AI_SEED")
-    if _seed_env:
-        try:
-            options["seed"] = int(_seed_env)
-        except ValueError:
-            pass
+    if opts is None:
+        options: Dict[str, Any] = {
+            # Bigger context so multi-turn tool-calling sessions don't
+            # rotate the agent's prior reasoning out of the window.
+            "num_ctx": 8192,
+        }
+        # Temperature / seed pass-through. Read at request time (not loop
+        # construction) so a wrapper script can set them between trials —
+        # this is how the seed-bench plan gets independent runs.
+        _temp_env = os.getenv("VMD_AI_TEMPERATURE")
+        if _temp_env:
+            try:
+                options["temperature"] = float(_temp_env)
+            except ValueError:
+                pass
+        _seed_env = os.getenv("VMD_AI_SEED")
+        if _seed_env:
+            try:
+                options["seed"] = int(_seed_env)
+            except ValueError:
+                pass
+    else:
+        options = _ollama_body_options(opts)
     body: Dict[str, Any] = {
         "model": model,
         "messages": ol_messages,
@@ -1513,6 +1989,15 @@ def _stream_ollama(
         "tools": _ollama_tools(tools_list),
         "options": options,
     }
+    if opts is not None:
+        if opts.keep_alive is not None:
+            body["keep_alive"] = opts.keep_alive
+        if (
+            opts.think is not None
+            and not _no_think_retry
+            and not _think_disabled(base_url, model)
+        ):
+            body["think"] = opts.think
 
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/api/chat",
@@ -1527,10 +2012,13 @@ def _stream_ollama(
     text_parts: List[str] = []
     final_tool_blocks: List[Dict[str, Any]] = []
     tool_call_counter = 0
+    got_event = False
+    done_event: Optional[Dict[str, Any]] = None
 
     try:
         with _open_stream(req, timeout, opts, should_cancel, on_meta) as resp:
             for event in _iter_ndjson_events(resp):
+                got_event = True
                 if should_cancel():
                     break
                 if "error" in event:
@@ -1538,6 +2026,12 @@ def _stream_ollama(
                         f"Ollama error: {event['error']}"
                     )
                 msg = event.get("message") or {}
+                if on_meta is not None:
+                    thinking = msg.get("thinking")
+                    if isinstance(thinking, str) and thinking:
+                        on_meta({"kind": "reasoning", "text": thinking})
+                    if event.get("done"):
+                        done_event = event
                 # Text content — stream it.
                 content = msg.get("content")
                 if isinstance(content, str) and content:
@@ -1566,7 +2060,34 @@ def _stream_ollama(
                         on_meta({"kind": "stop_reason",
                                  "value": str(event.get("done_reason") or "stop")})
                     break
-    except (ClaudeLoopError, RunCancelled):
+    except RunCancelled:
+        raise
+    except ClaudeLoopError as exc:
+        if opts is not None:
+            cause = exc.__cause__
+            if isinstance(cause, urllib.error.URLError) and not isinstance(
+                cause, urllib.error.HTTPError
+            ):
+                raise _ollama_unreachable_error(base_url, cause, opts) from cause
+            status = _http_status_of(exc)
+            if status == 400 and "think" in body and not _no_think_retry:
+                _remember_no_think(base_url, model)
+                if on_meta is not None:
+                    on_meta({
+                        "kind": "status",
+                        "phase": "think_unsupported",
+                        "message": f"{model} does not support thinking; continuing without it.",
+                    })
+                return _stream_ollama(
+                    messages=messages, model=model, system_prompt=system_prompt,
+                    base_url=base_url, timeout=timeout, on_text=on_text,
+                    should_cancel=should_cancel, tools=tools, on_meta=on_meta,
+                    opts=opts, tool_mode=tool_mode, _no_think_retry=True,
+                )
+            if status == 404:
+                # On /api/chat a 404 always means the model is not pulled;
+                # plan 02's generic "Choose a model..." hint is replaced.
+                exc.hint = f"ollama pull {model}"
         raise
     except urllib.error.HTTPError as exc:
         detail = ""
@@ -1589,7 +2110,17 @@ def _stream_ollama(
             f"Is `ollama serve` running?"
         ) from exc
     except Exception as exc:
+        if (
+            opts is not None
+            and opts.classify_unreachable
+            and not got_event
+            and isinstance(exc, (ConnectionRefusedError, ConnectionResetError))
+        ):
+            raise _ollama_unreachable_error(base_url, exc, opts) from exc
         raise ClaudeLoopError(f"Ollama stream failed: {exc}") from exc
+
+    if on_meta is not None:
+        on_meta(_ollama_usage_meta(done_event))
 
     text = "".join(text_parts)
 
@@ -1626,7 +2157,11 @@ def _stream_ollama(
 # Message-format conversion helpers
 # ---------------------------------------------------------------------------
 
-def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
+def _to_openrouter_messages(
+    messages: List[Dict],
+    *,
+    include_images: bool = False,
+) -> List[Dict]:
     """
     Convert internal Anthropic-style messages to OpenAI/OpenRouter format.
 
@@ -1636,6 +2171,10 @@ def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
     OpenRouter format:
         {"role": "user"|"assistant", "content": str, "tool_calls": [...]}
         {"role": "tool", "tool_call_id": "...", "content": "..."}
+
+    include_images (vision on, LoopOptions path): each image inside a
+    tool_result becomes a user message with an ``image_url`` data-URL part,
+    placed right after that turn's tool messages.
     """
     out: List[Dict] = []
     for msg in messages:
@@ -1653,6 +2192,7 @@ def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
         text_parts: List[str] = []
         tool_calls: List[Dict] = []
         tool_results: List[Dict] = []
+        snapshot_messages: List[Dict] = []
 
         for block in content:
             btype = block.get("type", "")
@@ -1673,6 +2213,16 @@ def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
                 # Flatten image content to text if present
                 tc_content = block.get("content", "")
                 if isinstance(tc_content, list):
+                    if include_images:
+                        for b in tc_content:
+                            if isinstance(b, dict) and b.get("type") == "image" and _image_block_b64(b):
+                                mime = str((b.get("source") or {}).get("media_type") or "image/png")
+                                snapshot_messages.append({"role": "user", "content": [
+                                    {"type": "text", "text": "Snapshot from capture_vmd_snapshot "
+                                                             f"(call {block['tool_use_id']})."},
+                                    {"type": "image_url", "image_url": {
+                                        "url": f"data:{mime};base64,{_image_block_b64(b)}"}},
+                                ]})
                     tc_content = " ".join(
                         b.get("text", "") for b in tc_content if isinstance(b, dict)
                     )
@@ -1690,6 +2240,7 @@ def _to_openrouter_messages(messages: List[Dict]) -> List[Dict]:
 
         if tool_results:
             out.extend(tool_results)
+            out.extend(snapshot_messages)
         elif tool_calls:
             msg_out: Dict[str, Any] = {
                 "role": role,
@@ -1951,6 +2502,11 @@ class ClaudeToolLoop:
         # FIRST on most turns to look up prior knowledge before
         # rediscovering it from raw docs.
         self.wiki_store = wiki_store
+        # Set from the Ollama preflight's /api/ps entry (C6); None elsewhere.
+        self.last_model_digest: Optional[str] = None
+        # Summed over the request's turns; None until a turn reports it.
+        self.last_usage: Dict[str, Optional[int]] = {
+            "input_tokens_evaluated": None, "output_tokens": None}
         # Behaviour flags (§2a). None keeps today's benchmark behaviour
         # byte-for-byte; the product passes LoopOptions.product(profile).
         self.options = options
@@ -2043,6 +2599,41 @@ class ClaudeToolLoop:
             "error": "",
         }
 
+    def _vision_enabled(self) -> bool:
+        """Whether snapshot images go to this loop's model (spec 2f Vision).
+
+        options=None keeps today's rule (anthropic-direct only). With options,
+        True/False are used as-is; None and "auto" are resolved once through
+        resolve_supports_vision (for Ollama, "auto" asks /api/show with the
+        2 s preflight timeout) and the bool is stored back into self.options,
+        so the converters see the same answer on every later call."""
+        options = getattr(self, "options", None)
+        if options is None:
+            return self._is_anthropic_direct
+        value = options.supports_vision
+        if isinstance(value, bool):
+            return value
+        capabilities: Optional[Dict[str, bool]] = None
+        if self._is_ollama and str(value).lower() == "auto":
+            capabilities = self._ollama_capabilities()
+        resolved = resolve_supports_vision(self.provider_name, value, capabilities)
+        self.options = dataclasses.replace(options, supports_vision=resolved)
+        return resolved
+
+    def _ollama_capabilities(self) -> Optional[Dict[str, bool]]:
+        options = getattr(self, "options", None)
+        base = options.base_url if options is not None and options.base_url else self.api_key
+        try:
+            show = provider_catalog.ollama_show(
+                base or "http://localhost:11434", self.model,
+                timeout=provider_catalog.PREFLIGHT_TIMEOUT_S,
+            )
+            return dict(provider_catalog.model_capabilities(show))
+        except Exception:
+            logger.warning("ollama /api/show failed; treating %s as non-vision", self.model,
+                           exc_info=True)
+            return None
+
     def _tools_for_turn(self) -> List[Dict[str, Any]]:
         """Tool list to advertise to the provider this turn.
 
@@ -2063,7 +2654,11 @@ class ClaudeToolLoop:
         # Optional extra tool schemas wired in by an embedder (e.g. semantic
         # vmd_measure / vmd_represent tools); dispatched to the tool_bridge.
         extra = getattr(self, "extra_tools", None)
-        return (tools + list(extra)) if extra else tools
+        tools = (tools + list(extra)) if extra else tools
+        options = getattr(self, "options", None)
+        if options is not None and options.tool_overrides:
+            tools = _apply_tool_overrides(tools, options.tool_overrides)
+        return tools
 
     # ------------------------------------------------------------------
     # Wiki tool dispatchers
@@ -2241,6 +2836,14 @@ class ClaudeToolLoop:
         ``options=None`` they are called exactly as before (S7).
         """
         tools = self._tools_for_turn()
+        if self.options is not None and _messages_have_images(messages):
+            # Per-call image view (spec 2f Vision): downscaled when this loop's
+            # resolved vision is on, a text marker when it is off. The in-run
+            # list (and messages_out) keep the full image.
+            vision = self._vision_enabled()
+            messages = _images_for_call(
+                messages, vision=vision, max_edge=int(self.options.image_max_edge or 0)
+            )
         extra: Dict[str, Any] = {}
         if self.options is not None:
             extra = {
@@ -2326,6 +2929,14 @@ class ClaudeToolLoop:
         if not isinstance(item, dict):
             return
         kind = str(item.get("kind") or "")
+        if kind == "model_digest":
+            value = item.get("value")
+            self.last_model_digest = str(value) if value else None
+        if kind == "usage":
+            for key in ("input_tokens_evaluated", "output_tokens"):
+                value = item.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    self.last_usage[key] = (self.last_usage.get(key) or 0) + value
         if kind in _LOOP_ONLY_META:
             self._turn_meta[kind] = dict(item)
             return
@@ -2607,6 +3218,8 @@ class ClaudeToolLoop:
             )
 
         self._ctx = ctx
+        self.last_model_digest = None
+        self.last_usage = {"input_tokens_evaluated": None, "output_tokens": None}
         self._turn = 0
         self._turn_meta = {}
         self.last_status = None
@@ -2726,7 +3339,7 @@ class ClaudeToolLoop:
                         _build_tool_result_block(
                             tool_use_id=tool_id,
                             result=result,
-                            include_image=self._is_anthropic_direct,
+                            include_image=self._vision_enabled(),
                         )
                     )
                     result_keys.append(call_key)

@@ -22,8 +22,6 @@ from pathlib import Path
 from typing import Iterable, List
 from unittest import mock
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DIR = ROOT / "runtime"
 if str(RUNTIME_DIR) not in sys.path:
@@ -32,6 +30,7 @@ if str(RUNTIME_DIR) not in sys.path:
 from vmd_ai_runtime.claude_loop import (  # noqa: E402
     ClaudeLoopError,
     ClaudeToolLoop,
+    LoopOptions,
     _iter_ndjson_events,
     _ollama_tools,
     _rescue_json_tool_calls,
@@ -441,15 +440,6 @@ class StreamOllamaErrorTests(unittest.TestCase):
                 )
         self.assertIn("not found", str(ctx.exception))
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason=(
-            "known Ollama bug (spec §2a 'Unreachable test'): _stream_request retries "
-            "URLError and raises a generic 'network error'. P04-T01 passes opts with "
-            "connect_retries=0 and removes this mark."
-        ),
-    )
     def test_unreachable_host_raises_with_hint(self):
         import urllib.error as _ue
         def boom(req, timeout=None):
@@ -465,6 +455,7 @@ class StreamOllamaErrorTests(unittest.TestCase):
                     base_url="http://localhost:11434", timeout=10,
                     on_text=lambda s: None, should_cancel=lambda: False,
                     tools=[],
+                    opts=LoopOptions(connect_retries=0),
                 )
         self.assertIn("unreachable", str(ctx.exception).lower())
         self.assertIn("ollama serve", str(ctx.exception).lower())

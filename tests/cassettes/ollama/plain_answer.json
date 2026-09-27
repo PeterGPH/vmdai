@@ -1,0 +1,72 @@
+{
+  "meta": {
+    "recorded_at": "2026-09-27T03:02:27Z",
+    "provider": "ollama",
+    "server_version": "0.34.4",
+    "model": "qwen3.8:27b",
+    "model_digest": "22130167c4c20e20c7b71454612966ca8e8171e9b3cc8ab6ce8aa6cbfec79643",
+    "synthetic": false
+  },
+  "exchanges": [
+    {
+      "method": "GET",
+      "path": "/api/version",
+      "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "body_lines": [
+        "{\"version\":\"0.34.4\"}"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/ps",
+      "request_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "status": 200,
+      "content_type": "application/json; charset=utf-8",
+      "body_lines": [
+        "{\"models\":[]}"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/chat",
+      "request_sha256": "ce5518a8556b2fae669eae70501f611e418a31cb8c34e79bb04a371207ccbba5",
+      "status": 200,
+      "content_type": "application/x-ndjson",
+      "body_lines": [
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:26.892387458Z\",\"message\":{\"role\":\"assistant\",\"content\":\"`\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:26.972252121Z\",\"message\":{\"role\":\"assistant\",\"content\":\"mol\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:26.972289781Z\",\"message\":{\"role\":\"assistant\",\"content\":\" new\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:26.97244035Z\",\"message\":{\"role\":\"assistant\",\"content\":\"`\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:26.97245939Z\",\"message\":{\"role\":\"assistant\",\"content\":\" loads\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.037257371Z\",\"message\":{\"role\":\"assistant\",\"content\":\" a\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.037296591Z\",\"message\":{\"role\":\"assistant\",\"content\":\" new\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.03744572Z\",\"message\":{\"role\":\"assistant\",\"content\":\" molecule\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.082173069Z\",\"message\":{\"role\":\"assistant\",\"content\":\" file\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.127578424Z\",\"message\":{\"role\":\"assistant\",\"content\":\" into\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.127599834Z\",\"message\":{\"role\":\"assistant\",\"content\":\" V\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.173763387Z\",\"message\":{\"role\":\"assistant\",\"content\":\"MD\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.173792147Z\",\"message\":{\"role\":\"assistant\",\"content\":\" and\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.173883666Z\",\"message\":{\"role\":\"assistant\",\"content\":\" creates\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.173897176Z\",\"message\":{\"role\":\"assistant\",\"content\":\" a\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.174025466Z\",\"message\":{\"role\":\"assistant\",\"content\":\" new\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.219072633Z\",\"message\":{\"role\":\"assistant\",\"content\":\" molecule\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.219165043Z\",\"message\":{\"role\":\"assistant\",\"content\":\" instance\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.263712751Z\",\"message\":{\"role\":\"assistant\",\"content\":\" (\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.30849188Z\",\"message\":{\"role\":\"assistant\",\"content\":\"display\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.353056768Z\",\"message\":{\"role\":\"assistant\",\"content\":\" object\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.399108771Z\",\"message\":{\"role\":\"assistant\",\"content\":\")\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.399183431Z\",\"message\":{\"role\":\"assistant\",\"content\":\" for\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.399223991Z\",\"message\":{\"role\":\"assistant\",\"content\":\" it\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.399273831Z\",\"message\":{\"role\":\"assistant\",\"content\":\" to\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.444075379Z\",\"message\":{\"role\":\"assistant\",\"content\":\" be\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.444127549Z\",\"message\":{\"role\":\"assistant\",\"content\":\" rendered\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.491033408Z\",\"message\":{\"role\":\"assistant\",\"content\":\" and\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.491051448Z\",\"message\":{\"role\":\"assistant\",\"content\":\" manipulated\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.491155388Z\",\"message\":{\"role\":\"assistant\",\"content\":\".\"},\"done\":false}",
+        "{\"model\":\"qwen3.8:27b\",\"created_at\":\"2026-09-27T03:02:27.491592616Z\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"total_duration\":9508885149,\"load_duration\":8280005019,\"prompt_eval_count\":569,\"prompt_eval_cached_count\":0,\"prompt_eval_duration\":617345000,\"eval_count\":31,\"eval_duration\":603940000}"
+      ]
+    }
+  ]
+}
