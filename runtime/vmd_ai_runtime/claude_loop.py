@@ -43,6 +43,7 @@ from .provider import (
     resolve_openai_compatible_api_key,
     resolve_openrouter_api_key,
 )
+from .loop_guard import NUDGE_TEXT_TEMPLATE, LoopGuard
 from .recorder import RunRecorder
 from .conversation import (
     CONTEXT_WARN_FRACTION,
@@ -1292,6 +1293,8 @@ def _stream_anthropic_direct(
     if system_prompt:
         body["system"] = system_prompt
 
+    _apply_tool_mode(body, "anthropic", tool_mode)
+
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps(body).encode(),
@@ -1464,6 +1467,7 @@ def _stream_openrouter(
         _url = _openai_chat_url(opts.base_url or OPENROUTER_BASE_URL)
         _bearer = api_key or "EMPTY"
         _apply_openai_body_options(body, opts)
+    _apply_tool_mode(body, "openai", tool_mode)
     req = urllib.request.Request(
         _url,
         data=json.dumps(body).encode(),
@@ -1999,6 +2003,8 @@ def _stream_ollama(
         ):
             body["think"] = opts.think
 
+    _apply_tool_mode(body, "ollama", tool_mode)
+
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/api/chat",
         data=json.dumps(body).encode(),
@@ -2129,7 +2135,7 @@ def _stream_ollama(
     # synthesize tool_use blocks from it. See _rescue_json_tool_calls.
     # Rescue mode (§2f): options=None keeps "all"; the product uses "json".
     rescue_mode = opts.rescue if opts is not None else "all"
-    if not final_tool_blocks and text and rescue_mode != "off":
+    if not final_tool_blocks and text and rescue_mode != "off" and tool_mode != "none":
         allowed = {str(t.get("name") or "") for t in tools_list if t.get("name")}
         rescued = _rescue_json_tool_calls(text, allowed, mode=rescue_mode)
         if rescued:
@@ -2439,6 +2445,56 @@ def _build_tool_result_block(
 
 
 # ---------------------------------------------------------------------------
+# C4: loop guard and wrap-up (product only; options=None never reaches these)
+# ---------------------------------------------------------------------------
+
+WRAP_UP_INSTRUCTION = (
+    "Stop using tools. In a few lines, say what you changed in the VMD scene, "
+    "what you measured (with values), what failed, and what the user could try next."
+)
+
+LOOP_GUARD_SKIP_RESULT: Dict[str, Any] = {
+    "ok": False,
+    "output": "",
+    "error": "not executed: loop guard",
+    "executed": "no",
+}
+
+
+def _apply_tool_mode(body: Dict[str, Any], flavor: str, tool_mode: Optional[str]) -> Dict[str, Any]:
+    """C4 wrap-up: with ``tool_mode == "none"`` the model may not call tools.
+
+    Ollama drops the ``tools`` key (``tools=None`` would fall back to
+    VMD_TOOLS); Anthropic sends ``tool_choice {"type": "none"}``; OpenRouter
+    and OpenAI-compatible servers send ``"tool_choice": "none"``. Any other
+    mode leaves ``body`` untouched, so options=None requests never change.
+    """
+    if tool_mode != "none":
+        return body
+    if flavor == "ollama":
+        body.pop("tools", None)
+    elif flavor == "anthropic":
+        body["tool_choice"] = {"type": "none"}
+    else:
+        body["tool_choice"] = "none"
+    return body
+
+
+def _append_to_tool_result(block: Dict[str, Any], text: str) -> None:
+    """Append ``text`` to a tool_result block (string content or first text part)."""
+    content = block.get("content")
+    if isinstance(content, str):
+        block["content"] = content + "\n\n" + text
+        return
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                part["text"] = str(part.get("text") or "") + "\n\n" + text
+                return
+        content.insert(0, {"type": "text", "text": text})
+
+
+# ---------------------------------------------------------------------------
 # Loop → app contract helpers (§2a call_key, §2b canonical copies, §2c)
 # ---------------------------------------------------------------------------
 
@@ -2726,6 +2782,114 @@ class ClaudeToolLoop:
         if options is None:
             return "legacy"
         return str(getattr(options, "result_format", "legacy") or "legacy")
+
+    def _loop_guard_enabled(self) -> bool:
+        """C4 is product-only: options=None has no detector and no wrap-up (S7)."""
+        options = getattr(self, "options", None)
+        return options is not None and bool(getattr(options, "loop_guard", False))
+
+    def _guard_after_result(
+        self,
+        guard: LoopGuard,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        result: Dict[str, Any],
+        call_key: str,
+    ) -> Tuple[str, bool]:
+        """C4: feed one tool result to the guard. Returns (nudge text, stop)."""
+        verdict = guard.observe(tool_name, tool_input or {}, result or {})
+        if verdict is None:
+            return "", False
+        if verdict == "nudge":
+            text = NUDGE_TEXT_TEMPLATE.format(n=guard.streak)
+            self._emit("system", "state", "", {
+                "kind": "status", "phase": "loop_detected", "call_key": call_key,
+                "stop": False, "message": text,
+            })
+            return text, False
+        self._emit("system", "state", "", {
+            "kind": "status", "phase": "loop_detected", "call_key": call_key,
+            "stop": True, "message": "Stopped: the model kept repeating the same step",
+        })
+        return "", True
+
+    def _skip_tool_block(self, block: Dict[str, Any], call_key: str, origin: str) -> Dict[str, Any]:
+        """C4: a tool call left in the turn after the guard's stop.
+
+        It is never dispatched, never recorded and not fed to the guard, but
+        it still gets its tool.started/tool.finished pair (the panel's
+        "not run" row) and a tool_result (every tool_use needs one).
+        """
+        tool_name = str(block.get("name") or "")
+        executor = "runtime" if tool_name in _RUNTIME_TOOLS else "tcl"
+        self._emit("system", "state", "", {
+            "kind": "tool.started",
+            "call_key": call_key,
+            "tool_call_id": str(block.get("id") or ""),
+            "tool_name": tool_name,
+            "executor": executor,
+            "origin": origin,
+            "input": block.get("input") or {},
+        })
+        result = dict(LOOP_GUARD_SKIP_RESULT)
+        self._emit("system", "state", "",
+                   _tool_finished_meta(call_key, tool_name, executor, result, 0.0))
+        return result
+
+    def _run_wrap_up(
+        self,
+        messages: List[Dict],
+        system_prompt: str,
+        on_text: Callable[[str], None],
+        cancel_event: threading.Event,
+        turn_no: int,
+    ) -> Tuple[str, bool]:
+        """C4: one extra tool-less call that summarises a stopped run.
+
+        Runs after the loop guard's stop and when max_turns is reached. The
+        per-call copy ends with a separate user message holding the
+        instruction as string content (the Ollama and OpenAI converters drop
+        text parts next to tool results but keep string content).
+        ``tool_mode="none"`` makes Ollama omit ``tools`` and the others send
+        ``tool_choice`` none; tool calls in the reply are dropped. The call is
+        never retried and never raises: an error becomes a notice. Returns
+        (text, cancelled). The call counts as a turn; ``messages_out``
+        receives only the reply text (plan 02's ``_finish_text_turn``).
+        """
+        self._turn = turn_no
+        self._turn_meta = {}
+        self.last_turns = turn_no
+        self._emit("system", "state", "", {
+            "kind": "status", "phase": "wrapping_up", "message": "Summarising what was done",
+        })
+        self._emit("system", "state", "", {"kind": "turn.started"})
+        call_messages, _compacted = self._compact_for_call(messages)
+        call_messages = list(call_messages) + [{"role": "user", "content": WRAP_UP_INSTRUCTION}]
+        self._tool_mode = "none"
+        try:
+            text, _dropped_tool_calls = self._call(
+                call_messages, system_prompt, on_text=on_text, should_cancel=cancel_event.is_set,
+            )
+        except Exception as exc:
+            if cancel_event.is_set():
+                return "", True
+            self.last_wrap_up_error = str(exc) or exc.__class__.__name__
+            logger.warning("wrap-up call failed: %s", self.last_wrap_up_error)
+            self._emit("system", "state", "", {
+                "kind": "status", "phase": "wrapping_up",
+                "message": "Summary failed: %s" % self.last_wrap_up_error,
+            })
+            return "", False
+        finally:
+            self._tool_mode = None
+        if cancel_event.is_set():
+            return text or "", True
+        text = text or ""
+        self.last_wrapped_up = True
+        # Seals the run's answer: assistant/message {final: true}, sets
+        # last_final_text_empty, and appends the text (only) to messages_out.
+        self._finish_text_turn(text)
+        return text, False
 
     # ------------------------------------------------------------------
     # Wiki tool dispatchers
@@ -3285,6 +3449,8 @@ class ClaudeToolLoop:
             )
 
         self._ctx = ctx
+        self.last_wrapped_up = False
+        self.last_wrap_up_error = None
         self.last_model_digest = None
         self.last_usage = {"input_tokens_evaluated": None, "output_tokens": None}
         self._turn = 0
@@ -3308,6 +3474,8 @@ class ClaudeToolLoop:
         end_status = "complete"
 
         try:
+            guard = LoopGuard() if self._loop_guard_enabled() else None
+            guard_stop = False
             for turn in range(max_turns):
                 if cancel_event.is_set():
                     end_status = "cancelled"
@@ -3390,26 +3558,39 @@ class ClaudeToolLoop:
                         end_status = "cancelled"
                         break
                     tool_id = str(block.get("id") or "")
-                    result = self._run_tool_block(
-                        block,
-                        call_key,
-                        tool_bridge=tool_bridge,
-                        session_id=session_id,
-                        session_queue=session_queue,
-                        cancel_event=cancel_event,
-                        on_tool_start=on_tool_start,
-                        on_tool_result=on_tool_result,
-                        truncated=truncated,
-                        origin="rescued" if tool_id in rescued_ids else "model",
-                    )
-                    tool_result_blocks.append(
-                        _build_tool_result_block(
-                            tool_use_id=tool_id,
-                            result=result,
-                            include_image=self._vision_enabled(),
-                            result_format=self._result_format(),
+                    origin = "rescued" if tool_id in rescued_ids else "model"
+                    if guard_stop:
+                        # C4: the guard stopped the run; the rest of this
+                        # turn's calls are not run and do not count.
+                        result = self._skip_tool_block(block, call_key, origin)
+                    else:
+                        result = self._run_tool_block(
+                            block,
+                            call_key,
+                            tool_bridge=tool_bridge,
+                            session_id=session_id,
+                            session_queue=session_queue,
+                            cancel_event=cancel_event,
+                            on_tool_start=on_tool_start,
+                            on_tool_result=on_tool_result,
+                            truncated=truncated,
+                            origin=origin,
                         )
+                    nudge_text = ""
+                    if guard is not None and not guard_stop and not cancel_event.is_set():
+                        nudge_text, guard_stop = self._guard_after_result(
+                            guard, str(block.get("name") or ""), block.get("input") or {},
+                            result, call_key,
+                        )
+                    result_block = _build_tool_result_block(
+                        tool_use_id=tool_id,
+                        result=result,
+                        include_image=self._vision_enabled(),
+                        result_format=self._result_format(),
                     )
+                    if nudge_text:
+                        _append_to_tool_result(result_block, nudge_text)
+                    tool_result_blocks.append(result_block)
                     result_keys.append(call_key)
 
                 # --- Append tool results to conversation ---
@@ -3418,6 +3599,10 @@ class ClaudeToolLoop:
                         {"role": "user", "content": tool_result_blocks}
                     )
                     self._out(_canonical_message(messages[-1], result_keys))
+                if guard_stop and end_status != "cancelled":
+                    end_status = "stuck"
+                    logger.info("loop guard stopped the run after turn %d", turn + 1)
+                    break
             else:
                 logger.warning("hit max turns (%d) without finishing",
                                max_turns)
@@ -3426,6 +3611,16 @@ class ClaudeToolLoop:
                 # round is still a cancel (options=None keeps max_turns; S7).
                 if opts is not None and opts.report_cancelled and cancel_event.is_set():
                     end_status = "cancelled"
+
+            if (guard is not None and end_status in ("stuck", "max_turns")
+                    and not cancel_event.is_set()):
+                wrap_text, wrap_cancelled = self._run_wrap_up(
+                    messages, system_prompt, on_text, cancel_event, self.last_turns + 1
+                )
+                if wrap_cancelled:
+                    end_status = "cancelled"
+                elif wrap_text:
+                    final_text = wrap_text
         except RunCancelled:
             end_status = "cancelled"
             logger.info("stopped during a provider backoff")
