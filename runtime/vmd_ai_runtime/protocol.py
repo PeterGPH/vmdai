@@ -14,6 +14,9 @@ CHAT_ID_RE = re.compile(r"chat_[0-9a-f]{12}")
 # Display-event protocols a client may ask for in session.start (§2c).
 EVENT_PROTOCOLS = (1, 2)
 
+# M2 long-poll (§2d): chat.events.poll holds the request at most this long.
+MAX_WAIT_MS = 2000
+
 # session.start vmd_env (C6): at most these four string fields, 64 chars each.
 VMD_ENV_KEYS = ("vmd_version", "arch", "tcl_patchlevel", "tk_patchlevel")
 VMD_ENV_MAX_CHARS = 64
@@ -183,11 +186,16 @@ def validate_method_params(method: str, params: Dict[str, Any]) -> Dict[str, Any
         }
 
     if method == "chat.events.poll":
-        return {
+        out = {
             "session_id": _as_str(p.get("session_id"), "session_id"),
             "after_seq": _as_int(p.get("after_seq"), "after_seq", minimum=0, default=0),
             "limit": _as_int(p.get("limit"), "limit", minimum=1, default=50),
         }
+        # M2 long-poll (§2d): passed through only when present, so a v1
+        # short-poll gets exactly today's params; clamped to 2000 ms.
+        if p.get("wait_ms") is not None:
+            out["wait_ms"] = min(_as_int(p.get("wait_ms"), "wait_ms", minimum=0, default=0), MAX_WAIT_MS)
+        return out
 
     if method == "chat.history.list":
         return {

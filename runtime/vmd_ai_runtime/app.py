@@ -904,6 +904,8 @@ class RuntimeApp:
             if authenticated:
                 result["event_protocol"] = state.event_protocol
                 result["runtime"] = {"version": RUNTIME_VERSION, "pid": os.getpid()}
+                # M2 long-poll (§2d); tokenless sessions keep today's capabilities.
+                result["capabilities"] = dict(CAPABILITIES, long_poll=True)
                 result["profile"] = self._profile_summary(state)
             return result
 
@@ -1022,6 +1024,18 @@ class RuntimeApp:
 
         if method == "chat.events.poll":
             state = self._get_session(params["session_id"], session_token)
+            wait_ms = int(params.get("wait_ms") or 0)
+            if wait_ms > 0:
+                # M2 long-poll (§2d): hold the request until an event newer
+                # than after_seq is queued or wait_ms passes. No lock is held
+                # while waiting (the server runs one thread per request).
+                state.queue.wait(params["after_seq"], wait_ms / 1000.0)
+                last_seq = state.queue.last_seq
+                if params["after_seq"] > last_seq:
+                    # The client's cursor is ahead of this queue (a restarted
+                    # runtime or a reset queue): answer at once with the real
+                    # last_seq so the client can resync.
+                    return {"events": [], "last_seq": last_seq, "has_more": False}
             polled = state.queue.poll(
                 after_seq=params["after_seq"], limit=params["limit"]
             )
