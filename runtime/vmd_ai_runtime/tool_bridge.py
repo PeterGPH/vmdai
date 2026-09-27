@@ -24,6 +24,7 @@ import base64
 import collections
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -43,6 +44,10 @@ ACK_STATES = ("running", "awaiting_user")
 _POLL_S = 0.05
 _KEEP_FINISHED = 512
 _CHECKOUT_ROOT = str(Path(__file__).resolve().parents[2])
+
+MODEL_OUTPUT_CAP = 6000
+MODEL_HEAD_CHARS = 3000
+MODEL_TAIL_CHARS = 2500
 
 
 @dataclass
@@ -271,6 +276,10 @@ class VmdToolBridge:
                     result["error"] = ("snapshot file rejected: the plugin may only use "
                                        "/tmp/vmdai_snap_<tool_call_id>.tga")
 
+            if sess is not None and sess.chat_dir is not None:
+                # C5: the model sees head + note + tail; the full text is saved.
+                _cut_output_in_place(result, sess.chat_dir, str(call_key or tool_call_id))
+
             return result
 
         finally:
@@ -420,6 +429,8 @@ class VmdToolBridge:
         })
         if pending.tool_name == "capture_vmd_snapshot":
             self._attach_snapshot(pending, raw, result)
+        if pending.chat_dir is not None:
+            _cut_output_in_place(result, pending.chat_dir, pending.call_key)
         return result
 
     def _attach_snapshot(self, pending: _PendingCall, raw: Dict[str, Any],
@@ -658,6 +669,69 @@ def _write_save_path(png: bytes, save_path: str, cwd: str):
     except OSError as exc:
         return None, "could not write save_path %s: %s" % (dest, exc)
     return dest, "Saved to %s.%s" % (dest, note)
+
+
+def truncation_note(n_lines: int, n_bytes: int, path: str, executor_cut: bool) -> str:
+    """The C5 line that joins head and tail (names the saved file)."""
+    kb = max(1, int(round(n_bytes / 1024.0)))
+    where = ("Saved text (cut at 1 MB in VMD): %s" % path) if executor_cut else ("Full text: %s" % path)
+    return (
+        "[output truncated: %d lines, %d KB. %s. Don't print it again: compute what you "
+        "need (measure, a narrower selection), or read a slice of that file with Tcl.]"
+        % (n_lines, kb, where)
+    )
+
+
+def _cut_head(window: str) -> str:
+    """Cut the head window at its last newline, else last whitespace, else exactly."""
+    pos = window.rfind("\n")
+    if pos <= 0:
+        pos = max(window.rfind(" "), window.rfind("\t"))
+    return window[:pos] if pos > 0 else window
+
+
+def _cut_tail(window: str) -> str:
+    """Start the tail window after its first newline, else first whitespace, else exactly."""
+    pos = window.find("\n")
+    if 0 <= pos < len(window) - 1:
+        return window[pos + 1:]
+    candidates = [p for p in (window.find(" "), window.find("\t")) if p >= 0]
+    if candidates and min(candidates) < len(window) - 1:
+        return window[min(candidates) + 1:]
+    return window
+
+
+def cut_for_model(text: str, *, head: int = MODEL_HEAD_CHARS, tail: int = MODEL_TAIL_CHARS,
+                  note: str = "") -> str:
+    """Keep the first ``head`` and last ``tail`` characters, each cut at a line
+    (else word) boundary inside its window, joined by ``note`` (C5)."""
+    if len(text) <= head + tail:
+        return text
+    head_part = _cut_head(text[:head])
+    tail_part = _cut_tail(text[-tail:])
+    return head_part + "\n" + note + "\n" + tail_part
+
+
+def _cut_output_in_place(result: Dict[str, Any], chat_dir: Path, call_key: str) -> None:
+    """C5: save output over 6000 chars to outputs/<call_key>.txt and cut the
+    model's copy to head + note + tail. Lone surrogates (undecodable text that
+    reached the JSON) become '?' so the text is always valid UTF-8."""
+    data = str(result.get("output") or "").encode("utf-8", "replace")
+    output = data.decode("utf-8")
+    result["output"] = output
+    result["output_bytes"] = len(data)
+    if len(output) <= MODEL_OUTPUT_CAP:
+        return
+    safe_key = re.sub(r"[^A-Za-z0-9_\-]", "_", str(call_key or "call"))
+    outputs = Path(chat_dir) / "outputs"
+    outputs.mkdir(parents=True, exist_ok=True)
+    path = outputs / ("%s.txt" % safe_key)
+    path.write_bytes(data)
+    executor_cut = bool(result.get("truncated"))
+    note = truncation_note(output.count("\n") + 1, len(data), str(path), executor_cut)
+    result["output"] = cut_for_model(output, note=note)
+    result["output_path"] = str(path)
+    result["truncated"] = True
 
 
 def _format_tool_label(tool_name: str, tool_input: Dict[str, Any]) -> str:
