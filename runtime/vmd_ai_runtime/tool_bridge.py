@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Optional
 
+from . import tcl_policy
 from .image_utils import read_image_as_png_bytes
 from .image_scale import make_thumbnail, png_size, to_jpeg
 
@@ -41,6 +42,7 @@ TOOL_TIMEOUT_SEC = 45
 ACK_STATES = ("running", "awaiting_user")
 _POLL_S = 0.05
 _KEEP_FINISHED = 512
+_CHECKOUT_ROOT = str(Path(__file__).resolve().parents[2])
 
 
 @dataclass
@@ -144,8 +146,16 @@ class VmdToolBridge:
         call_key: Optional[str] = None,
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Run one VMD tool call through the plugin and return its result dict."""
+        """Run one VMD tool call through the plugin and return its result dict.
+
+        C1: run_vmd_command is checked by tcl_policy first, for every session;
+        a finding returns executed "no" and nothing is ever pushed to VMD.
+        """
         sess = self._lookup(session_id)
+        if tool_name == "run_vmd_command":
+            blocked = self._policy_block(tool_input)
+            if blocked is not None:
+                return blocked
         if call_key and sess is not None and sess.authenticated:
             return self._execute_token(
                 sess,
@@ -178,6 +188,23 @@ class VmdToolBridge:
         except Exception:
             logger.warning("session_lookup failed for %s", session_id, exc_info=True)
             return None
+
+    def _policy_block(self, tool_input: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """C1: the blocked result for a critical command, or None when allowed."""
+        command = str((tool_input or {}).get("command") or "")
+        findings = tcl_policy.check(command, checkout_root=_CHECKOUT_ROOT)
+        if not findings:
+            return None
+        blocked = [{"id": f.id, "word": f.word, "text": f.text} for f in findings]
+        logger.info("tcl_policy blocked %s", ",".join(b["id"] for b in blocked))
+        result = _empty_result()
+        result.update({
+            "ok": False,
+            "executed": "no",
+            "error": tcl_policy.message_for(findings[0]),
+            "blocked": blocked,
+        })
+        return result
 
     # ---- legacy (tokenless) path ----------------------------------------
 

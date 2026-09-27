@@ -3403,6 +3403,10 @@ class ClaudeToolLoop:
     ) -> None:
         if self.recorder is None:
             return
+        if result.get("blocked"):
+            # C1: a blocked call never reached VMD; it changes neither
+            # transcript.tcl nor the manifest counts.
+            return
         try:
             if tool_name == "run_vmd_command":
                 command = str(tool_input.get("command") or "")
