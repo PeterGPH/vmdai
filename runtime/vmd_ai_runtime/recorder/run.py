@@ -24,7 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 # ----------------------------------------------------------------------
@@ -42,6 +42,9 @@ class RunRecorderError(RuntimeError):
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SAFE_EXT = ("png", "tga", "jpg", "jpeg")
 
+_EMPTY_USAGE = {"input_tokens_evaluated": None, "output_tokens": None}
+_EMPTY_COUNTS = {"tool_calls": 0, "rescued_calls": 0, "truncated_turns": 0, "compactions": 0}
+
 
 def _utc_iso(t: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
@@ -50,6 +53,28 @@ def _utc_iso(t: float) -> str:
 def _slug(text: str, max_len: int = 40) -> str:
     s = _SLUG_RE.sub("-", (text or "").lower()).strip("-")
     return s[:max_len] or "task"
+
+
+def _tcl_word(s: str) -> str:
+    """A single Tcl word that parses back to exactly ``s`` (M8: the old
+    ``{...}`` wrapping produced invalid Tcl for a path containing an
+    unbalanced brace). Brace-quoting is used whenever ``s`` has no brace at
+    all — the common case, and what earlier transcripts already look like —
+    since VMD 8.6's Tcl performs no substitution inside braces. Otherwise a
+    backslash-escaped double-quoted word is used instead; braces need no
+    escaping there, only the characters double-quoting itself is special
+    about.
+    """
+    if "{" not in s and "}" not in s:
+        return "{%s}" % s
+    escaped = (
+        s.replace("\\", "\\\\")
+         .replace("\"", "\\\"")
+         .replace("$", "\\$")
+         .replace("[", "\\[")
+         .replace("]", "\\]")
+    )
+    return "\"%s\"" % escaped
 
 
 def _atomic_write(path: Path, data: str) -> None:
@@ -115,17 +140,52 @@ class RunRecorder:
     # Construction
     # ------------------------------------------------------------------
 
-    def __init__(self, runs_root: Optional[Path | str] = None):
+    def __init__(
+        self,
+        runs_root: Optional[Path | str] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ):
         self.runs_root: Optional[Path] = (
             Path(runs_root) if runs_root is not None else None
         )
         self._current: Optional[_TaskState] = None
+        # C6 product-run provenance. None keeps today's manifest exactly.
+        self._meta: Optional[Dict[str, Any]] = None
+        if meta is not None:
+            self._meta = {
+                "provenance": dict(meta),
+                "usage": dict(_EMPTY_USAGE),
+                "counts": dict(_EMPTY_COUNTS),
+            }
 
     @classmethod
-    def for_cwd(cls, cwd: Optional[str | Path] = None) -> "RunRecorder":
+    def for_cwd(
+        cls,
+        cwd: Optional[str | Path] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> "RunRecorder":
         """Build a recorder rooted at ``<cwd>/.vmdai_runs/``."""
         base = Path(cwd) if cwd is not None else Path(os.getcwd())
-        return cls(base / cls.DEFAULT_DIR_NAME)
+        return cls(base / cls.DEFAULT_DIR_NAME, meta=meta)
+
+    def update_meta(self, **fields: Any) -> None:
+        """Merge provenance fields; ``usage`` and ``counts`` update their keys.
+
+        No-op when the recorder was built without ``meta``. Rewrites the
+        manifest when a task is active, so a crash leaves the values of the
+        last completed turn on disk.
+        """
+        if self._meta is None:
+            return
+        for key, value in fields.items():
+            if key in ("usage", "counts"):
+                merged = dict(self._meta[key])
+                merged.update(dict(value or {}))
+                self._meta[key] = merged
+            else:
+                self._meta["provenance"][key] = value
+        if self._current is not None:
+            self._flush_manifest(status="active")
 
     # ------------------------------------------------------------------
     # Public properties
@@ -218,12 +278,23 @@ class RunRecorder:
         ok: bool,
         rationale: str = "",
         duration_ms: float = 0.0,
+        applied_text: Optional[str] = None,
+        failed_index: Optional[int] = None,
+        total: Optional[int] = None,
+        error: Optional[str] = None,
     ) -> Optional[int]:
         """Record one ``run_vmd_command`` tool call.
 
         Returns the 1-based turn number on success, ``None`` if no task
         is active or the call failed (failed commands are counted in
-        the manifest but never written to transcript.tcl).
+        the manifest and never written as runnable Tcl).
+
+        A partial failure (C3: ``ok=False`` with a non-empty
+        ``applied_text``, the exact source of statements 1..applied)
+        writes that applied prefix, which is still in effect in VMD,
+        followed by a comment naming the failed statement and the
+        unapplied rest commented out line by line. Without
+        ``applied_text`` a failed call writes nothing, as before.
         """
         if self._current is None:
             return None
@@ -233,6 +304,13 @@ class RunRecorder:
 
         if not ok:
             self._current.failed_count += 1
+            if applied_text:
+                block = self._format_partial_block(
+                    turn_n, command, rationale, duration_ms,
+                    applied_text, failed_index, total, error,
+                )
+                with (self._current.dir / "transcript.tcl").open("a", encoding="utf-8") as f:
+                    f.write(block)
             self._flush_manifest(status="active")
             return None
 
@@ -255,13 +333,16 @@ class RunRecorder:
         image_bytes: Optional[bytes] = None,
         image_ext: str = "png",
         duration_ms: float = 0.0,
+        renderer: str = "snapshot",
+        saved_path: Optional[str] = None,
     ) -> Optional[int]:
         """Record one ``capture_vmd_snapshot`` tool call.
 
-        On success: save image_bytes to ``snapshots/turn_NN.<ext>`` and
-        emit a ``render snapshot snapshots/turn_NN.<ext>`` line to
-        ``transcript.tcl`` so replay reproduces the image file. Returns
-        the turn number.
+        On success: save image_bytes to ``snapshots/turn_NNN.<ext>`` and
+        emit a ``render <renderer> snapshots/turn_NNN.<ext>`` line to
+        ``transcript.tcl`` so replay reproduces the image file. When the
+        runtime also wrote a ``save_path`` deliverable, replay re-renders it
+        with ``render <renderer> {<saved_path>}``. Returns the turn number.
 
         On failure: count it and return None.
         """
@@ -286,7 +367,10 @@ class RunRecorder:
 
         self._current.successful_count += 1
         self._current.snapshot_count += 1
-        block = self._format_snapshot_block(turn_n, snap_name, purpose, duration_ms)
+        block = self._format_snapshot_block(
+            turn_n, snap_name, purpose, duration_ms,
+            renderer=renderer, saved_path=saved_path,
+        )
         with (self._current.dir / "transcript.tcl").open("a", encoding="utf-8") as f:
             f.write(block)
         self._flush_manifest(status="active")
@@ -317,12 +401,56 @@ class RunRecorder:
         out.append("")
         return "\n".join(out)
 
+    def _format_partial_block(
+        self,
+        turn_n: int,
+        command: str,
+        rationale: str,
+        duration_ms: float,
+        applied_text: str,
+        failed_index: Optional[int],
+        total: Optional[int],
+        error: Optional[str],
+    ) -> str:
+        """C3: the applied prefix, then the failed/unapplied rest as comments
+        (the same rule as the panel's Save .tcl export)."""
+        ts = _utc_iso(time.time())
+        first_error = (str(error or "").strip().splitlines() or ["error"])[0]
+        idx = int(failed_index or 0)
+        tot = int(total or 0)
+        if idx and tot and idx < tot:
+            span = f"statements {idx}–{tot} were not applied"
+        elif idx:
+            span = f"statement {idx} was not applied"
+        else:
+            span = "the rest was not applied"
+        out: list[str] = []
+        out.append("")
+        out.append(f"# --- turn {turn_n:02d} | {ts} | {duration_ms:.0f}ms | partial ---")
+        if rationale:
+            for r_line in rationale.splitlines():
+                out.append(f"# rationale : {r_line}")
+        out.append("")
+        out.append(applied_text.rstrip())
+        out.append(f"# statement {idx} of {tot} failed ({first_error}); {span}:")
+        rest = command[len(applied_text):] if command.startswith(applied_text) else command
+        for r_line in rest.strip("\n").splitlines():
+            # A trailing odd backslash would continue the comment onto the
+            # next line; a following space stops that.
+            if (len(r_line) - len(r_line.rstrip("\\"))) % 2 == 1:
+                r_line += " "
+            out.append(f"# {r_line}")
+        out.append("")
+        return "\n".join(out)
+
     def _format_snapshot_block(
         self,
         turn_n: int,
         snap_name: str,
         purpose: str,
         duration_ms: float,
+        renderer: str = "snapshot",
+        saved_path: Optional[str] = None,
     ) -> str:
         ts = _utc_iso(time.time())
         out: list[str] = []
@@ -334,8 +462,15 @@ class RunRecorder:
             for p_line in purpose.splitlines():
                 out.append(f"# purpose   : {p_line}")
         out.append(f"# saved to  : snapshots/{snap_name}")
+        if saved_path:
+            # A comment runs to end of line; collapse any embedded CR/LF so
+            # a saved_path can never split it into unterminated Tcl source.
+            comment_path = re.sub(r"\r\n|\r|\n", " ", saved_path)
+            out.append(f"# save_path : {comment_path}")
         out.append("")
-        out.append(f"render snapshot snapshots/{snap_name}")
+        out.append(f"render {renderer} snapshots/{snap_name}")
+        if saved_path:
+            out.append(f"render {renderer} {_tcl_word(saved_path)}")
         out.append("")
         return "\n".join(out)
 
@@ -352,12 +487,41 @@ class RunRecorder:
             f"# model      : {s.model}\n"
             f"# cwd        : {s.cwd}\n"
             f"# prompt     : {prompt_one_line}\n"
+            f"{self._provenance_header()}"
             f"#\n"
-            f"# Only successful commands are recorded; this file is replayable:\n"
+            f"# Successful commands, and the applied part of a partly failed one, "
+            f"are recorded; this file is replayable:\n"
             f"#   vmd -e {s.task_id}/transcript.tcl\n"
             f"#   vmd -dispdev text -e {s.task_id}/transcript.tcl   (headless)\n"
         )
         (s.dir / "transcript.tcl").write_text(header, encoding="utf-8")
+
+    def _provenance_header(self) -> str:
+        """C6 header lines; empty without meta. The digest lives only in the
+        manifest, because it may be unknown when the header is written."""
+        if self._meta is None:
+            return ""
+        p = self._meta["provenance"]
+        env = p.get("vmd_env") or {}
+        vmd = " ".join(
+            str(x) for x in (env.get("vmd_version"), env.get("arch")) if x
+        ) or "unknown"
+        tcl_tk = []
+        if env.get("tcl_patchlevel"):
+            tcl_tk.append(f"Tcl {env['tcl_patchlevel']}")
+        if env.get("tk_patchlevel"):
+            tcl_tk.append(f"Tk {env['tk_patchlevel']}")
+        if tcl_tk:
+            vmd += " (" + ", ".join(tcl_tk) + ")"
+        provider = str(p.get("provider") or "")
+        if p.get("base_url"):
+            provider += f" {p['base_url']}"
+        return (
+            f"# provider   : {provider}\n"
+            f"# runtime    : vmd_ai_runtime {p.get('runtime_version') or 'unknown'}\n"
+            f"# vmd        : {vmd}\n"
+            f"# provenance : see manifest.json\n"
+        )
 
     # ------------------------------------------------------------------
     # Manifest
@@ -383,6 +547,10 @@ class RunRecorder:
         }
         if ended:
             manifest["ended_at"] = _utc_iso(time.time())
+        if self._meta is not None:
+            manifest["provenance"] = dict(self._meta["provenance"])
+            manifest["usage"] = dict(self._meta["usage"])
+            manifest["counts"] = dict(self._meta["counts"])
         _atomic_write(
             s.dir / "manifest.json",
             json.dumps(manifest, indent=2, sort_keys=True),

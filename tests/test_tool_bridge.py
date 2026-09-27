@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 import sys
 
@@ -217,14 +218,19 @@ class ToolBridgeSnapshotTests(unittest.TestCase):
         cancel = threading.Event()
 
         tga_data = _make_tga_1x1()
-        with tempfile.NamedTemporaryFile(suffix=".tga", delete=False) as f:
+        # Tokenless sessions may only use the path the old plugin builds
+        # (spec 2d Snapshot): /tmp/vmdai_snap_<tool_call_id>.tga. The id is
+        # unique per run (I2) so concurrent same-host suites never collide
+        # on this fixed-looking /tmp path.
+        tcid = "tc_snap_" + uuid.uuid4().hex[:8]
+        tga_path = "/tmp/vmdai_snap_%s.tga" % tcid
+        with open(tga_path, "wb") as f:
             f.write(tga_data)
-            tga_path = f.name
 
         try:
             def resolve_later():
                 time.sleep(0.2)
-                bridge.resolve("tc_snap", {
+                bridge.resolve(tcid, {
                     "ok": True,
                     "output": "Snapshot captured",
                     "error": "",
@@ -235,7 +241,7 @@ class ToolBridgeSnapshotTests(unittest.TestCase):
 
             result = bridge.execute_tool(
                 session_id="s1",
-                tool_call_id="tc_snap",
+                tool_call_id=tcid,
                 tool_name="capture_vmd_snapshot",
                 tool_input={"purpose": "verify scene"},
                 session_queue=q,
@@ -257,21 +263,22 @@ class ToolBridgeSnapshotTests(unittest.TestCase):
         bridge = VmdToolBridge()
         q = EventQueue()
         cancel = threading.Event()
+        tcid = "tc_snap_" + uuid.uuid4().hex[:8]
 
         def resolve_later():
             time.sleep(0.2)
-            bridge.resolve("tc_snap2", {
+            bridge.resolve(tcid, {
                 "ok": True,
                 "output": "Snapshot",
                 "error": "",
-                "snapshot_file": "/tmp/does_not_exist_vmdai_test.tga",
+                "snapshot_file": "/tmp/vmdai_snap_%s.tga" % tcid,
             })
 
         threading.Thread(target=resolve_later, daemon=True).start()
 
         result = bridge.execute_tool(
             session_id="s1",
-            tool_call_id="tc_snap2",
+            tool_call_id=tcid,
             tool_name="capture_vmd_snapshot",
             tool_input={"purpose": "test"},
             session_queue=q,

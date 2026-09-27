@@ -10,12 +10,16 @@ Key additions over the skeleton:
 """
 from __future__ import annotations
 
+import atexit
 import copy
 import dataclasses
+import hashlib
 import hmac
 import json
 import logging
 import os
+import shutil
+import tempfile
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -30,6 +34,8 @@ from .claude_loop import (
     LoopOptions,
     RunContext,
     WIKI_SYSTEM_PROMPT_ADDENDUM,
+    _ollama_tools,
+    _openrouter_tools,
     build_claude_loop,
 )
 from .locks import ChatLock
@@ -48,6 +54,7 @@ from .provider import (
     resolve_openai_compatible_api_key,
     resolve_openrouter_api_key,
 )
+from .provider_catalog import strip_url_secrets
 from .settings_store import (
     DEFAULT_BASE_URLS,
     DEFAULT_PROFILE_NAMES,
@@ -60,7 +67,7 @@ from .settings_store import (
 )
 from .sessions import RequestState, SessionManager, SessionState
 from .store import ChatStore
-from .tool_bridge import VmdToolBridge
+from .tool_bridge import BridgeSession, VmdToolBridge
 from .wiki_store import WikiStore
 
 
@@ -75,6 +82,35 @@ RESCUE_ALL_NOTICE = (
 
 # settings.json keys settings.set may write (§2f Schema); they need a token session.
 PERSISTED_SETTING_KEYS = tuple(TOP_LEVEL_DEFAULTS)
+
+
+def _canonical_sha256(obj: Any) -> str:
+    """SHA-256 of canonical JSON (sorted keys, compact separators): C6 tools_sha256."""
+    data = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _tools_as_sent(loop) -> List[Dict[str, Any]]:
+    """The ``tools`` list a turn-1 request body carries (C6: after
+    tool_overrides, in the provider's own shape)."""
+    tools = loop._tools_for_turn()
+    if getattr(loop, "_is_anthropic_direct", False):
+        return list(tools)
+    if getattr(loop, "_is_ollama", False):
+        return _ollama_tools(tools)
+    return _openrouter_tools(tools)
+
+
+def _remove_snapshot_dirs(dirs: Dict[str, str], lock: threading.Lock) -> None:
+    """atexit hook (M2): sweep any per-session snapshot temp dirs still open
+    when the process exits (SIGTERM, ``--watch-stdin`` EOF, a session that
+    never called session.stop). ``dirs`` is the live ``_snapshot_dirs`` map —
+    cleared here, under ``lock``, before the directories are removed."""
+    with lock:
+        paths = list(dirs.values())
+        dirs.clear()
+    for path in paths:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 class RuntimeApp:
@@ -114,7 +150,11 @@ class RuntimeApp:
         # OS keychain, so the provider auto-detect below sees them.
         self.keys = KeyStore()
         self.logger = logger
-        self.tool_bridge = VmdToolBridge()
+        self._snapshot_lock = threading.Lock()
+        self._snapshot_dirs: Dict[str, str] = {}
+        atexit.register(_remove_snapshot_dirs, self._snapshot_dirs, self._snapshot_lock)
+        self.tool_bridge = VmdToolBridge(session_lookup=self._bridge_session)
+        self.tool_bridge.on_late_result = self._on_late_result
         # Round-2 hook (spec 1, 2g): each callable returns extra per-request
         # context (for example scene state) appended after the <session> block.
         self.context_providers: List[Callable[[SessionState], str]] = []
@@ -739,6 +779,7 @@ class RuntimeApp:
                 self._cancel_active_request(state)
                 self._release_chat_lock(state)
                 self.sessions.remove(state.session_id)
+            self._drop_snapshot_dir(state.session_id)
             return {"ok": True}
 
         # ---- Chat ----
@@ -1032,6 +1073,21 @@ class RuntimeApp:
 
         # ---- Tool result callback (posted by Tcl bridge) ----
 
+        if method == "tool.ack":
+            # C2: the executor acks before running a tool_start. Any ack stops
+            # the pickup deadline; the answer is atomic against Stop.
+            state = self._get_session(params["session_id"], session_token)
+            owner = self.tool_bridge.get_call_session(params["call_key"])
+            if owner is None:
+                return {"proceed": False, "reason": "unknown call"}
+            if owner != state.session_id:
+                raise RpcError(
+                    "AUTH_FAILED",
+                    "call_key does not belong to this session",
+                    {"call_key": params["call_key"]},
+                )
+            return self.tool_bridge.ack(state.session_id, params["call_key"], params["state"])
+
         if method == "tool.command_result":
             # tool.command_result is the only inbound channel from the Tcl
             # bridge after VMD has executed a tool call. Three checks:
@@ -1041,8 +1097,48 @@ class RuntimeApp:
             #      a session could resolve another session's pending tool.
             state = self._get_session(params["session_id"], session_token)
 
+            call_key = params.get("call_key") or ""
+            if call_key:
+                owner = self.tool_bridge.get_call_session(call_key)
+                if owner is None:
+                    raise RpcError(
+                        "TOOL_CALL_UNKNOWN",
+                        "call_key is not known (never issued or long expired)",
+                        {"call_key": call_key},
+                    )
+                if owner != state.session_id:
+                    raise RpcError(
+                        "AUTH_FAILED",
+                        "call_key does not belong to this session",
+                        {"call_key": call_key},
+                    )
+                reply = self.tool_bridge.post_result(state.session_id, params)
+                if reply.get("accepted") and not reply.get("duplicate"):
+                    # v1 transcript entry, as for tool_call_id results.
+                    ok = bool(params["ok"]) and params.get("executed") != "no"
+                    label = (
+                        params.get("output", "")[:120]
+                        if ok
+                        else f"Error: {params.get('error', '')[:120]}"
+                    )
+                    result_event = state.queue.push(
+                        "tool_result",
+                        "message",
+                        label,
+                        {
+                            "tool_call_id": params.get("tool_call_id") or "",
+                            "call_key": call_key,
+                            "ok": ok,
+                            "late": bool(reply.get("late")),
+                        },
+                    )
+                    if state.chat_id:
+                        self.store.append_events(state.chat_id, [result_event])
+                return dict(reply)
+
             tool_call_id = params["tool_call_id"]
-            pending_session = self.tool_bridge.get_pending_session(tool_call_id)
+            pending_session = self.tool_bridge.get_pending_session(
+                tool_call_id, session_id=state.session_id)
             if pending_session is None:
                 raise RpcError(
                     "TOOL_CALL_UNKNOWN",
@@ -1063,7 +1159,7 @@ class RuntimeApp:
                 "snapshot_file": params.get("snapshot_file") or "",
             }
 
-            resolved = self.tool_bridge.resolve(tool_call_id, result)
+            resolved = self.tool_bridge.resolve(tool_call_id, result, session_id=state.session_id)
             if not resolved:
                 # Already timed out — log and ignore
                 if self.logger:
@@ -1122,7 +1218,7 @@ class RuntimeApp:
     # Recorder factory — one fresh RunRecorder per chat.send
     # ------------------------------------------------------------------
 
-    def _build_recorder_for_session(self, state) -> RunRecorder | None:
+    def _build_recorder_for_session(self, state, meta: Optional[Dict[str, Any]] = None) -> RunRecorder | None:
         """Build a RunRecorder for this chat.send, or None.
 
         Resolution rules:
@@ -1130,6 +1226,9 @@ class RuntimeApp:
           2. ``state.cwd`` is a real directory → ``<cwd>/.vmdai_runs/``.
           3. Otherwise fall back to ``~/.vmdai/runs/`` so we never
              silently drop the artifact (option (c) in the plan).
+
+        ``meta`` (C6, product runs only) adds the provenance/usage/counts
+        manifest keys and the provenance header lines.
 
         Returns None on any construction failure — the recorder is a
         side-channel; failing to build one must never break chat.send.
@@ -1139,17 +1238,151 @@ class RuntimeApp:
         try:
             cwd = (state.cwd or "").strip()
             if cwd and os.path.isdir(cwd):
-                return RunRecorder.for_cwd(cwd)
+                return RunRecorder.for_cwd(cwd, meta=meta)
             # Centralized fallback so we don't pollute the home dir
             # directly — everything lives under ~/.vmdai/runs/<task_id>/.
             fallback = Path(os.path.expanduser("~/.vmdai")) / "runs"
-            return RunRecorder(runs_root=fallback)
+            return RunRecorder(runs_root=fallback, meta=meta)
         except Exception:
             if self.logger:
                 self.logger.warning(
                     "recorder construction failed", exc_info=True,
                 )
             return None
+
+    def _recorder_meta(self, state, loop, request_id: str) -> Dict[str, Any]:
+        """C6 static provenance for a product run's recorder manifest."""
+        options = getattr(loop, "options", None)
+        base_url = ""
+        if options is not None and getattr(options, "base_url", None):
+            base_url = str(options.base_url)
+        elif getattr(loop, "_is_ollama", False):
+            base_url = str(loop.api_key or "")
+        opts = None
+        if options is not None:
+            opts = options.to_dict()
+            if opts.get("base_url"):
+                opts["base_url"] = strip_url_secrets(str(opts["base_url"]))
+        try:
+            vision = bool(loop._vision_enabled())
+        except Exception:
+            vision = False
+        # The prompt before the per-request <session> block (the variant plus
+        # today's mode line, exactly as P04-T06's _system_prompt_for_request
+        # builds it), plus the wiki addendum run() appends when wiki is on
+        # (C6 Hashes).
+        mode = str(state.settings.get("mode") or "work")
+        prompt = chatvmd_system_prompt(vision) + f"\n\nMode: {mode}."
+        if getattr(loop, "wiki_store", None) is not None:
+            prompt += WIKI_SYSTEM_PROMPT_ADDENDUM
+        profile_name = None
+        store = getattr(self, "settings_store", None)
+        if store is not None:
+            try:
+                profile_name = store.active_profile()[0]
+            except Exception:
+                profile_name = None
+        return {
+            "request_id": request_id,
+            "profile": profile_name,
+            "provider": loop.provider_name,
+            "base_url": strip_url_secrets(base_url) if base_url else None,
+            "model": loop.model,
+            "model_digest": None,
+            "runtime_version": RUNTIME_VERSION,
+            "vmd_env": getattr(state, "vmd_env", None),
+            "options": opts,
+            "system_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "tools_sha256": _canonical_sha256(_tools_as_sent(loop)),
+        }
+
+    # ------------------------------------------------------------------
+    # Product bridge support (plan 05)
+    # ------------------------------------------------------------------
+
+    def _bridge_session(self, session_id: str) -> Optional[BridgeSession]:
+        """What VmdToolBridge needs to know about ``session_id`` (None if unknown)."""
+        state = self.sessions.get(session_id)
+        if state is None:
+            return None
+        chat_dir = None
+        if state.chat_id:
+            try:
+                chat_dir = Path(self.store.chat_dir(state.chat_id))
+            except Exception:
+                chat_dir = None
+        exec_s, grace_s = self._tool_timeouts()
+        return BridgeSession(
+            chat_dir=chat_dir,
+            cwd=str(state.cwd or ""),
+            authenticated=bool(getattr(state, "authenticated", False)),
+            snapshot_dir=self._snapshot_dir_for(state.session_id),
+            exec_timeout_s=exec_s,
+            cancel_grace_s=grace_s,
+        )
+
+    def _snapshot_dir_for(self, session_id: str) -> Path:
+        """Per-session 0700 temp dir where the plugin renders snapshots (spec 2d)."""
+        with self._snapshot_lock:
+            path = self._snapshot_dirs.get(session_id)
+            if path is None or not os.path.isdir(path):
+                path = tempfile.mkdtemp(prefix="vmdai_snap_")
+                self._snapshot_dirs[session_id] = path
+        return Path(path)
+
+    def _drop_snapshot_dir(self, session_id: str) -> None:
+        """Delete the per-session snapshot temp dir (it only ever holds renders)."""
+        with self._snapshot_lock:
+            path = self._snapshot_dirs.pop(session_id, None)
+        if path:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _tool_timeouts(self) -> Tuple[Optional[float], Optional[float]]:
+        """(tool_exec_timeout_s, cancel_grace_s) from settings.json; None = bridge default.
+
+        Read on every tool call, so a changed setting applies to the next
+        call. settings_store validates exec >= 1 and grace >= 0 (0 = do not
+        wait for a running command after Stop).
+        """
+        store = getattr(self, "settings_store", None)
+        if store is None:
+            return None, None
+        try:
+            data = store.load()
+        except Exception:
+            return None, None
+        if not isinstance(data, dict):
+            return None, None
+
+        def _number(key: str, minimum: float) -> Optional[float]:
+            try:
+                value = float(data.get(key))
+            except (TypeError, ValueError):
+                return None
+            return value if value >= minimum else None
+
+        return _number("tool_exec_timeout_s", 1.0), _number("cancel_grace_s", 0.0)
+
+    def _on_late_result(self, session_id: str, call_key: str, info: Dict[str, Any]) -> None:
+        """A tool result arrived after its request gave up (spec 2b Late results).
+
+        Stored as a ``late_result`` line in the chat the call belonged to, so
+        build_prior can note it before the next prompt.
+        """
+        chat_dir = info.get("chat_dir")
+        if not chat_dir:
+            return
+        try:
+            conversation.Appender(Path(chat_dir), str(info.get("request_id") or "")).append_late_result(
+                call_key,
+                bool(info.get("ok", False)),
+                str(info.get("executed") or "yes"),
+                str(info.get("output") or ""),
+                str(info.get("error") or ""),
+            )
+        except Exception:
+            if self.logger:
+                self.logger.warning("could not store late result %s", call_key, exc_info=True)
 
     # ------------------------------------------------------------------
     # Background thread: Claude agent loop
@@ -1229,7 +1462,15 @@ class RuntimeApp:
         # Per-request recorder; restored afterwards so an assigned (shared)
         # loop never carries it into the next request.
         prev_recorder = loop.recorder
-        loop.recorder = self._build_recorder_for_session(state)
+        meta = None
+        if getattr(state, "authenticated", False):
+            try:
+                meta = self._recorder_meta(state, loop, request_id)
+            except Exception:
+                meta = None
+                if self.logger:
+                    self.logger.warning("recorder provenance failed", exc_info=True)
+        loop.recorder = self._build_recorder_for_session(state, meta)
         events_to_persist: List[Dict[str, Any]] = []
         try:
             output = loop.run(

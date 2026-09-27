@@ -43,6 +43,7 @@ from .provider import (
     resolve_openai_compatible_api_key,
     resolve_openrouter_api_key,
 )
+from .loop_guard import NUDGE_TEXT_TEMPLATE, LoopGuard
 from .recorder import RunRecorder
 from .conversation import (
     CONTEXT_WARN_FRACTION,
@@ -1292,6 +1293,8 @@ def _stream_anthropic_direct(
     if system_prompt:
         body["system"] = system_prompt
 
+    _apply_tool_mode(body, "anthropic", tool_mode)
+
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps(body).encode(),
@@ -1464,6 +1467,7 @@ def _stream_openrouter(
         _url = _openai_chat_url(opts.base_url or OPENROUTER_BASE_URL)
         _bearer = api_key or "EMPTY"
         _apply_openai_body_options(body, opts)
+    _apply_tool_mode(body, "openai", tool_mode)
     req = urllib.request.Request(
         _url,
         data=json.dumps(body).encode(),
@@ -1999,6 +2003,8 @@ def _stream_ollama(
         ):
             body["think"] = opts.think
 
+    _apply_tool_mode(body, "ollama", tool_mode)
+
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/api/chat",
         data=json.dumps(body).encode(),
@@ -2129,7 +2135,7 @@ def _stream_ollama(
     # synthesize tool_use blocks from it. See _rescue_json_tool_calls.
     # Rescue mode (§2f): options=None keeps "all"; the product uses "json".
     rescue_mode = opts.rescue if opts is not None else "all"
-    if not final_tool_blocks and text and rescue_mode != "off":
+    if not final_tool_blocks and text and rescue_mode != "off" and tool_mode != "none":
         allowed = {str(t.get("name") or "") for t in tools_list if t.get("name")}
         rescued = _rescue_json_tool_calls(text, allowed, mode=rescue_mode)
         if rescued:
@@ -2328,10 +2334,64 @@ def _is_stream_drop(exc: BaseException) -> bool:
 # Tool result construction
 # ---------------------------------------------------------------------------
 
+def _structured_summary(result: Dict[str, Any]) -> str:
+    """C3 model-facing text for product runs (``result_format="structured"``).
+
+    Tells the model what actually happened: blocked (C1), not executed
+    (Stop, pickup deadline, loop guard, C2 refusal), nothing run (C3
+    pre-check), outcome unknown, or which statement failed and which ones
+    are already applied in VMD.
+    """
+    ok = bool(result.get("ok", False))
+    output = str(result.get("output") or "")
+    error = str(result.get("error") or "")
+    executed = str(result.get("executed") or "yes")
+    statements = result.get("statements") or {}
+    failed = statements.get("failed") or None
+    if result.get("blocked"):
+        return error or "Not run: blocked by ChatVMD."
+    if executed == "no":
+        if error.startswith("Nothing was run"):
+            if failed and failed.get("text"):
+                return "%s\nIncomplete statement: `%s`" % (error, failed["text"])
+            return error
+        if error == "cancelled":
+            return "not executed: request stopped"
+        if error.lower().startswith("not executed"):
+            return error
+        return "not executed: %s" % (error or "unknown reason")
+    if executed == "unknown":
+        return error or "stopped while running; outcome unknown"
+    if ok:
+        return output if output else "Command executed successfully."
+    if failed and statements.get("total"):
+        total = int(statements["total"])
+        applied = int(statements.get("applied") or 0)
+        index = int(failed.get("index") or applied + 1)
+        lines = ["Failed at statement %d of %d: `%s`" % (index, total, failed.get("text") or "")]
+        lines.append("Error: %s" % (error or "unknown error"))
+        if failed.get("error_info"):
+            lines.append(str(failed["error_info"]))
+        if applied == 0:
+            lines.append("No statements were applied.")
+        elif applied == 1:
+            lines.append("Statement 1 was applied and is still in effect; do not re-run it.")
+        else:
+            lines.append(
+                "Statements 1–%d were applied and are still in effect; "
+                "do not re-run them." % applied
+            )
+        if output:
+            lines.append("Output before the error:\n%s" % output)
+        return "\n".join(lines)
+    return ("Error: %s" % error) if error else "Command failed with unknown error."
+
+
 def _build_tool_result_block(
     tool_use_id: str,
     result: Dict[str, Any],
     include_image: bool,
+    result_format: str = "legacy",
 ) -> Dict:
     """
     Build an Anthropic tool_result content block from the tool bridge result dict.
@@ -2339,6 +2399,10 @@ def _build_tool_result_block(
     For capture_vmd_snapshot results that include image_b64, the image is
     embedded as a base64 content block (only when include_image=True, i.e.
     when calling Anthropic directly).
+
+    ``result_format="structured"`` (product runs only; C3) replaces the
+    plain ``Error: ...`` text with :func:`_structured_summary`. The default
+    ``"legacy"`` keeps today's text byte-for-byte (options=None / S7).
     """
     ok = bool(result.get("ok", False))
     output = str(result.get("output") or "")
@@ -2346,7 +2410,9 @@ def _build_tool_result_block(
     image_b64 = str(result.get("image_b64") or "")
     image_mime = str(result.get("image_mime") or "image/png")
 
-    if ok:
+    if result_format == "structured":
+        summary = _structured_summary(result)
+    elif ok:
         summary = output if output else "Command executed successfully."
     else:
         summary = f"Error: {error}" if error else "Command failed with unknown error."
@@ -2376,6 +2442,56 @@ def _build_tool_result_block(
         "content": content,
         "is_error": not ok,
     }
+
+
+# ---------------------------------------------------------------------------
+# C4: loop guard and wrap-up (product only; options=None never reaches these)
+# ---------------------------------------------------------------------------
+
+WRAP_UP_INSTRUCTION = (
+    "Stop using tools. In a few lines, say what you changed in the VMD scene, "
+    "what you measured (with values), what failed, and what the user could try next."
+)
+
+LOOP_GUARD_SKIP_RESULT: Dict[str, Any] = {
+    "ok": False,
+    "output": "",
+    "error": "not executed: loop guard",
+    "executed": "no",
+}
+
+
+def _apply_tool_mode(body: Dict[str, Any], flavor: str, tool_mode: Optional[str]) -> Dict[str, Any]:
+    """C4 wrap-up: with ``tool_mode == "none"`` the model may not call tools.
+
+    Ollama drops the ``tools`` key (``tools=None`` would fall back to
+    VMD_TOOLS); Anthropic sends ``tool_choice {"type": "none"}``; OpenRouter
+    and OpenAI-compatible servers send ``"tool_choice": "none"``. Any other
+    mode leaves ``body`` untouched, so options=None requests never change.
+    """
+    if tool_mode != "none":
+        return body
+    if flavor == "ollama":
+        body.pop("tools", None)
+    elif flavor == "anthropic":
+        body["tool_choice"] = {"type": "none"}
+    else:
+        body["tool_choice"] = "none"
+    return body
+
+
+def _append_to_tool_result(block: Dict[str, Any], text: str) -> None:
+    """Append ``text`` to a tool_result block (string content or first text part)."""
+    content = block.get("content")
+    if isinstance(content, str):
+        block["content"] = content + "\n\n" + text
+        return
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                part["text"] = str(part.get("text") or "") + "\n\n" + text
+                return
+        content.insert(0, {"type": "text", "text": text})
 
 
 # ---------------------------------------------------------------------------
@@ -2522,6 +2638,11 @@ class ClaudeToolLoop:
         self.last_turns = 0
         self.last_tool_calls = 0
         self.last_final_text_empty = False
+        # Set only in run()'s wrap-up (C4); declared here too so a caller
+        # that reads them before any run() (or plan 07's getattr callers)
+        # sees defined values rather than an AttributeError (M8).
+        self.last_wrapped_up: bool = False
+        self.last_wrap_up_error: Optional[str] = None
 
     @property
     def _is_anthropic_direct(self) -> bool:
@@ -2659,6 +2780,121 @@ class ClaudeToolLoop:
         if options is not None and options.tool_overrides:
             tools = _apply_tool_overrides(tools, options.tool_overrides)
         return tools
+
+    def _result_format(self) -> str:
+        """C3: "structured" for product runs, "legacy" (today's text) otherwise."""
+        options = getattr(self, "options", None)
+        if options is None:
+            return "legacy"
+        return str(getattr(options, "result_format", "legacy") or "legacy")
+
+    def _loop_guard_enabled(self) -> bool:
+        """C4 is product-only: options=None has no detector and no wrap-up (S7)."""
+        options = getattr(self, "options", None)
+        return options is not None and bool(getattr(options, "loop_guard", False))
+
+    def _guard_after_result(
+        self,
+        guard: LoopGuard,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        result: Dict[str, Any],
+        call_key: str,
+    ) -> Tuple[str, bool]:
+        """C4: feed one tool result to the guard. Returns (nudge text, stop)."""
+        verdict = guard.observe(tool_name, tool_input or {}, result or {})
+        if verdict is None:
+            return "", False
+        if verdict == "nudge":
+            text = NUDGE_TEXT_TEMPLATE.format(n=guard.streak)
+            self._emit("system", "state", "", {
+                "kind": "status", "phase": "loop_detected", "call_key": call_key,
+                "stop": False, "message": text,
+            })
+            return text, False
+        self._emit("system", "state", "", {
+            "kind": "status", "phase": "loop_detected", "call_key": call_key,
+            "stop": True, "message": "Stopped: the model kept repeating the same step",
+        })
+        return "", True
+
+    def _skip_tool_block(self, block: Dict[str, Any], call_key: str, origin: str) -> Dict[str, Any]:
+        """C4: a tool call left in the turn after the guard's stop.
+
+        It is never dispatched, never recorded and not fed to the guard, but
+        it still gets its tool.started/tool.finished pair (the panel's
+        "not run" row) and a tool_result (every tool_use needs one).
+        """
+        tool_name = str(block.get("name") or "")
+        executor = "runtime" if tool_name in _RUNTIME_TOOLS else "tcl"
+        self._emit("system", "state", "", {
+            "kind": "tool.started",
+            "call_key": call_key,
+            "tool_call_id": str(block.get("id") or ""),
+            "tool_name": tool_name,
+            "executor": executor,
+            "origin": origin,
+            "input": block.get("input") or {},
+        })
+        result = dict(LOOP_GUARD_SKIP_RESULT)
+        self._emit("system", "state", "",
+                   _tool_finished_meta(call_key, tool_name, executor, result, 0.0))
+        return result
+
+    def _run_wrap_up(
+        self,
+        messages: List[Dict],
+        system_prompt: str,
+        on_text: Callable[[str], None],
+        cancel_event: threading.Event,
+        turn_no: int,
+    ) -> Tuple[str, bool]:
+        """C4: one extra tool-less call that summarises a stopped run.
+
+        Runs after the loop guard's stop and when max_turns is reached. The
+        per-call copy ends with a separate user message holding the
+        instruction as string content (the Ollama and OpenAI converters drop
+        text parts next to tool results but keep string content).
+        ``tool_mode="none"`` makes Ollama omit ``tools`` and the others send
+        ``tool_choice`` none; tool calls in the reply are dropped. The call is
+        never retried and never raises: an error becomes a notice. Returns
+        (text, cancelled). The call counts as a turn; ``messages_out``
+        receives only the reply text (plan 02's ``_finish_text_turn``).
+        """
+        self._turn = turn_no
+        self._turn_meta = {}
+        self.last_turns = turn_no
+        self._emit("system", "state", "", {
+            "kind": "status", "phase": "wrapping_up", "message": "Summarising what was done",
+        })
+        self._emit("system", "state", "", {"kind": "turn.started"})
+        call_messages, _compacted = self._compact_for_call(messages)
+        call_messages = list(call_messages) + [{"role": "user", "content": WRAP_UP_INSTRUCTION}]
+        self._tool_mode = "none"
+        try:
+            text, _dropped_tool_calls = self._call(
+                call_messages, system_prompt, on_text=on_text, should_cancel=cancel_event.is_set,
+            )
+        except Exception as exc:
+            if cancel_event.is_set():
+                return "", True
+            self.last_wrap_up_error = str(exc) or exc.__class__.__name__
+            logger.warning("wrap-up call failed: %s", self.last_wrap_up_error)
+            self._emit("system", "state", "", {
+                "kind": "status", "phase": "wrapping_up",
+                "message": "Summary failed: %s" % self.last_wrap_up_error,
+            })
+            return "", False
+        finally:
+            self._tool_mode = None
+        if cancel_event.is_set():
+            return text or "", True
+        text = text or ""
+        self.last_wrapped_up = True
+        # Seals the run's answer: assistant/message {final: true}, sets
+        # last_final_text_empty, and appends the text (only) to messages_out.
+        self._finish_text_turn(text)
+        return text, False
 
     # ------------------------------------------------------------------
     # Wiki tool dispatchers
@@ -2926,6 +3162,12 @@ class ClaudeToolLoop:
         chunk event; every other item (status, usage) becomes a
         ``system/state`` event carrying the item plus request_id and turn.
         """
+        kind = item.get("kind") if isinstance(item, dict) else None
+        if kind == "rescued":
+            self._prov_rescued = getattr(self, "_prov_rescued", 0) + len(item.get("ids") or [])
+        elif kind == "stop_reason" and item.get("value") in ("max_tokens", "length"):
+            self._prov_truncated = getattr(self, "_prov_truncated", 0) + 1
+
         if not isinstance(item, dict):
             return
         kind = str(item.get("kind") or "")
@@ -3187,8 +3429,9 @@ class ClaudeToolLoop:
                                     None keeps today's behaviour.
 
         Returns the final assistant text. The outcome is also left on
-        ``last_status`` ('complete' | 'cancelled' | 'error' | 'max_turns'),
-        ``last_turns``, ``last_tool_calls`` and ``last_final_text_empty``.
+        ``last_status`` ('complete' | 'cancelled' | 'error' | 'max_turns' |
+        'stuck'), ``last_turns``, ``last_tool_calls`` and
+        ``last_final_text_empty``.
         """
         # Conversation history maintained in Anthropic-style format internally.
         # If resuming a prior chat, inject the history before the new prompt.
@@ -3218,6 +3461,11 @@ class ClaudeToolLoop:
             )
 
         self._ctx = ctx
+        self.last_wrapped_up = False
+        self.last_wrap_up_error = None
+        self._prov_tool_calls = 0
+        self._prov_rescued = 0
+        self._prov_truncated = 0
         self.last_model_digest = None
         self.last_usage = {"input_tokens_evaluated": None, "output_tokens": None}
         self._turn = 0
@@ -3241,6 +3489,8 @@ class ClaudeToolLoop:
         end_status = "complete"
 
         try:
+            guard = LoopGuard() if self._loop_guard_enabled() else None
+            guard_stop = False
             for turn in range(max_turns):
                 if cancel_event.is_set():
                     end_status = "cancelled"
@@ -3272,6 +3522,8 @@ class ClaudeToolLoop:
                     raise ClaudeLoopError(
                         f"API call failed on turn {turn + 1}: {exc}"
                     ) from exc
+
+                self._recorder_update_meta()
 
                 if text:
                     final_text = text
@@ -3323,25 +3575,39 @@ class ClaudeToolLoop:
                         end_status = "cancelled"
                         break
                     tool_id = str(block.get("id") or "")
-                    result = self._run_tool_block(
-                        block,
-                        call_key,
-                        tool_bridge=tool_bridge,
-                        session_id=session_id,
-                        session_queue=session_queue,
-                        cancel_event=cancel_event,
-                        on_tool_start=on_tool_start,
-                        on_tool_result=on_tool_result,
-                        truncated=truncated,
-                        origin="rescued" if tool_id in rescued_ids else "model",
-                    )
-                    tool_result_blocks.append(
-                        _build_tool_result_block(
-                            tool_use_id=tool_id,
-                            result=result,
-                            include_image=self._vision_enabled(),
+                    origin = "rescued" if tool_id in rescued_ids else "model"
+                    if guard_stop:
+                        # C4: the guard stopped the run; the rest of this
+                        # turn's calls are not run and do not count.
+                        result = self._skip_tool_block(block, call_key, origin)
+                    else:
+                        result = self._run_tool_block(
+                            block,
+                            call_key,
+                            tool_bridge=tool_bridge,
+                            session_id=session_id,
+                            session_queue=session_queue,
+                            cancel_event=cancel_event,
+                            on_tool_start=on_tool_start,
+                            on_tool_result=on_tool_result,
+                            truncated=truncated,
+                            origin=origin,
                         )
+                    nudge_text = ""
+                    if guard is not None and not guard_stop and not cancel_event.is_set():
+                        nudge_text, guard_stop = self._guard_after_result(
+                            guard, str(block.get("name") or ""), block.get("input") or {},
+                            result, call_key,
+                        )
+                    result_block = _build_tool_result_block(
+                        tool_use_id=tool_id,
+                        result=result,
+                        include_image=self._vision_enabled(),
+                        result_format=self._result_format(),
                     )
+                    if nudge_text:
+                        _append_to_tool_result(result_block, nudge_text)
+                    tool_result_blocks.append(result_block)
                     result_keys.append(call_key)
 
                 # --- Append tool results to conversation ---
@@ -3350,6 +3616,10 @@ class ClaudeToolLoop:
                         {"role": "user", "content": tool_result_blocks}
                     )
                     self._out(_canonical_message(messages[-1], result_keys))
+                if guard_stop and end_status != "cancelled":
+                    end_status = "stuck"
+                    logger.info("loop guard stopped the run after turn %d", turn + 1)
+                    break
             else:
                 logger.warning("hit max turns (%d) without finishing",
                                max_turns)
@@ -3358,6 +3628,16 @@ class ClaudeToolLoop:
                 # round is still a cancel (options=None keeps max_turns; S7).
                 if opts is not None and opts.report_cancelled and cancel_event.is_set():
                     end_status = "cancelled"
+
+            if (guard is not None and end_status in ("stuck", "max_turns")
+                    and not cancel_event.is_set()):
+                wrap_text, wrap_cancelled = self._run_wrap_up(
+                    messages, system_prompt, on_text, cancel_event, self.last_turns + 1
+                )
+                if wrap_cancelled:
+                    end_status = "cancelled"
+                elif wrap_text:
+                    final_text = wrap_text
         except RunCancelled:
             end_status = "cancelled"
             logger.info("stopped during a provider backoff")
@@ -3365,6 +3645,7 @@ class ClaudeToolLoop:
             end_status = "error"
             raise
         finally:
+            self._recorder_update_meta()
             self.last_status = end_status
             self._recorder_end_task(end_status)
             self._ctx = None
@@ -3403,17 +3684,40 @@ class ClaudeToolLoop:
     ) -> None:
         if self.recorder is None:
             return
+        if result.get("blocked"):
+            # C1: a blocked call never reached VMD; it changes neither
+            # transcript.tcl nor the manifest counts. The counter below is
+            # one of those counts (C6's counts.tool_calls, M5/final review),
+            # so it must not see calls that never reached VMD either.
+            return
+        self._prov_tool_calls = getattr(self, "_prov_tool_calls", 0) + 1
         try:
             if tool_name == "run_vmd_command":
                 command = str(tool_input.get("command") or "")
                 rationale = str(tool_input.get("rationale") or "")
                 ok = bool(result.get("ok", False))
-                self.recorder.record_vmd_command(
-                    command,
-                    ok=ok,
-                    rationale=rationale,
-                    duration_ms=duration_ms,
-                )
+                statements = result.get("statements") or {}
+                failed = statements.get("failed") or {}
+                applied_text = str(result.get("applied_text") or "")
+                if not ok and applied_text and failed.get("index"):
+                    # C3 partial failure: statements 1..applied are in effect.
+                    self.recorder.record_vmd_command(
+                        command,
+                        ok=False,
+                        rationale=rationale,
+                        duration_ms=duration_ms,
+                        applied_text=applied_text,
+                        failed_index=int(failed["index"]),
+                        total=int(statements.get("total") or 0),
+                        error=str(result.get("error") or ""),
+                    )
+                else:
+                    self.recorder.record_vmd_command(
+                        command,
+                        ok=ok,
+                        rationale=rationale,
+                        duration_ms=duration_ms,
+                    )
             elif tool_name == "capture_vmd_snapshot":
                 purpose = str(tool_input.get("purpose") or "")
                 ok = bool(result.get("ok", False))
@@ -3432,17 +3736,72 @@ class ClaudeToolLoop:
                     ext = "jpg"
                 elif image_mime == "image/tga":
                     ext = "tga"
+                # The product bridge renders with TachyonInternal and may have
+                # written a save_path deliverable (spec 2d); benchmark bridges
+                # return neither key, so their transcript lines are unchanged.
+                extra: Dict[str, Any] = {}
+                image = result.get("image")
+                if isinstance(image, dict):
+                    extra["renderer"] = str(image.get("renderer") or "TachyonInternal")
+                if result.get("saved_path"):
+                    extra["saved_path"] = str(result["saved_path"])
                 self.recorder.record_snapshot(
                     ok=ok,
                     purpose=purpose,
                     image_bytes=image_bytes,
                     image_ext=ext,
                     duration_ms=duration_ms,
+                    **extra,
                 )
             # search_docs is intentionally not recorded — it produces no
             # VMD state change, so replaying without it still works.
         except Exception:
             logger.warning("recorder hook failed", exc_info=True)
+
+    def _recorder_update_meta(self) -> None:
+        """C6: push digest, usage and counts into the recorder manifest.
+
+        Only for product runs (``self._ctx`` set) and only when the recorder
+        was built with provenance meta; benchmark runs build no recorder.
+        """
+        if self.recorder is None or self._ctx is None:
+            return
+        update = getattr(self.recorder, "update_meta", None)
+        if update is None:
+            return
+        usage = dict(getattr(self, "last_usage", None) or {})
+        try:
+            update(
+                model_digest=self._provenance_digest(),
+                usage={
+                    "input_tokens_evaluated": usage.get("input_tokens_evaluated"),
+                    "output_tokens": usage.get("output_tokens"),
+                },
+                counts={
+                    "tool_calls": int(getattr(self, "_prov_tool_calls", 0)),
+                    "rescued_calls": int(getattr(self, "_prov_rescued", 0)),
+                    "truncated_turns": int(getattr(self, "_prov_truncated", 0)),
+                    "compactions": int(getattr(self, "last_compactions", 0) or 0),
+                },
+            )
+        except Exception:
+            logger.warning("recorder.update_meta failed", exc_info=True)
+
+    def _provenance_digest(self) -> Optional[str]:
+        """Ollama model digest: /api/ps (preflight), else the cached /api/tags
+        entry, else None. Never sends a request of its own (C6)."""
+        digest = getattr(self, "last_model_digest", None)
+        if digest:
+            return str(digest)
+        if not self._is_ollama:
+            return None
+        options = getattr(self, "options", None)
+        base = (getattr(options, "base_url", None) if options is not None else None) or self.api_key
+        try:
+            from .provider_catalog import cached_tag_digest
+            return cached_tag_digest(base or "http://localhost:11434", self.model)
+        except Exception:
+            return None
 
     def _recorder_end_task(self, status: str) -> None:
         if self.recorder is None:
