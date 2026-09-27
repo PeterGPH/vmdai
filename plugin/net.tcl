@@ -130,6 +130,7 @@ proc ::vmdai::net::epoch {} {
 proc ::vmdai::net::bump_epoch {} {
     variable epoch
     incr epoch
+    _queue_drop_stale
     return $epoch
 }
 
@@ -349,4 +350,107 @@ proc ::vmdai::net::http_get {path callback args} {
         return $rid
     }
     return [_geturl $rid $callback get "" "$base_url$path" -timeout $timeout -keepalive 0]
+}
+
+# --- Result queue (spec 2d Post, 5 "Result post fails") -------------------
+# tool.command_result posts are retried (0.25 s doubling to 2 s) until the
+# runtime accepts them or the epoch changes. The runtime dedupes by call_key
+# and answers {accepted, late, duplicate}; a duplicate counts as accepted.
+
+namespace eval ::vmdai::net {
+    # queue(<call_key>) = dict {pairs epoch delay timer attempts}
+    variable queue
+    if {![info exists queue]} { array set queue {} }
+    variable retry_min_ms 250
+    variable retry_max_ms 2000
+}
+
+# result_pairs: typed pairs for tool.command_result, without call_key.
+proc ::vmdai::net::post_result {call_key result_pairs} {
+    variable queue
+    variable epoch
+    variable retry_min_ms
+    if {[info exists queue($call_key)]} {
+        _log "result for $call_key is already queued"
+        return
+    }
+    set queue($call_key) [dict create pairs [linsert $result_pairs 0 call_key s $call_key] \
+        epoch $epoch delay $retry_min_ms timer "" attempts 0]
+    _queue_send $call_key
+}
+
+proc ::vmdai::net::result_queue_size {} {
+    variable queue
+    return [array size queue]
+}
+
+proc ::vmdai::net::_queue_send {call_key} {
+    variable queue
+    variable epoch
+    if {![info exists queue($call_key)]} {
+        return
+    }
+    set entry $queue($call_key)
+    if {[dict get $entry epoch] != $epoch} {
+        unset queue($call_key)
+        return
+    }
+    dict set entry timer ""
+    dict incr entry attempts
+    set queue($call_key) $entry
+    call tool.command_result [dict get $entry pairs] [list ::vmdai::net::_queue_reply $call_key]
+}
+
+proc ::vmdai::net::_queue_reply {call_key kind args} {
+    variable queue
+    if {![info exists queue($call_key)]} {
+        return
+    }
+    switch -- $kind {
+        ok {
+            set reply [lindex $args 0]
+            set accepted 0
+            set duplicate 0
+            catch {set accepted [string is true -strict [dict get $reply accepted]]}
+            catch {set duplicate [string is true -strict [dict get $reply duplicate]]}
+            if {!$accepted && !$duplicate} {
+                _log "runtime did not accept the result for $call_key: $reply"
+            }
+            unset queue($call_key)
+        }
+        rpc_error {
+            lassign $args code message
+            if {$code in {TOOL_CALL_UNKNOWN INVALID_PARAMS METHOD_NOT_FOUND}} {
+                _log "dropped the result for $call_key: $code $message"
+                unset queue($call_key)
+                return
+            }
+            _queue_retry $call_key "$code: $message"
+        }
+        default {
+            _queue_retry $call_key [lindex $args 0]
+        }
+    }
+}
+
+proc ::vmdai::net::_queue_retry {call_key reason} {
+    variable queue
+    variable retry_max_ms
+    set entry $queue($call_key)
+    set delay [dict get $entry delay]
+    _log "result for $call_key not delivered ($reason); retrying in $delay ms"
+    dict set entry delay [expr {min($delay * 2, $retry_max_ms)}]
+    dict set entry timer [::vmdai::sched::after $delay [list ::vmdai::net::_queue_send $call_key]]
+    set queue($call_key) $entry
+}
+
+proc ::vmdai::net::_queue_drop_stale {} {
+    variable queue
+    variable epoch
+    foreach call_key [array names queue] {
+        if {[dict get $queue($call_key) epoch] != $epoch} {
+            ::vmdai::sched::cancel [dict get $queue($call_key) timer]
+            unset queue($call_key)
+        }
+    }
 }
