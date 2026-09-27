@@ -51,6 +51,7 @@ RUNTIME_MODULES: List[str] = [
     "vmd_ai_runtime.sessions",
     "vmd_ai_runtime.settings_store",
     "vmd_ai_runtime.store",
+    "vmd_ai_runtime.tcl_policy",
     "vmd_ai_runtime.tool_bridge",
     "vmd_ai_runtime.wiki_bench",
     "vmd_ai_runtime.wiki_store",
