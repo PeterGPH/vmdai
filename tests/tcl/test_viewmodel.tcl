@@ -171,4 +171,92 @@ test trust_notice_no_op {the runtime's security notice produces no op; it is rou
     list $ops [dict get $S trust_notice]
 } -result {{} 1}
 
+# ---- P08-T02 ---------------------------------------------------------------
+
+test notrun_label_order {not-run labels: first match wins in C1-C4 order} -body {
+    set all [dict create executed no ok false \
+        blocked [list [dict create id cmd_exec word exec text {exec ls}]] \
+        statements [dict create total 2 applied 0 failed [dict create index 2 text "x \{" error_info null]] \
+        error cancelled]
+    set r {}
+    lappend r [::vmdai::vm::notrun_label $all]
+    dict set all blocked null
+    lappend r [::vmdai::vm::notrun_label $all]
+    dict set all statements null
+    dict set all error "not executed: loop guard"
+    lappend r [::vmdai::vm::notrun_label $all]
+    dict set all error cancelled
+    lappend r [::vmdai::vm::notrun_label $all]
+    dict set all error "VMD did not pick up the command (45 s)"
+    lappend r [::vmdai::vm::notrun_label $all]
+    dict set all error "This panel cannot ask for approval\nmore"
+    lappend r [::vmdai::vm::notrun_label $all]
+    dict set all error ""
+    lappend r [::vmdai::vm::notrun_label $all]
+} -result {{not run · blocked: exec} {not run · incomplete Tcl} {not run · loop guard} {not run · stopped} {VMD did not pick up the command} {not run · This panel cannot ask for approval} {not run}}
+
+test tool_state_values {tool_state maps executed/ok to ok|err|notrun|unknown} -body {
+    list [::vmdai::vm::tool_state {ok true executed yes}] \
+         [::vmdai::vm::tool_state {ok false executed yes}] \
+         [::vmdai::vm::tool_state {ok false executed no}] \
+         [::vmdai::vm::tool_state {ok false executed unknown}] \
+         [::vmdai::vm::tool_state {ok true}]
+} -result {ok err notrun unknown ok}
+
+test unknown_call_key_ignored {tool.finished before tool.started, or for an unknown call_key, does nothing} -body {
+    ::vmdai::vm::init S
+    feed S [started req_a] [tfin req_a k_nope] [tstart req_a k1] [tstart req_a k1]
+    set before $S
+    set ops [::vmdai::vm::apply S [tfin req_a k_other]]
+    list $ops [expr {$S eq $before}] [llength [only [feed S [tstart req_a k1]] tool.open]]
+} -result {{} 1 0}
+
+test second_finished_ignored_unless_late {a repeated tool.finished is ignored unless late:true} -body {
+    ::vmdai::vm::init S
+    feed S [started req_a] [tstart req_a k1] [tfin req_a k1 {ok false executed unknown}]
+    set again [::vmdai::vm::apply S [tfin req_a k1 {ok true}]]
+    set late [::vmdai::vm::apply S [tfin req_a k1 {ok true late true output 7.5}]]
+    list $again [lrange [lindex $late 0] 0 2] [dict get [lindex $late 0 4] label] [lindex $late 1]
+} -result {{} {tool.close k1 ok} {(finished late)} {run.chip r1 k1 ok}}
+
+test late_updates_row_after_finished {a late result updates its row after request.finished and after the next request started} -body {
+    ::vmdai::vm::init S
+    feed S [started req_a] [tstart req_a k1] [tfin req_a k1 {ok false executed unknown}] \
+        [st request.finished {request_id req_a status cancelled tool_calls 1 final_text_empty false duration_ms 3000}] \
+        [started req_b]
+    set ops [::vmdai::vm::apply S [tfin req_a k1 {ok false late true error {boom}}]]
+    list [lrange [lindex $ops 0] 0 1] [dict get [lindex $ops 0 4] error] [lindex $ops 1] [llength $ops]
+} -result {{tool.close k1} boom {run.chip r1 k1 err} 2}
+
+test error_card_actions_and_no_model {error events become cards with an action; NO_MODEL is a local card; truncation, context and thinking get a muted notice, never a card} -body {
+    ::vmdai::vm::init S
+    set r {}
+    lappend r [::vmdai::vm::apply S [ev error message "Model not found: qwen3.8:27b" \
+        {request_id req_a code model_not_found http_status 404 hint {ollama pull qwen3.8:27b} action choose_model}]]
+    lappend r [::vmdai::vm::apply S [ev error message "Credit balance too low" {request_id req_a code billing}]]
+    lappend r [::vmdai::vm::apply S [::vmdai::vm::local_event local.send_failed \
+        {code NO_MODEL message {Set up a model in Settings.}}]]
+    lappend r [only [feed S [st status {request_id req_a phase turn_truncated}] \
+        [st status {request_id req_a phase context_near_full}] \
+        [st status {request_id req_a phase think_unsupported}]] {notice error.card}]
+} -result {{{error.card model_not_found {Model not found: qwen3.8:27b} {ollama pull qwen3.8:27b} choose_model}} {{error.card billing {Credit balance too low} {} switch_profile}} {{error.card NO_MODEL {No model configured} {Set up a model in Settings.} open_settings}} {{notice info {The reply was cut off, so its tool calls were not run}} {notice info {Context is nearly full; older tool output is shortened}} {notice info {This model does not support thinking; continuing without it}}}}
+
+test local_connection_notices {one notice per connection state change; a lost request settles its rows} -body {
+    ::vmdai::vm::init S
+    feed S [started req_a] [tstart req_a k1]
+    set ops [feed S \
+        [::vmdai::vm::local_event local.connection {state reconnecting detail 127.0.0.1:8765 request_lost false ts 1727180000}] \
+        [::vmdai::vm::local_event local.connection {state down detail 127.0.0.1:8765 request_lost false ts 1727180001}] \
+        [::vmdai::vm::local_event local.connection {state ready detail 127.0.0.1:8765 request_lost true ts 1727180002}]]
+    list [only $ops notice] [lrange [lindex [only $ops tool.close] 0] 0 2] \
+         [lrange [lindex [only $ops run.close] 0] 0 1] [lindex $ops end]
+} -result {{{notice warn {Connection lost at 12:13 PM · your draft is kept}} {notice warn {Reconnected: request lost} retry}} {tool.close k1 unknown} {run.close r1} {status idle}}
+
+test request_ended_local {local.request_ended ends a busy request with a note} -body {
+    ::vmdai::vm::init S
+    feed S [started req_a]
+    set ops [::vmdai::vm::apply S [::vmdai::vm::local_event local.request_ended {request_id req_a}]]
+    list [lindex $ops 0] [lrange [lindex [only $ops run.close] 0] 0 2] [lindex $ops end] [dict get $S busy]
+} -result {{notice info {Request ended (details may be missing)}} {run.close r1 ended} {status idle} 0}
+
 cleanupTests

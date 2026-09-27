@@ -41,6 +41,17 @@ UNIT_TESTS = [
     "trust_notice_no_op",
 ]
 
+UNIT_TESTS += [
+    "notrun_label_order",
+    "tool_state_values",
+    "unknown_call_key_ignored",
+    "second_finished_ignored_unless_late",
+    "late_updates_row_after_finished",
+    "error_card_actions_and_no_model",
+    "local_connection_notices",
+    "request_ended_local",
+]
+
 REPLAY = r"""
 source [file join $env(VMDAI_PLUGIN_DIR) viewmodel.tcl]
 set in [open $env(CHATVMD_EVENTS) r]
@@ -92,6 +103,30 @@ def test_seal_replaces_streamed_text(vm_result):
 
 def test_trust_notice_no_op(vm_result):
     assert_tcltests(vm_result, ["trust_notice_no_op"])
+
+
+def test_notrun_label_order(vm_result):
+    assert_tcltests(vm_result, ["notrun_label_order", "tool_state_values"])
+
+
+def test_unknown_call_key_ignored(vm_result):
+    assert_tcltests(vm_result, ["unknown_call_key_ignored"])
+
+
+def test_second_finished_ignored_unless_late(vm_result):
+    assert_tcltests(vm_result, ["second_finished_ignored_unless_late"])
+
+
+def test_late_updates_row_after_finished(vm_result):
+    assert_tcltests(vm_result, ["late_updates_row_after_finished"])
+
+
+def test_error_card_actions_and_no_model(vm_result):
+    assert_tcltests(vm_result, ["error_card_actions_and_no_model"])
+
+
+def test_local_events(vm_result):
+    assert_tcltests(vm_result, ["local_connection_notices", "request_ended_local"])
 
 
 def replay_ops(name: str, tmp_path: Path) -> str:
@@ -180,6 +215,23 @@ def _retried_block_discarded(ops):
     sealed = {op[1] for op in ops if op[0] == "block.seal"}
     assert retried and not (set(retried) & sealed), ops
     assert sealed
+
+
+@scenario("loop_guard")
+def _stuck_run_ends_with_wrap_up(ops):
+    assert [op[2] for op in ops if op[0] == "run.close"] == ["stuck"]
+    last_rule = max(i for i, op in enumerate(ops) if op[0] == "rule")
+    assert any(op[0] == "block.seal" for op in ops[last_rule:])
+    assert ops[-1] == ["status", "idle"]
+
+
+@scenario("11_dead_runtime")
+def _lost_runtime_notices(ops):
+    assert any(op[0] == "run.open" for op in ops)
+    assert any(op[0] == "tool.open" for op in ops)
+    assert not any(op[0] == "run.close" and op[2] == "complete" for op in ops)
+    notices = [op[2] for op in ops if op[0] == "notice"]
+    assert any(n.startswith("Connection lost at ") for n in notices), notices
 
 
 def run_scenario_checks(name: str, ops: List[List[str]]) -> None:

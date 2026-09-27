@@ -327,23 +327,24 @@ proc ::vmdai::vm::_result_view {output} {
     return [list "" [concat [lrange $lines 0 2] [list "… $more more lines"]]]
 }
 
-proc ::vmdai::vm::_tool_detail {md state} {
+proc ::vmdai::vm::_tool_detail {md state late} {
     set output [_get $md output]
     lassign [_result_view $output] inline preview
     set label ""
     set error ""
     switch -- $state {
-        notrun  { set label "not run"; set inline ""; set preview {} }
+        notrun  { set label [notrun_label $md]; set inline ""; set preview {} }
         unknown { set label "stopped while running · outcome unknown" }
         err     { set error [_first_line [_get $md error]]; set inline "" }
     }
+    if {$late} { set label [string trim "$label (finished late)"] }
     set stmts [_get $md statements]
     set failed [_get $stmts failed]
     return [dict create label $label error $error inline $inline preview $preview \
         output $output output_path [_get $md output_path] \
         total [_get $stmts total] applied [_get $stmts applied] \
         failed_index [_get $failed index] failed_text [_get $failed text] \
-        late 0]
+        late $late]
 }
 
 proc ::vmdai::vm::_chip_state {state k warned} {
@@ -356,9 +357,11 @@ proc ::vmdai::vm::_on_tool_finished {sv md ts} {
     upvar 1 $sv S
     set k [_get $md call_key]
     if {$k eq "" || ![dict exists $S tools $k]} { return {} }
+    set late [_bool [_get $md late false]]
     set tool [dict get $S tools $k]
-    if {[dict get $tool finished]} { return {} }
+    if {[dict get $tool finished] && !$late} { return {} }
     set state [tool_state $md]
+    if {$late && $state ni {ok err}} { return {} }
     set was [dict get $tool state]
     dict set S tools $k state $state
     dict set S tools $k finished 1
@@ -367,7 +370,7 @@ proc ::vmdai::vm::_on_tool_finished {sv md ts} {
     set image [_get $md image]
     set thumb [expr {$image eq "" ? "" : [_get $image thumb_path]}]
     set ops [list [list tool.close $k $state [_dur_text [_get $md duration_ms ""]] \
-        [_tool_detail $md $state] $thumb]]
+        [_tool_detail $md $state $late] $thumb]]
     if {$run ne ""} {
         lappend ops [list run.chip $run $k [_chip_state $state $k [dict get $S warned]]]
     }
@@ -390,9 +393,11 @@ proc ::vmdai::vm::_on_tool_finished {sv md ts} {
         if {![string is integer -strict $applied]} {
             set applied [expr {$state eq "ok" ? 1 : 0}]
         }
-        dict set S runs $req applied [expr {[dict get $S runs $req applied] + $applied}]
+        if {!$late || $was ni {ok err}} {
+            dict set S runs $req applied [expr {[dict get $S runs $req applied] + $applied}]
+        }
     }
-    if {[dict get $S request] eq $req && [dict get $S busy]} {
+    if {!$late && [dict get $S request] eq $req && [dict get $S busy]} {
         lappend ops {*}[_phase S "Thinking" $ts]
     }
     return $ops
@@ -515,6 +520,7 @@ proc ::vmdai::vm::apply {stateVar event} {
         user/message      { lappend ops {*}[_on_user_message S $text $ts] }
         assistant/message { lappend ops {*}[_on_assistant_message S $md $text $ts] }
         reasoning/message { lappend ops {*}[_on_reasoning_message S $md $text $ts] }
+        error/message     { lappend ops {*}[_on_error $md $text] }
         system/message {
             if {[_get $md notice] eq "tcl_trust_boundary"} {
                 dict set S trust_notice 1
@@ -532,8 +538,136 @@ proc ::vmdai::vm::apply {stateVar event} {
                 tool.finished    { lappend ops {*}[_on_tool_finished S $md $ts] }
                 status           { lappend ops {*}[_on_status S $md $ts] }
                 usage            { }
+                local.*          { lappend ops {*}[_on_local S $kind $md $ts] }
             }
         }
     }
     return $ops
+}
+
+# First line wins, in C1-C4 order (Part B V4 "not run").
+proc ::vmdai::vm::notrun_label {md} {
+    set blocked [_get $md blocked]
+    if {[llength $blocked]} {
+        return "not run · blocked: [_get [lindex $blocked 0] word exec]"
+    }
+    set stmts [_get $md statements]
+    if {$stmts ne "" && [_get $stmts failed] ne ""} { return "not run · incomplete Tcl" }
+    set err [string trim [_get $md error]]
+    if {$err eq "not executed: loop guard"} { return "not run · loop guard" }
+    if {$err eq "cancelled"} { return "not run · stopped" }
+    if {[string match "VMD did not pick up the command*" $err]} {
+        return "VMD did not pick up the command"
+    }
+    set first [_first_line $err]
+    if {$first eq ""} { return "not run" }
+    return "not run · $first"
+}
+
+proc ::vmdai::vm::_default_action {code} {
+    switch -- $code {
+        auth            { return open_settings }
+        billing         { return switch_profile }
+        model_not_found { return choose_model }
+        unreachable     { return test_connection }
+        NO_MODEL        { return open_settings }
+        default         { return open_log }
+    }
+}
+
+proc ::vmdai::vm::_on_error {md text} {
+    set code [_get $md code other]
+    set action [_get $md action [_default_action $code]]
+    return [list [list error.card $code $text [_get $md hint] $action]]
+}
+
+# ---- plugin-local events (P07-T08 kinds) -----------------------------------
+
+proc ::vmdai::vm::local_event {kind fields} {
+    set ts [clock seconds]
+    if {[dict exists $fields ts]} {
+        set ts [dict get $fields ts]
+        dict unset fields ts
+    }
+    return [dict create seq 0 ts $ts role system type state text "" \
+        metadata [dict merge [dict create kind $kind] $fields]]
+}
+
+proc ::vmdai::vm::_clock_text {secs} {
+    return [string trimleft [clock format $secs -format "%I:%M %p"] 0]
+}
+
+# The request was lost (restart) or ended while we were away: settle every
+# running row and close the run, so the panel never stays busy.
+proc ::vmdai::vm::_lose_request {sv status ts} {
+    upvar 1 $sv S
+    set req [dict get $S request]
+    if {$req eq "" || ![dict exists $S runs $req]} { return {} }
+    set ops {}
+    dict for {k tool} [dict get $S tools] {
+        if {[dict get $tool request_id] ne $req || [dict get $tool state] ne "running"} continue
+        dict set S tools $k state unknown
+        dict set S tools $k finished 1
+        set label [expr {$status eq "lost" ? "connection lost · outcome unknown" : "outcome unknown"}]
+        lappend ops [list tool.close $k unknown "" [dict create label $label error "" \
+            inline "" preview {} output "" output_path "" total "" applied "" \
+            failed_index "" failed_text "" late 0] ""]
+        lappend ops [list run.chip [dict get $tool run] $k warn]
+    }
+    lappend ops {*}[_close_run S $req $status 0 [expr {[_secs $ts] - [dict get $S runs $req t0]}]]
+    return $ops
+}
+
+proc ::vmdai::vm::_on_local {sv kind md ts} {
+    upvar 1 $sv S
+    switch -- $kind {
+        local.connection {
+            set new [_get $md state]
+            set old [dict get $S conn]
+            dict set S conn $new
+            if {$new eq $old} { return {} }
+            switch -- $new {
+                reconnecting - down {
+                    if {$old in {reconnecting down}} { return {} }
+                    return [list [list notice warn \
+                        "Connection lost at [_clock_text [_secs $ts]] · your draft is kept"]]
+                }
+                ready {
+                    if {$old ni {reconnecting down}} { return {} }
+                    if {[_bool [_get $md request_lost false]]} {
+                        set ops [list [list notice warn "Reconnected: request lost" retry]]
+                        lappend ops {*}[_lose_request S lost $ts]
+                        return $ops
+                    }
+                    return [list [list notice info "Reconnected"]]
+                }
+            }
+            return {}
+        }
+        local.request_ended {
+            set req [_get $md request_id]
+            if {$req eq "" || $req ne [dict get $S request]} { return {} }
+            set ops [list [list notice info "Request ended (details may be missing)"]]
+            lappend ops {*}[_lose_request S ended $ts]
+            return $ops
+        }
+        local.send_failed {
+            set code [_get $md code other]
+            if {$code eq "NO_MODEL"} {
+                set ops [list [list error.card NO_MODEL "No model configured" \
+                    [_get $md message] open_settings]]
+            } else {
+                set ops [list [list error.card $code "Message not sent" \
+                    [_get $md message] [_default_action $code]]]
+            }
+            if {[dict get $S busy] && [dict get $S request] eq ""} {
+                dict set S busy 0
+                dict set S phase ""
+                dict set S phase_t0 ""
+                lappend ops [list status idle]
+            }
+            return $ops
+        }
+    }
+    return {}
 }
