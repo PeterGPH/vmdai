@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -16,6 +17,8 @@ class RequestState:
     request_id: str
     cancel_event: threading.Event = field(default_factory=threading.Event)
     thread: Optional[threading.Thread] = None
+    turn: int = 0                                           # updated from turn.started
+    started_at: float = field(default_factory=time.time)    # epoch seconds
 
 
 @dataclass

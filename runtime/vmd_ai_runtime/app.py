@@ -13,13 +13,15 @@ from __future__ import annotations
 import copy
 import hmac
 import json
+import logging
 import os
 import threading
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pathlib import Path
 
 from . import conversation
+from . import provider_catalog
 from . import settings_store as settings_mod
 from .claude_loop import (
     ClaudeLoopError,
@@ -32,11 +34,11 @@ from .claude_loop import (
 )
 from .locks import ChatLock
 from .recorder import RunRecorder
-from .constants import CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_VERSION
+from .constants import CAPABILITIES, DEFAULT_SETTINGS, RUNTIME_PROTOCOL, RUNTIME_VERSION
 from .docs_search import DocsSearch
 from .errors import RpcError
 from .keys import KeyStore
-from .logging_utils import redact_sensitive
+from .logging_utils import default_log_path, redact_sensitive
 from .protocol import validate_method_params, validate_rpc_payload
 from .provider import (
     build_provider,
@@ -47,7 +49,9 @@ from .provider import (
 )
 from .settings_store import (
     DEFAULT_BASE_URLS,
+    DEFAULT_PROFILE_NAMES,
     TOP_LEVEL_DEFAULTS,
+    SettingsError,
     SettingsStore,
     normalize_provider,
     resolve_profile,
@@ -65,6 +69,10 @@ RESCUE_ALL_NOTICE = (
     "Set options.rescue to \"json\" in ~/.vmdai/settings.json to run only "
     "tool-call JSON that names an offered tool."
 )
+
+
+# settings.json keys settings.set may write (§2f Schema); they need a token session.
+PERSISTED_SETTING_KEYS = tuple(TOP_LEVEL_DEFAULTS)
 
 
 class RuntimeApp:
@@ -359,6 +367,169 @@ class RuntimeApp:
             "No model configured. Choose a provider and model, or add a profile to ~/.vmdai/settings.json.",
             {"action": "open_settings"},
         )
+
+    # ------------------------------------------------------------------
+    # M1 RPC helpers (§2c, §3)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _turn_tracker(request) -> Callable[[Dict[str, Any]], None]:
+        """on_event for v1 sessions: keeps RequestState.turn current for runtime.info.
+
+        v1 sessions get no queue events from on_event (§2a Legacy callbacks);
+        P07-T01 replaces this with _make_on_event for v2 sessions.
+        """
+        def on_event(item: Dict[str, Any]) -> None:
+            metadata = item.get("metadata") or {}
+            if request is not None and metadata.get("kind") == "turn.started":
+                try:
+                    request.turn = int(metadata.get("turn") or 0)
+                except (TypeError, ValueError):
+                    pass
+        return on_event
+
+    @staticmethod
+    def _vision_for(loop: Optional[ClaudeToolLoop]) -> bool:
+        if loop is None:
+            return False
+        if loop.provider_name == "anthropic-direct":
+            return True
+        return getattr(getattr(loop, "options", None), "supports_vision", None) is True
+
+    def _max_turns_for(self, loop: Optional[ClaudeToolLoop]) -> int:
+        options = getattr(loop, "options", None) if loop is not None else None
+        if options is not None:
+            return int(options.max_turns)
+        if loop is not None:
+            return int(loop.MAX_TURNS)
+        return int(self._setting("max_turns"))
+
+    @staticmethod
+    def _log_path() -> str:
+        for handler in logging.getLogger().handlers:
+            name = getattr(handler, "baseFilename", None)
+            if name:
+                return str(name)
+        return default_log_path()
+
+    def _runtime_info(self, state) -> Dict[str, Any]:
+        loop = self._new_loop_for(state)
+        profile = self.profile_for_session(state) or {}
+        # A token session of a runtime that owns settings.json never runs the
+        # env/mock provider (§2f), so with no usable profile it reports "".
+        fallback = "" if (state.authenticated and self.settings_store is not None) else self.provider_name
+        info: Dict[str, Any] = {
+            "version": RUNTIME_VERSION,
+            "protocol": RUNTIME_PROTOCOL,
+            "pid": os.getpid(),
+            "provider": loop.provider_name if loop is not None else str(profile.get("provider") or fallback),
+            "model": loop.model if loop is not None else str(profile.get("model") or ""),
+            "agent_loop": loop is not None,
+            "vision": self._vision_for(loop),
+            "tools": [str(tool.get("name")) for tool in loop._tools_for_turn()] if loop is not None else [],
+            "rag": bool(self.docs_search is not None and getattr(self.docs_search, "is_available", False)),
+            "wiki": bool(loop is not None and loop.wiki_store is not None),
+            "max_turns": self._max_turns_for(loop),
+            "log_path": self._log_path(),
+            "settings_source": (self.settings_store.settings_source
+                                if self.settings_store is not None else "default"),
+            "first_run": {"servers": copy.deepcopy(self.first_run_servers)},
+        }
+        active = state.active_request
+        if self._request_running(state):
+            info["active_request"] = {
+                "request_id": active.request_id,
+                "turn": int(active.turn),
+                "started_at": float(active.started_at),
+                "last_seq": state.queue.last_seq,
+            }
+        return info
+
+    def _catalog_target(self, state, params: Dict[str, Any]) -> Tuple[str, str, str, str]:
+        """(provider, base_url, model, api_key) for models.list/provider.test.
+
+        Missing params come from the session's profile when the provider
+        matches, else from the provider's defaults.
+        """
+        profile = self.profile_for_session(state) or {}
+        profile_provider = normalize_provider(profile.get("provider"))
+        provider_name = normalize_provider(params.get("provider")) or profile_provider
+        same = provider_name == profile_provider
+        base_url = (params.get("base_url") or (profile.get("base_url") if same else "")
+                    or DEFAULT_BASE_URLS.get(provider_name) or "")
+        model = params.get("model") or (profile.get("model") if same else "") or ""
+        return provider_name, str(base_url), str(model), self._api_key_for(provider_name)
+
+    def _capabilities_for(self, profile: Dict[str, Any]) -> Dict[str, bool]:
+        provider_name = normalize_provider(profile.get("provider"))
+        options = profile.get("options") or {}
+        if provider_name == "ollama" and profile.get("model"):
+            base_url = profile.get("base_url") or DEFAULT_BASE_URLS["ollama"]
+            try:
+                show = provider_catalog.ollama_show(base_url, profile["model"], timeout=2.0)
+            except Exception:
+                return {"tools": False, "vision": False, "thinking": False}
+            return provider_catalog.model_capabilities(show)
+        return {"tools": True,
+                "vision": provider_name == "anthropic-direct" or options.get("supports_vision") is True,
+                "thinking": False}
+
+    def _settings_rpc_error(self, exc: SettingsError) -> RpcError:
+        if exc.code in ("IN_USE", "NOT_FOUND"):
+            return RpcError(exc.code, exc.message)
+        if exc.code == "READ_ONLY":
+            source = self.settings_store.settings_source if self.settings_store is not None else "default"
+            return RpcError("INVALID_PARAMS", exc.message, {"reason": "read_only", "settings_source": source})
+        return RpcError("INVALID_PARAMS", exc.message)
+
+    def _provider_set_profile(self, state, params: Dict[str, Any]) -> Dict[str, Any]:
+        """provider.set for a token session: persist into the active or named profile.
+
+        Applies to the next request. Without a profile name it edits the
+        active profile in place (M1 ui.tcl Apply, §2f). With no active
+        profile it edits (or creates) the provider's default-named profile and
+        activates it: first run may have seeded ``claude``/``openrouter`` from
+        last_provider.txt without activating it, and applying it is the
+        user's explicit choice.
+        """
+        store = self.settings_store
+        provider_name = normalize_provider(params.get("provider"))
+        if not provider_name:
+            raise RpcError("INVALID_PARAMS",
+                           "provider must be one of anthropic-direct, openrouter, ollama, openai-compatible",
+                           {"provider": params.get("provider")})
+        model = str(params.get("model") or "").strip() or None
+        base_url = str(params.get("base_url") or "").strip() or None
+        options = params.get("options")
+        name = str(params.get("profile") or "").strip()
+        try:
+            active_name, _active = store.active_profile()
+            if not name:
+                name = active_name or DEFAULT_PROFILE_NAMES[provider_name]
+            if store.get_profile(name) is None:
+                profile: Dict[str, Any] = {"provider": provider_name, "model": model or "",
+                                           "options": dict(options or {})}
+                url = base_url or DEFAULT_BASE_URLS.get(provider_name)
+                if url:
+                    profile["base_url"] = url
+                store.save_profile(name, profile, activate=active_name is None)
+            else:
+                store.update_profile(name, provider=provider_name, model=model, base_url=base_url, options=options)
+                if active_name is None:
+                    store.activate(name)
+        except SettingsError as exc:
+            raise self._settings_rpc_error(exc)
+        saved = store.get_profile(name) or {}
+        if saved.get("model"):
+            state.settings["model"] = saved["model"]
+        return {
+            "ok": True,
+            "provider": provider_name,
+            "model": saved.get("model", ""),
+            "profile": name,
+            "agent_loop": self.has_agent_loop(state),
+            "capabilities": self._capabilities_for(saved),
+        }
 
     # ------------------------------------------------------------------
     # RPC dispatch
@@ -670,10 +841,25 @@ class RuntimeApp:
         if method == "settings.set":
             state = self._get_session(params["session_id"], session_token)
             patch = dict(params.get("patch") or {})
+            persisted = {key: patch[key] for key in PERSISTED_SETTING_KEYS if key in patch}
+            owns_settings = bool(state.authenticated) and self.settings_store is not None
+            if persisted and not owns_settings and set(persisted) - {"reasoning_visible"}:
+                # reasoning_visible stays a per-session key for tokenless clients.
+                self._require_auth(state)
+            saved = None
+            if owns_settings and persisted:
+                try:
+                    saved = self.settings_store.patch(persisted)
+                except SettingsError as exc:
+                    raise self._settings_rpc_error(exc)
             for name in ("model", "mode", "conversation_mode", "reasoning_visible", "debug_mode"):
                 if name in patch:
                     state.settings[name] = patch[name]
-            return {"ok": True, "settings": dict(state.settings)}
+            reply: Dict[str, Any] = {"ok": True, "settings": dict(state.settings)}
+            if owns_settings:
+                reply["persisted"] = saved if saved is not None else {
+                    key: self._setting(key) for key in PERSISTED_SETTING_KEYS}
+            return reply
 
         # ---- Provider switching ----
         #
@@ -687,6 +873,12 @@ class RuntimeApp:
 
         if method == "provider.set":
             state = self._get_session(params["session_id"], session_token)
+            privileged = (bool(params.get("base_url")) or params.get("options") is not None
+                          or bool(params.get("profile")))
+            if privileged:
+                self._require_auth(state)
+            if state.authenticated and self.settings_store is not None:
+                return self._provider_set_profile(state, params)
             requested = str(params["provider"] or "").strip().lower()
             if not requested:
                 raise RpcError("INVALID_PARAMS", "provider is required")
@@ -837,6 +1029,35 @@ class RuntimeApp:
 
             return {"ok": True, "resolved": resolved}
 
+        # ---- M1 runtime RPCs (§2c Stage split, §3) ----
+
+        if method == "runtime.info":
+            state = self._get_session(params["session_id"], session_token)
+            return self._runtime_info(state)
+
+        if method == "session.set_cwd":
+            state = self._get_session(params["session_id"], session_token)
+            self._require_auth(state)
+            path = os.path.realpath(os.path.expanduser(params["cwd"]))
+            if not os.path.isdir(path):
+                raise RpcError("INVALID_PARAMS", "cwd is not a directory", {"cwd": params["cwd"]})
+            state.cwd = path
+            return {"ok": True, "cwd": path}
+
+        if method == "models.list":
+            state = self._get_session(params["session_id"], session_token)
+            if params.get("base_url"):
+                self._require_auth(state)
+            provider_name, base_url, _model, api_key = self._catalog_target(state, params)
+            return provider_catalog.list_models(provider_name, base_url, api_key=api_key)
+
+        if method == "provider.test":
+            state = self._get_session(params["session_id"], session_token)
+            if params.get("base_url"):
+                self._require_auth(state)
+            provider_name, base_url, model, api_key = self._catalog_target(state, params)
+            return provider_catalog.test_provider(provider_name, base_url, model, api_key=api_key)
+
         raise RpcError("METHOD_NOT_FOUND", f"Unknown method: {method}")
 
     # ------------------------------------------------------------------
@@ -941,8 +1162,11 @@ class RuntimeApp:
         messages_out = None
         if state.authenticated and chat_id:
             messages_out = conversation.Appender(self.store.chat_dir(chat_id), request_id)
-        ctx = RunContext(request_id=request_id, chat_id=chat_id or "", on_event=None,
-                         messages_out=messages_out)
+        request = state.active_request
+        if request is not None and request.request_id != request_id:
+            request = None
+        ctx = RunContext(request_id=request_id, chat_id=chat_id or "",
+                         on_event=self._turn_tracker(request), messages_out=messages_out)
 
         # Per-request recorder; restored afterwards so an assigned (shared)
         # loop never carries it into the next request.
