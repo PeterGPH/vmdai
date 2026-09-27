@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
 import hmac
 import json
 import logging
@@ -32,6 +33,8 @@ from .claude_loop import (
     LoopOptions,
     RunContext,
     WIKI_SYSTEM_PROMPT_ADDENDUM,
+    _ollama_tools,
+    _openrouter_tools,
     build_claude_loop,
 )
 from .locks import ChatLock
@@ -50,6 +53,7 @@ from .provider import (
     resolve_openai_compatible_api_key,
     resolve_openrouter_api_key,
 )
+from .provider_catalog import strip_url_secrets
 from .settings_store import (
     DEFAULT_BASE_URLS,
     DEFAULT_PROFILE_NAMES,
@@ -77,6 +81,23 @@ RESCUE_ALL_NOTICE = (
 
 # settings.json keys settings.set may write (§2f Schema); they need a token session.
 PERSISTED_SETTING_KEYS = tuple(TOP_LEVEL_DEFAULTS)
+
+
+def _canonical_sha256(obj: Any) -> str:
+    """SHA-256 of canonical JSON (sorted keys, compact separators): C6 tools_sha256."""
+    data = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _tools_as_sent(loop) -> List[Dict[str, Any]]:
+    """The ``tools`` list a turn-1 request body carries (C6: after
+    tool_overrides, in the provider's own shape)."""
+    tools = loop._tools_for_turn()
+    if getattr(loop, "_is_anthropic_direct", False):
+        return list(tools)
+    if getattr(loop, "_is_ollama", False):
+        return _ollama_tools(tools)
+    return _openrouter_tools(tools)
 
 
 class RuntimeApp:
@@ -1182,7 +1203,7 @@ class RuntimeApp:
     # Recorder factory — one fresh RunRecorder per chat.send
     # ------------------------------------------------------------------
 
-    def _build_recorder_for_session(self, state) -> RunRecorder | None:
+    def _build_recorder_for_session(self, state, meta: Optional[Dict[str, Any]] = None) -> RunRecorder | None:
         """Build a RunRecorder for this chat.send, or None.
 
         Resolution rules:
@@ -1190,6 +1211,9 @@ class RuntimeApp:
           2. ``state.cwd`` is a real directory → ``<cwd>/.vmdai_runs/``.
           3. Otherwise fall back to ``~/.vmdai/runs/`` so we never
              silently drop the artifact (option (c) in the plan).
+
+        ``meta`` (C6, product runs only) adds the provenance/usage/counts
+        manifest keys and the provenance header lines.
 
         Returns None on any construction failure — the recorder is a
         side-channel; failing to build one must never break chat.send.
@@ -1199,17 +1223,63 @@ class RuntimeApp:
         try:
             cwd = (state.cwd or "").strip()
             if cwd and os.path.isdir(cwd):
-                return RunRecorder.for_cwd(cwd)
+                return RunRecorder.for_cwd(cwd, meta=meta)
             # Centralized fallback so we don't pollute the home dir
             # directly — everything lives under ~/.vmdai/runs/<task_id>/.
             fallback = Path(os.path.expanduser("~/.vmdai")) / "runs"
-            return RunRecorder(runs_root=fallback)
+            return RunRecorder(runs_root=fallback, meta=meta)
         except Exception:
             if self.logger:
                 self.logger.warning(
                     "recorder construction failed", exc_info=True,
                 )
             return None
+
+    def _recorder_meta(self, state, loop, request_id: str) -> Dict[str, Any]:
+        """C6 static provenance for a product run's recorder manifest."""
+        options = getattr(loop, "options", None)
+        base_url = ""
+        if options is not None and getattr(options, "base_url", None):
+            base_url = str(options.base_url)
+        elif getattr(loop, "_is_ollama", False):
+            base_url = str(loop.api_key or "")
+        opts = None
+        if options is not None:
+            opts = options.to_dict()
+            if opts.get("base_url"):
+                opts["base_url"] = strip_url_secrets(str(opts["base_url"]))
+        try:
+            vision = bool(loop._vision_enabled())
+        except Exception:
+            vision = False
+        # The prompt before the per-request <session> block (the variant plus
+        # today's mode line, exactly as P04-T06's _system_prompt_for_request
+        # builds it), plus the wiki addendum run() appends when wiki is on
+        # (C6 Hashes).
+        mode = str(state.settings.get("mode") or "work")
+        prompt = chatvmd_system_prompt(vision) + f"\n\nMode: {mode}."
+        if getattr(loop, "wiki_store", None) is not None:
+            prompt += WIKI_SYSTEM_PROMPT_ADDENDUM
+        profile_name = None
+        store = getattr(self, "settings_store", None)
+        if store is not None:
+            try:
+                profile_name = store.active_profile()[0]
+            except Exception:
+                profile_name = None
+        return {
+            "request_id": request_id,
+            "profile": profile_name,
+            "provider": loop.provider_name,
+            "base_url": strip_url_secrets(base_url) if base_url else None,
+            "model": loop.model,
+            "model_digest": None,
+            "runtime_version": RUNTIME_VERSION,
+            "vmd_env": getattr(state, "vmd_env", None),
+            "options": opts,
+            "system_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "tools_sha256": _canonical_sha256(_tools_as_sent(loop)),
+        }
 
     # ------------------------------------------------------------------
     # Product bridge support (plan 05)
@@ -1377,7 +1447,15 @@ class RuntimeApp:
         # Per-request recorder; restored afterwards so an assigned (shared)
         # loop never carries it into the next request.
         prev_recorder = loop.recorder
-        loop.recorder = self._build_recorder_for_session(state)
+        meta = None
+        if getattr(state, "authenticated", False):
+            try:
+                meta = self._recorder_meta(state, loop, request_id)
+            except Exception:
+                meta = None
+                if self.logger:
+                    self.logger.warning("recorder provenance failed", exc_info=True)
+        loop.recorder = self._build_recorder_for_session(state, meta)
         events_to_persist: List[Dict[str, Any]] = []
         try:
             output = loop.run(

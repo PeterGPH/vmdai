@@ -165,6 +165,16 @@ def cached_tag_digest(base_url: str, model: str) -> Optional[str]:
     return None
 
 
+def strip_url_secrets(url: str) -> str:
+    """Drop userinfo, query and fragment from ``url`` (C6 provenance)."""
+    text = str(url or "")
+    if not text:
+        return text
+    parts = urllib.parse.urlsplit(text)
+    host = parts.netloc.rpartition("@")[2]
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
 # -- Unreachable classification (§2f) -----------------------------------------
 
 def classify_unreachable(exc: BaseException) -> Optional[str]:

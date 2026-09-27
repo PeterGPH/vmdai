@@ -3157,6 +3157,12 @@ class ClaudeToolLoop:
         chunk event; every other item (status, usage) becomes a
         ``system/state`` event carrying the item plus request_id and turn.
         """
+        kind = item.get("kind") if isinstance(item, dict) else None
+        if kind == "rescued":
+            self._prov_rescued = getattr(self, "_prov_rescued", 0) + len(item.get("ids") or [])
+        elif kind == "stop_reason" and item.get("value") in ("max_tokens", "length"):
+            self._prov_truncated = getattr(self, "_prov_truncated", 0) + 1
+
         if not isinstance(item, dict):
             return
         kind = str(item.get("kind") or "")
@@ -3451,6 +3457,9 @@ class ClaudeToolLoop:
         self._ctx = ctx
         self.last_wrapped_up = False
         self.last_wrap_up_error = None
+        self._prov_tool_calls = 0
+        self._prov_rescued = 0
+        self._prov_truncated = 0
         self.last_model_digest = None
         self.last_usage = {"input_tokens_evaluated": None, "output_tokens": None}
         self._turn = 0
@@ -3507,6 +3516,8 @@ class ClaudeToolLoop:
                     raise ClaudeLoopError(
                         f"API call failed on turn {turn + 1}: {exc}"
                     ) from exc
+
+                self._recorder_update_meta()
 
                 if text:
                     final_text = text
@@ -3628,6 +3639,7 @@ class ClaudeToolLoop:
             end_status = "error"
             raise
         finally:
+            self._recorder_update_meta()
             self.last_status = end_status
             self._recorder_end_task(end_status)
             self._ctx = None
@@ -3666,6 +3678,7 @@ class ClaudeToolLoop:
     ) -> None:
         if self.recorder is None:
             return
+        self._prov_tool_calls = getattr(self, "_prov_tool_calls", 0) + 1
         if result.get("blocked"):
             # C1: a blocked call never reached VMD; it changes neither
             # transcript.tcl nor the manifest counts.
@@ -3736,6 +3749,51 @@ class ClaudeToolLoop:
             # VMD state change, so replaying without it still works.
         except Exception:
             logger.warning("recorder hook failed", exc_info=True)
+
+    def _recorder_update_meta(self) -> None:
+        """C6: push digest, usage and counts into the recorder manifest.
+
+        Only for product runs (``self._ctx`` set) and only when the recorder
+        was built with provenance meta; benchmark runs build no recorder.
+        """
+        if self.recorder is None or self._ctx is None:
+            return
+        update = getattr(self.recorder, "update_meta", None)
+        if update is None:
+            return
+        usage = dict(getattr(self, "last_usage", None) or {})
+        try:
+            update(
+                model_digest=self._provenance_digest(),
+                usage={
+                    "input_tokens_evaluated": usage.get("input_tokens_evaluated"),
+                    "output_tokens": usage.get("output_tokens"),
+                },
+                counts={
+                    "tool_calls": int(getattr(self, "_prov_tool_calls", 0)),
+                    "rescued_calls": int(getattr(self, "_prov_rescued", 0)),
+                    "truncated_turns": int(getattr(self, "_prov_truncated", 0)),
+                    "compactions": int(getattr(self, "last_compactions", 0) or 0),
+                },
+            )
+        except Exception:
+            logger.warning("recorder.update_meta failed", exc_info=True)
+
+    def _provenance_digest(self) -> Optional[str]:
+        """Ollama model digest: /api/ps (preflight), else the cached /api/tags
+        entry, else None. Never sends a request of its own (C6)."""
+        digest = getattr(self, "last_model_digest", None)
+        if digest:
+            return str(digest)
+        if not self._is_ollama:
+            return None
+        options = getattr(self, "options", None)
+        base = (getattr(options, "base_url", None) if options is not None else None) or self.api_key
+        try:
+            from .provider_catalog import cached_tag_digest
+            return cached_tag_digest(base or "http://localhost:11434", self.model)
+        except Exception:
+            return None
 
     def _recorder_end_task(self, status: str) -> None:
         if self.recorder is None:

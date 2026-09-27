@@ -24,7 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 # ----------------------------------------------------------------------
@@ -41,6 +41,9 @@ class RunRecorderError(RuntimeError):
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SAFE_EXT = ("png", "tga", "jpg", "jpeg")
+
+_EMPTY_USAGE = {"input_tokens_evaluated": None, "output_tokens": None}
+_EMPTY_COUNTS = {"tool_calls": 0, "rescued_calls": 0, "truncated_turns": 0, "compactions": 0}
 
 
 def _utc_iso(t: float) -> str:
@@ -115,17 +118,52 @@ class RunRecorder:
     # Construction
     # ------------------------------------------------------------------
 
-    def __init__(self, runs_root: Optional[Path | str] = None):
+    def __init__(
+        self,
+        runs_root: Optional[Path | str] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ):
         self.runs_root: Optional[Path] = (
             Path(runs_root) if runs_root is not None else None
         )
         self._current: Optional[_TaskState] = None
+        # C6 product-run provenance. None keeps today's manifest exactly.
+        self._meta: Optional[Dict[str, Any]] = None
+        if meta is not None:
+            self._meta = {
+                "provenance": dict(meta),
+                "usage": dict(_EMPTY_USAGE),
+                "counts": dict(_EMPTY_COUNTS),
+            }
 
     @classmethod
-    def for_cwd(cls, cwd: Optional[str | Path] = None) -> "RunRecorder":
+    def for_cwd(
+        cls,
+        cwd: Optional[str | Path] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> "RunRecorder":
         """Build a recorder rooted at ``<cwd>/.vmdai_runs/``."""
         base = Path(cwd) if cwd is not None else Path(os.getcwd())
-        return cls(base / cls.DEFAULT_DIR_NAME)
+        return cls(base / cls.DEFAULT_DIR_NAME, meta=meta)
+
+    def update_meta(self, **fields: Any) -> None:
+        """Merge provenance fields; ``usage`` and ``counts`` update their keys.
+
+        No-op when the recorder was built without ``meta``. Rewrites the
+        manifest when a task is active, so a crash leaves the values of the
+        last completed turn on disk.
+        """
+        if self._meta is None:
+            return
+        for key, value in fields.items():
+            if key in ("usage", "counts"):
+                merged = dict(self._meta[key])
+                merged.update(dict(value or {}))
+                self._meta[key] = merged
+            else:
+                self._meta["provenance"][key] = value
+        if self._current is not None:
+            self._flush_manifest(status="active")
 
     # ------------------------------------------------------------------
     # Public properties
@@ -424,12 +462,40 @@ class RunRecorder:
             f"# model      : {s.model}\n"
             f"# cwd        : {s.cwd}\n"
             f"# prompt     : {prompt_one_line}\n"
+            f"{self._provenance_header()}"
             f"#\n"
             f"# Only successful commands are recorded; this file is replayable:\n"
             f"#   vmd -e {s.task_id}/transcript.tcl\n"
             f"#   vmd -dispdev text -e {s.task_id}/transcript.tcl   (headless)\n"
         )
         (s.dir / "transcript.tcl").write_text(header, encoding="utf-8")
+
+    def _provenance_header(self) -> str:
+        """C6 header lines; empty without meta. The digest lives only in the
+        manifest, because it may be unknown when the header is written."""
+        if self._meta is None:
+            return ""
+        p = self._meta["provenance"]
+        env = p.get("vmd_env") or {}
+        vmd = " ".join(
+            str(x) for x in (env.get("vmd_version"), env.get("arch")) if x
+        ) or "unknown"
+        tcl_tk = []
+        if env.get("tcl_patchlevel"):
+            tcl_tk.append(f"Tcl {env['tcl_patchlevel']}")
+        if env.get("tk_patchlevel"):
+            tcl_tk.append(f"Tk {env['tk_patchlevel']}")
+        if tcl_tk:
+            vmd += " (" + ", ".join(tcl_tk) + ")"
+        provider = str(p.get("provider") or "")
+        if p.get("base_url"):
+            provider += f" {p['base_url']}"
+        return (
+            f"# provider   : {provider}\n"
+            f"# runtime    : vmd_ai_runtime {p.get('runtime_version') or 'unknown'}\n"
+            f"# vmd        : {vmd}\n"
+            f"# provenance : see manifest.json\n"
+        )
 
     # ------------------------------------------------------------------
     # Manifest
@@ -455,6 +521,10 @@ class RunRecorder:
         }
         if ended:
             manifest["ended_at"] = _utc_iso(time.time())
+        if self._meta is not None:
+            manifest["provenance"] = dict(self._meta["provenance"])
+            manifest["usage"] = dict(self._meta["usage"])
+            manifest["counts"] = dict(self._meta["counts"])
         _atomic_write(
             s.dir / "manifest.json",
             json.dumps(manifest, indent=2, sort_keys=True),
