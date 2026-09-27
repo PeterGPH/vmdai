@@ -292,13 +292,17 @@ def test_stdin_eof_exits_within_2s(tmp_path):
     try:
         _ready(proc)
         _ready(other)
+        # Without --watch-stdin, EOF on stdin is ignored. Close other's stdin
+        # first so its 0.5 s check overlaps proc's exit instead of following it.
+        other.stdin.close()
+        other_closed = time.monotonic()
         started = time.monotonic()
         proc.stdin.close()
         proc.wait(timeout=10)
         assert time.monotonic() - started < 2.0
         assert proc.returncode == 0
-        other.stdin.close()  # without --watch-stdin, EOF on stdin is ignored
-        time.sleep(0.5)
+        time.sleep(max(0.0, 0.5 - (time.monotonic() - other_closed)))
+        assert time.monotonic() - other_closed >= 0.5
         assert other.poll() is None
     finally:
         _stop(proc)
@@ -314,11 +318,13 @@ def test_no_announce_writes_token_file_0600_and_removes_on_exit(tmp_path):
         assert set(data) == {"port", "pid", "token", "protocol"}
         assert data["pid"] == proc.pid and data["protocol"] == 2 and len(data["token"]) == 32
         assert path.name == f"runtime-{data['port']}.json"
-        assert _readline(proc, timeout=0.5) == ""  # no READY line without --announce
         started = _rpc(data["port"], "session.start", {"cwd": str(tmp_path)})
         assert "session_id" in started["result"]  # tokenless is fine without --announce
         assert _exit_seconds(proc) < 2.0
         assert not path.exists()
+        # No READY line (nor any other stdout) without --announce, over the
+        # runtime's whole life rather than a 0.5 s window after the token file.
+        assert proc.stdout.read() == b""
     finally:
         _stop(proc)
 
