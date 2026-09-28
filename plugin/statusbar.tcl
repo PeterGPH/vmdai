@@ -71,9 +71,10 @@ proc ::vmdai::statusbar::create {path args} {
     grid $path.trust -row 0 -column 3 -sticky e -pady {2 5}
     grid $path.sep -row 0 -column 4 -pady {2 5}
     grid $path.folder -row 0 -column 5 -sticky e -pady {2 5}
-    grid $path.hint -row 0 -column 6 -sticky e -padx {0 14} -pady {2 5}
+    grid $path.hint -row 0 -column 6 -sticky e -pady {2 5}
     grid columnconfigure $path 2 -weight 1
     grid columnconfigure $path 1 -weight 0
+    grid columnconfigure $path 7 -minsize 14
     foreach w [list $path $path.dot $path.left $path.trust $path.sep $path.folder $path.hint] {
         ::vmdai::theme::paint $w -background chrome
     }
