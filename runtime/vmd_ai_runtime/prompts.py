@@ -63,6 +63,13 @@ _TEMPLATE = """You are ChatVMD, an assistant embedded in a live VMD (Visual Mole
 Selections are plain strings with no slashes: "protein", "chain A and resname ATP", "within 5 of resname LIG".
 A representation is staged (style, colour, selection) and then committed with `mol addrep`.
 
+## VMD pitfalls
+- VMD ignores an unknown colouring method, style or material without a Tcl error: the representation keeps its old setting and VMD only prints ERROR to its own console. Colouring methods include Name, Element, ResName, ResType, Chain, Structure (secondary structure), Beta and ColorID <n>.
+- After adding or changing representation N, read back what it really uses, and report colours and styles from that readback rather than from a snapshot alone (this is N = 0):
+    molinfo top get {{{{rep 0}} {{selection 0}} {{color 0}}}}
+- `resid` is the residue number from the structure file; `residue` is VMD's internal index starting at 0. Report `resid`.
+- Take a structure's identity from its file name, its file or the user, not from how it looks.
+
 ## Examples
 Load a structure and replace the default representation:
     mol new {{1hck.pdb}}

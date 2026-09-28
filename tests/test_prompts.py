@@ -79,6 +79,20 @@ def test_content_changes_from_2g():
         assert 'End with a short "what changed" summary.' in prompt
 
 
+def test_vmd_pitfalls_seen_in_live_sessions():
+    # A live qwen3.8:27b session hit both: `mol color SecondaryStructure` is
+    # silently ignored by VMD (the rep keeps Name colouring, rc 0), and
+    # `residue` (VMD's 0-based index) was reported instead of `resid`.
+    for prompt in BOTH:
+        assert "## VMD pitfalls" in prompt
+        assert "Structure (secondary structure)" in prompt
+        assert "without a Tcl error" in prompt
+        assert "    molinfo top get {{rep 0} {selection 0} {color 0}}" in prompt
+        assert "`resid` is the residue number from the structure file" in prompt
+        assert "`residue` is VMD's internal index" in prompt
+        assert "not from how it looks" in prompt
+
+
 def test_non_vision_tool_overrides():
     loop = ClaudeToolLoop("ollama", "http://127.0.0.1:9", "m",
                           options=LoopOptions(tool_overrides=dict(NON_VISION_TOOL_OVERRIDES)))
