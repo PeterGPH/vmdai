@@ -35,4 +35,13 @@ test syntax-6 {every class is one of the seven syn tokens; empty input has none}
     list [lsort -unique $classes] [::vmdai::syntax::tokens ""]
 } -result {{brace cmd cmt num opt str var} {}}
 
+test syntax-long-line {tokenizing a very long single line stays roughly linear} -body {
+    set idx {}
+    for {set i 0} {$i < 20000} {incr i} { lappend idx $i }
+    set t0 [clock milliseconds]
+    set toks [::vmdai::syntax::tokens "foo $idx"]
+    set ms [expr {[clock milliseconds] - $t0}]
+    list [llength $toks] [lindex $toks 0] [lindex $toks end] [expr {$ms < 750}]
+} -result {20001 {0 3 cmd} {108888 108893 num} 1}
+
 cleanupTests

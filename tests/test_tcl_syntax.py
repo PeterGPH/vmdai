@@ -10,7 +10,7 @@ from helpers.tk_cases import assert_case, run_tk_file
 
 REPO = Path(__file__).resolve().parents[1]
 TOKENS_FILE = REPO / "tests" / "tcl" / "test_syntax.tcl"
-TOKENS_TOTAL = 6
+TOKENS_TOTAL = 7
 DETAIL_TOTAL = 4
 
 

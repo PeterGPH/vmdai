@@ -22,37 +22,37 @@ proc ::vmdai::syntax::tokens {code} {
         set pos 0
         set cmdpos 1
         while {$pos < $len} {
-            set rest [string range $line $pos end]
+            # -start with \A avoids a per-token copy, so the scan is linear.
             set cls ""
-            if {[regexp {^[ \t]+} $rest m]} {
+            if {[regexp -start $pos {\A[ \t]+} $line m]} {
                 # whitespace
-            } elseif {$cmdpos && [regexp {^#.*} $rest m]} {
+            } elseif {$cmdpos && [regexp -start $pos {\A#.*} $line m]} {
                 set cls cmt
-            } elseif {[regexp {^\$(\{[^\}]*\}|[A-Za-z0-9_:]+(\([^\)]*\))?)} $rest m]} {
+            } elseif {[regexp -start $pos {\A\$(\{[^\}]*\}|[A-Za-z0-9_:]+(\([^\)]*\))?)} $line m]} {
                 set cls var
                 set cmdpos 0
-            } elseif {[regexp {^\[} $rest m]} {
+            } elseif {[regexp -start $pos {\A\[} $line m]} {
                 set cls brace
                 set cmdpos 1
-            } elseif {[regexp {^[\]\{\}]} $rest m]} {
+            } elseif {[regexp -start $pos {\A[\]\{\}]} $line m]} {
                 set cls brace
                 set cmdpos 0
-            } elseif {[regexp {^;} $rest m]} {
+            } elseif {[regexp -start $pos {\A;} $line m]} {
                 set cmdpos 1
-            } elseif {[regexp {^"(?:[^"\\]|\\.)*"?} $rest m]} {
+            } elseif {[regexp -start $pos {\A"(?:[^"\\]|\\.)*"?} $line m]} {
                 set cls str
                 set cmdpos 0
-            } elseif {!$cmdpos && [regexp {^-?[0-9]+(?:\.[0-9]+)?(?=[\s\]\};]|$)} $rest m]} {
+            } elseif {!$cmdpos && [regexp -start $pos {\A-?[0-9]+(?:\.[0-9]+)?(?=[\s\]\};]|$)} $line m]} {
                 set cls num
-            } elseif {!$cmdpos && [regexp {^-[A-Za-z][A-Za-z0-9_]*} $rest m]} {
+            } elseif {!$cmdpos && [regexp -start $pos {\A-[A-Za-z][A-Za-z0-9_]*} $line m]} {
                 set cls opt
-            } elseif {[regexp {^[^\s\[\]\{\}\$;"]+} $rest m]} {
+            } elseif {[regexp -start $pos {\A[^\s\[\]\{\}\$;"]+} $line m]} {
                 if {$cmdpos} {
                     set cls cmd
                 }
                 set cmdpos 0
             } else {
-                set m [string index $rest 0]
+                set m [string index $line $pos]
                 set cmdpos 0
             }
             set n [string length $m]
