@@ -49,7 +49,7 @@ test md-basetags {every inserted character carries basetags; no trailing newline
     set end [::vmdai::md::render_into $w end "A **b**\n\n- c" {prose wl:r1}]
     $w insert end "|after"
     list [$w get 2.0 "end - 1c"] [$w tag ranges wl:r1] $end
-} -result [list "A b\n\n•\tc|after" {2.0 4.3} 4.3]
+} -result [list "A b\n\n\u2022\tc|after" {2.0 4.3} 4.3]
 
 test md-proxy {a renamed widget behind a read-only proxy renders and right-aligns Copy} -body {
     set w [::m3::root_text 600x700]
@@ -82,7 +82,7 @@ test md-seal {streamed text stays raw; the sealed block is rendered} -setup {
     ::harness::settle
     set all [$t get 1.0 end]
     list $streaming [string first "**" $all] [::m3::ranges_text $t md_b] [::m3::ranges_text $t md_code]
-} -result [list 1 -1 1hck "mol new"]
+} -result [list 1 -1 1hck "mol\u00a0new"]
 
 test md-copy-plain {copying rendered inline code gives plain spaces} -body {
     $t tag remove sel 1.0 end

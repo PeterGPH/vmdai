@@ -22,7 +22,7 @@ proc ::usage_test::run {rid usage} {
 
 test usage-line {the footer shows the usage line in muted text; no links without applied Tcl} -body {
     set t [::usage_test::run req_000000000092 [dict create input_tokens_evaluated 20100 output_tokens 640]]
-    set idx [$t search -exact "20.1k evaluated · 640 out" 1.0 end]
+    set idx [$t search -exact "20.1k evaluated \u00b7 640 out" 1.0 end]
     set muted 0
     foreach tag [$t tag names $idx] {
         if {![catch {$t tag cget $tag -foreground} fg] && $fg eq [::vmdai::theme::c muted]} { set muted 1 }

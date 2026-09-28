@@ -20,7 +20,7 @@ test syntax-3 {offsets run across lines; every line starts a command} -body {
 
 test syntax-4 {semicolons and brackets start commands; offsets count characters} -body {
     list [::vmdai::syntax::tokens {set s [measure rgyr $sel]; puts $s}] \
-         [::vmdai::syntax::tokens "puts Å; set a(1) 2"]
+         [::vmdai::syntax::tokens "puts \u00c5; set a(1) 2"]
 } -result {{{0 3 cmd} {6 7 brace} {7 14 cmd} {20 24 var} {24 25 brace} {27 31 cmd} {32 34 var}} {{0 4 cmd} {8 11 cmd} {17 18 num}}}
 
 test syntax-5 {braced bodies and namespaced variables} -body {
