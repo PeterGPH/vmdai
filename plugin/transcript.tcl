@@ -2029,7 +2029,9 @@ proc ::vmdai::transcript::_empty_ready {f info} {
         grid $f.v$i -row $r -column 2 -sticky nw -padx {8 8} -pady 6
         if {$action ne ""} {
             label $f.a$i -text $action -font ChatMeta -foreground [$C accent] -background $bg -cursor hand2
-            bind $f.a$i <ButtonRelease-1> $cmd
+            # $cmd can carry a probed server's base_url/model verbatim (M5);
+            # a literal % in it would otherwise be %-substituted by bind.
+            bind $f.a$i <ButtonRelease-1> [string map {% %%} $cmd]
             grid $f.a$i -row $r -column 3 -sticky ne -padx {0 10} -pady 6
         }
         incr r

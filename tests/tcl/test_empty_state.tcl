@@ -40,10 +40,13 @@ test empty-card_fills_composer_never_sends {a card fills the composer and never 
         [winfo exists $t.empty]
 } -result [list "Show residues within 5 \u00c5 of the ligand as Licorice" 0 0 1]
 
+# M5: the "Use..." action script carries the probed base_url verbatim, and
+# %W (like any other %-sequence) in it must survive the round trip through
+# `bind` unmangled -- it is data, not a %W substitution.
 test empty-ready_group_first_run_servers {no model yet: the probe's servers are listed with Use...} -body {
     set info [dict create connected 1 endpoint 127.0.0.1:8765 provider "" model "" agent_loop false \
         folder /tmp/proj runs 1 first_run [dict create servers [list [dict create \
-            base_url http://127.0.0.1:11435 version 0.12.3 models {qwen3.8:27b llama3.2:3b}]]]]
+            base_url http://127.0.0.1:11435/%Wx version 0.12.3 models {qwen3.8:27b llama3.2:3b}]]]]
     set rows [::vmdai::transcript::empty_rows $info]
     ::harness::fresh_panel
     set t $::vmdai::panel::text
@@ -55,7 +58,7 @@ test empty-ready_group_first_run_servers {no model yet: the probe's servers are 
         [lindex $::harness::settings_opened end]
 } -result [list "running \u00b7 127.0.0.1:8765" "No model configured" "Set up\u2026" \
     "Found Ollama 0.12.3 at 127.0.0.1:11435 \u00b7 2 models" "/tmp/proj \u00b7 1 run recorded" \
-    [list model [dict create provider ollama base_url http://127.0.0.1:11435 model qwen3.8:27b]]]
+    [list model [dict create provider ollama base_url http://127.0.0.1:11435/%Wx model qwen3.8:27b]]]
 
 test empty-trust_row {the trust notice, title and key hints are shown} -body {
     ::harness::fresh_panel

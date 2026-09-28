@@ -154,6 +154,8 @@ proc ::vmdai::panel::dispose {} {
     foreach dialog {.vmd_ai_settings .vmd_ai_history} {
         if {[winfo exists $dialog]} { ::destroy $dialog }
     }
+    # The toolbar tooltip toplevel must not outlive the panel (M4).
+    catch {::destroy .vmd_ai_tip}
     if {![winfo exists $win]} { return }
     save_geometry
     ::destroy $win

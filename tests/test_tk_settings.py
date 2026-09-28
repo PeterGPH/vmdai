@@ -5,7 +5,7 @@ import pytest
 
 from helpers.tk_cases import assert_case, run_tk_file
 
-TOTAL = 10
+TOTAL = 11
 
 
 @pytest.fixture(scope="module")
@@ -39,6 +39,10 @@ def test_new_delete_profile(results):
 
 def test_no_keychain_message(results):
     assert_case(results, "settings-no_keychain_message", TOTAL)
+
+
+def test_key_test_rpc_error_vs_transport(results):
+    assert_case(results, "settings-key_test_rpc_error_vs_transport", TOTAL)
 
 
 def test_panel_prefs_saved(results):

@@ -148,6 +148,24 @@ test settings-no_keychain_message {no keychain backend: the Keys tab shows the s
 } -result [list "No keychain backend: set ANTHROPIC_API_KEY/OPENROUTER_API_KEY in the environment, or install `keyring`" \
     {} "Not set" 0]
 
+# M6: keys.test rpc_error means the runtime did answer, just with an error;
+# only a transport failure is really "did not answer".
+test settings-key_test_rpc_error_vs_transport {a keys.test rpc_error shows the runtime's message, not "did not answer"} -body {
+    ::harness::fresh_panel
+    ::fake::reply profiles.list ok $::PROFILES
+    ::fake::reply models.list ok $::MODELS
+    ::fake::reply settings.set ok {ok true settings {} persisted {reasoning_visible true wiki_enabled false}}
+    ::fake::reply keys.test rpc_error INVALID "not a valid key" {}
+    ::vmdai::settings::open keys
+    set k [::vmdai::settings::tab keys]
+    ::harness::wait_until {expr {[$k.src_anthropic cget -text] eq "Unknown: not a valid key"}}
+    set r [list [$k.src_anthropic cget -text]]
+    ::fake::reply keys.test transport timeout
+    ::vmdai::settings::_load_keys
+    ::harness::wait_until {expr {[$k.src_anthropic cget -text] eq "Unknown: the runtime did not answer"}}
+    lappend r [$k.src_anthropic cget -text]
+} -result {{Unknown: not a valid key} {Unknown: the runtime did not answer}}
+
 test settings-panel_prefs_saved {Panel prefs go to plugin.json, persisted keys to settings.set} -body {
     ::test::open_loaded panel
     ::harness::wait_until {expr {[dict size $::vmdai::settings::persisted] > 0}}

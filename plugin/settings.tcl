@@ -968,6 +968,12 @@ proc ::vmdai::settings::_on_key_test {id form args} {
     variable NO_KEYCHAIN_MESSAGE
     if {![winfo exists $win]} { return }
     set src [tab keys].src_$id
+    if {$form eq "rpc_error"} {
+        # The runtime did answer, just with an error (M6; distinct from a
+        # transport failure, which the message below still fits).
+        $src configure -text "Unknown: [lindex $args 1]"
+        return
+    }
     if {$form ne "ok"} {
         $src configure -text "Unknown: the runtime did not answer"
         return
