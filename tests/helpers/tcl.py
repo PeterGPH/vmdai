@@ -206,12 +206,17 @@ def run_tcl(
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(tcl_prelude(needs_http=needs_http, needs_json=needs_json))
             fh.write(script)
+        # Tk on aqua swaps stdout/stderr for console channels when stdin is a
+        # zero-length char device (/dev/null, which pytest's fd capture
+        # installs), which swallows every diagnostic; input="" gives the
+        # child a real (empty) stdin pipe instead.
         return subprocess.run(
             [tclsh, path],
             cwd=cwd or tmp,
             env=_merged_env(home, env),
             capture_output=True,
             text=True,
+            input="",
             timeout=timeout,
         )
 
@@ -250,12 +255,17 @@ def run_tcltest(
             fh.write("package require tcltest 2\n")
             fh.write(f"::tcltest::configure -outfile {tcl_word(outfile)} -verbose {{body error}}\n")
             fh.write(f"source {tcl_word(str(test_path))}\n")
+        # Tk on aqua swaps stdout/stderr for console channels when stdin is a
+        # zero-length char device (/dev/null, which pytest's fd capture
+        # installs), which swallows every diagnostic; input="" gives the
+        # child a real (empty) stdin pipe instead.
         proc = subprocess.run(
             [tclsh, driver],
             cwd=tmp,
             env=_merged_env(home, env),
             capture_output=True,
             text=True,
+            input="",
             timeout=timeout,
         )
         report = Path(outfile).read_text(encoding="utf-8") if os.path.exists(outfile) else ""
