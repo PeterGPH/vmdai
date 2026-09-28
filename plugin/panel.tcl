@@ -484,7 +484,7 @@ proc ::vmdai::panel::focus_prev {w} {
 proc ::vmdai::panel::copy_selection {} {
     variable text
     if {[catch {$text get -displaychars sel.first sel.last} s]} { return "" }
-    set s [string map [list "\t" "  "] $s]
+    set s [::vmdai::md::plain_text [string map [list "\t" "  "] $s]]
     _set_clipboard $s
     return $s
 }

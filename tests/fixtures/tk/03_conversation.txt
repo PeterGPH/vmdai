@@ -11,12 +11,12 @@ images 1
 012 detail dlast dlink link | Copy
 016 thumb | <card>
 017 rule | <rule>
-018 prose | Loaded **1hck** as a cartoon on a white background.
+018 md_b md_p prose | Loaded 1hck as a cartoon on a white background.
 019 footer link | Copy Tcl · Save .tcl…
 020 role rolemeta | You⇥12:00 AM
 021 user | what is its radius of gyration?
 022 chip chip_ok runhdr runmodel runsum | ChatVMD  qwen3.8:27b⇥✓  1 step · 8 s
 023 chev cmd extra g_ok meta row | ✓⇥… measure rgyr $sel  +1 lines  Radius of gyration of the protein.⇥→ 20.8431  0.5 s  ▸
 024 rule | <rule>
-025 prose | The radius of gyration is 20.84 Å.
+025 md_p prose | The radius of gyration is 20.84 Å.
 026 footer link | Copy Tcl · Save .tcl…

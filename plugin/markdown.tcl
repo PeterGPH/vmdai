@@ -98,3 +98,209 @@ proc ::vmdai::md::_flush {outVar paraVar} {
     lappend out [list para $raw [list inline [inline $raw]]]
     set para {}
 }
+
+# ---- Tk rendering (P10-T04) --------------------------------------------------
+# t is a writable text widget command.  In the transcript that is the real
+# widget behind the read-only proxy (a renamed command, not a window path);
+# _window_of finds the window for the width and the <Configure> binding.
+
+# configure_tags t: the md_* tags on text widget t (idempotent).  Colours are
+# theme tokens, so a dark/light switch retints them with everything else.
+proc ::vmdai::md::configure_tags {t} {
+    set C ::vmdai::theme::c
+    $t tag configure md_p -spacing3 8
+    $t tag configure md_li -lmargin1 0 -lmargin2 18 -tabs {18 left} -spacing3 4
+    $t tag configure md_marker -foreground [$C muted]
+    $t tag configure md_h1 -font ChatH2 -spacing1 12 -spacing3 6
+    $t tag configure md_h2 -font ChatH2 -spacing1 8 -spacing3 4
+    $t tag configure md_b -font ChatBodyBold
+    $t tag configure md_code -font ChatCode -background [$C icode_bg]
+    $t tag configure md_codehdr -font ChatMeta -foreground [$C muted] \
+        -background [$C code_bg] -lmargin1 12 -lmargin2 12 -spacing1 8 -spacing3 2
+    $t tag configure md_copy -foreground [$C accent]
+    $t tag configure md_pre -font ChatCode -background [$C code_bg] \
+        -lmargin1 12 -lmargin2 12 -rmargin 12
+    $t tag configure md_pretail -background [$C code_bg] -spacing3 8
+    catch {
+        foreach tag {md_codehdr md_pre md_pretail} {
+            $t tag configure $tag -lmargincolor [$C code_bg] -rmargincolor [$C code_bg]
+        }
+    }
+    foreach tag {md_code md_b md_h1 md_h2 md_marker md_copy} {
+        $t tag raise $tag
+    }
+    catch {$t tag raise sel}
+    $t tag bind md_copy <Enter> {%W configure -cursor hand2}
+    $t tag bind md_copy <Leave> {%W configure -cursor {}}
+    $t tag bind md_copy <1> {::vmdai::md::copy_at %W @%x,%y}
+    set w [_window_of $t]
+    if {$w ne ""} {
+        if {[string first ::vmdai::md::retab [bind $w <Configure>]] < 0} {
+            bind $w <Configure> {+::vmdai::md::retab %W}
+        }
+        retab $w
+    }
+}
+
+# retab w: right-align each code header's "Copy" at the content edge of
+# text window w (a window path; tag configure passes through the proxy).
+proc ::vmdai::md::retab {w} {
+    if {[catch {winfo width $w} px]} {
+        return
+    }
+    set px [expr {$px - 2 * [$w cget -padx] - 2}]
+    if {$px < 100} {
+        set px 480
+    }
+    $w tag configure md_codehdr -tabs [list [expr {$px - 12}] right]
+}
+
+# _window_of t -> the window path of text widget command t, or "".  A
+# renamed widget command is matched to its window by a probe mark, which the
+# window path (the read-only proxy passes "mark names" through) also sees.
+proc ::vmdai::md::_window_of {t} {
+    variable win
+    if {[winfo exists $t]} {
+        return $t
+    }
+    if {[info exists win($t)] && [winfo exists $win($t)]} {
+        return $win($t)
+    }
+    set probe md_probe[incr ::vmdai::md::seq]
+    if {[catch {$t mark set $probe 1.0}]} {
+        return ""
+    }
+    set found ""
+    foreach w [_text_windows .] {
+        if {![catch {$w mark names} marks] && [lsearch -exact $marks $probe] >= 0} {
+            set found $w
+            break
+        }
+    }
+    $t mark unset $probe
+    set win($t) $found
+    return $found
+}
+
+proc ::vmdai::md::_text_windows {w} {
+    set out {}
+    if {[winfo class $w] eq "Text"} {
+        lappend out $w
+    }
+    foreach c [winfo children $w] {
+        set out [concat $out [_text_windows $c]]
+    }
+    return $out
+}
+
+# render_into t index text ?basetags?: insert the Markdown rendering of text
+# into writable text widget command t at index.  Every inserted character also
+# carries basetags.  Adds no trailing newline, so it can replace a plain
+# "$t insert $index $text $basetags".  Returns the index after the insertion.
+proc ::vmdai::md::render_into {t index text {basetags {}}} {
+    configure_tags $t
+    # A mark at "end" would sit after the widget's final newline; insert
+    # before it instead, as "$t insert end" does.
+    set index [$t index $index]
+    if {[$t compare $index > "end - 1c"]} {
+        set index [$t index "end - 1c"]
+    }
+    set mark md_ins[incr ::vmdai::md::seq]
+    $t mark set $mark $index
+    $t mark gravity $mark right
+    set prev ""
+    foreach span [spans $text] {
+        foreach {kind body attrs} $span break
+        if {$prev eq "code"} {
+            # The newline after a code block carries its tint to the edge.
+            $t insert $mark "\n" [concat $basetags md_pretail]
+        } elseif {$prev ne ""} {
+            $t insert $mark "\n" $basetags
+        }
+        set prev $kind
+        set lstart [$t index "$mark linestart"]
+        switch -- $kind {
+            para {
+                _inline $t $mark [dict get $attrs inline] $basetags
+                $t tag add md_p $lstart $mark
+            }
+            heading {
+                _inline $t $mark [dict get $attrs inline] $basetags
+                $t tag add md_h[dict get $attrs level] $lstart $mark
+            }
+            item {
+                $t insert $mark "[dict get $attrs marker]\t" [concat $basetags md_marker]
+                _inline $t $mark [dict get $attrs inline] $basetags
+                $t tag add md_li $lstart $mark
+            }
+            code {
+                _code_block $t $mark $body [dict get $attrs lang] $basetags
+            }
+        }
+    }
+    set end [$t index $mark]
+    $t mark unset $mark
+    if {$prev eq "code" && [$t get $end] eq "\n"} {
+        $t tag add md_pretail $end "$end + 1c"
+    }
+    return $end
+}
+
+proc ::vmdai::md::_inline {t mark inl tags} {
+    foreach sp $inl {
+        foreach {k s} $sp break
+        switch -- $k {
+            bold {
+                $t insert $mark $s [concat $tags md_b]
+            }
+            code {
+                # NBSP: Tk never wraps at U+00A0, so the span stays on one
+                # display line (Part B V1, prototypes/lead/nbsp.tcl).
+                $t insert $mark [string map [list " " "\u00a0"] $s] [concat $tags md_code]
+            }
+            default {
+                $t insert $mark $s $tags
+            }
+        }
+    }
+}
+
+proc ::vmdai::md::_code_block {t mark body lang tags} {
+    set label [expr {$lang eq "" ? "code" : $lang}]
+    set hdr [concat $tags md_codehdr]
+    $t insert $mark $label $hdr "\t" $hdr "Copy" [concat $hdr md_copy] "\n" $hdr
+    set start [$t index $mark]
+    $t insert $mark $body [concat $tags md_pre]
+    if {[string tolower $lang] eq "tcl"} {
+        ::vmdai::syntax::highlight $t $start $body
+        ::vmdai::theme::syntax_tags $t
+    }
+}
+
+# copy_at w index: copy the code block whose header line holds index.
+proc ::vmdai::md::copy_at {w index} {
+    set next [$w index "$index linestart + 1 line"]
+    set r [$w tag nextrange md_pre $next]
+    if {$r eq "" || [$w compare [lindex $r 0] != $next]} {
+        return
+    }
+    copy [$w get [lindex $r 0] [lindex $r 1]]
+}
+
+# copy code: put code on the clipboard, through the panel's clipboard seam
+# when it is loaded (the Tk tests stub it, so they never touch the real
+# pasteboard); plain Tk clipboard otherwise.
+proc ::vmdai::md::copy {code} {
+    if {[llength [info commands ::vmdai::panel::_set_clipboard]]
+            && ![catch {::vmdai::panel::_set_clipboard $code}]} {
+        return
+    }
+    clipboard clear
+    clipboard append -- $code
+}
+
+# plain_text s -> s with the NBSPs of rendered inline code turned back into
+# spaces, for anything that copies transcript text to the clipboard.
+proc ::vmdai::md::plain_text {s} {
+    return [string map [list "\u00a0" " "] $s]
+}

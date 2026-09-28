@@ -21,6 +21,7 @@
 # here so every file that sources transcript.tcl gets it; syntax.tcl is safe
 # to source again.
 source [file join [file dirname [info script]] syntax.tcl]
+source [file join [file dirname [info script]] markdown.tcl]
 
 namespace eval ::vmdai::transcript {
     variable W
@@ -224,7 +225,7 @@ proc ::vmdai::transcript::op_block.seal {b canonical} {
     $W delete $at "[lindex $r end] -1c"
     set text [string trimright $canonical "\n"]
     set tags $B($b,tags)
-    $W insert $at $text $tags
+    ::vmdai::md::render_into $W $at $text $tags
     set B($b,sealed) 1
 }
 
