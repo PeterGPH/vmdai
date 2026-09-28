@@ -765,7 +765,7 @@ proc ::vmdai::vm::stop_requested {stateVar} {
 }
 
 # ---- M3 (plan 10, P10-T05): the run footer's usage line ----------------------
-# usage_text usage -> "20.1k evaluated · 640 out" (Part B V4 Run footer).
+# usage_text usage -> "20.1k evaluated \u00b7 640 out" (Part B V4 Run footer).
 # usage is request.finished.usage: a dict whose values may be null (json
 # "null") or missing, or null/absent as a whole.  An unreported figure is left
 # out, never shown as 0; "" means "no usage line".  The input figure is
@@ -782,7 +782,7 @@ proc ::vmdai::vm::usage_text {usage} {
         }
         lappend parts "[_count $v] $label"
     }
-    return [join $parts " · "]
+    return [join $parts " \u00b7 "]
 }
 
 # _count n -> 640, 5k, 20.1k, 1.2M

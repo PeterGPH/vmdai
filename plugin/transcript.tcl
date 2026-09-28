@@ -789,7 +789,7 @@ proc ::vmdai::transcript::op_run.close {run status steps failed recovered durati
     _render_header $run
 }
 
-# The footer (Part B V4): "Copy Tcl · Save .tcl…" once the run applied at
+# The footer (Part B V4): "Copy Tcl \u00b7 Save .tcl\u2026" once the run applied at
 # least one statement, then (M3) the muted usage line whenever the run
 # reported usage, even when it applied nothing (loop_guard's stuck run).
 proc ::vmdai::transcript::op_footer {run applied usage_text} {
@@ -2198,7 +2198,7 @@ proc ::vmdai::transcript::reasoning_reset {{t ""}} {
 }
 
 # ---- M3 (plan 10, P10-T05): the run footer's usage line ----------------------
-# usage_line W at run text: a muted, right-aligned "20.1k evaluated · 640 out"
+# usage_line W at run text: a muted, right-aligned "20.1k evaluated \u00b7 640 out"
 # line under the run footer (Part B V4); "" inserts nothing.  W is the
 # writable widget command the footer branch inserts with.
 proc ::vmdai::transcript::usage_line {W at run text} {
