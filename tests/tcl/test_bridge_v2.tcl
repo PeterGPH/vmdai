@@ -5,23 +5,6 @@
 source [file join $env(VMDAI_REPO) tests tcl panel_harness.tcl]
 source [file join $env(VMDAI_PLUGIN_DIR) ui.tcl]
 ::harness::stub_desktop
-# This file is the first to drive two separate async round-trips on the same
-# nested, withdrawn panel toplevel (start_session, then a second RPC): under
-# this Tk, a bare `update` issued after the panel has already had one real
-# update+redraw pass hangs (a withdrawn-toplevel redraw reentrancy quirk that
-# no other plan-08/09 Tk test hits, since each of those touches a fresh panel
-# only once per test). vwait pumps the same event loop without triggering it;
-# this shadows panel_harness.tcl's definition for this file's process only.
-proc ::harness::wait_until {script {ms 2000}} {
-    set deadline [expr {[clock milliseconds] + $ms}]
-    while {![uplevel #0 $script]} {
-        if {[clock milliseconds] > $deadline} { return 0 }
-        set ::harness::_wait_tick 0
-        after 10 {set ::harness::_wait_tick 1}
-        vwait ::harness::_wait_tick
-    }
-    return 1
-}
 proc ::vmdai::runtime::state {} { return $::harness::runtime_state }
 proc ::vmdai::runtime::info {} {
     return [dict create host 127.0.0.1 port 18765 pid 4242 version 0.3.0 protocol 2 \

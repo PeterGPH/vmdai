@@ -34,6 +34,7 @@ namespace eval ::harness {
     variable opened {}
     variable flashes {}
     variable settings_opened {}
+    variable bgerrors {}
 }
 foreach ::harness::module $::harness::modules {
     set ::harness::path [file join $::harness::plugin $::harness::module.tcl]
@@ -116,18 +117,33 @@ proc ::fake::has_param {params name} {
 }
 
 # ---- event loop and bindings ---------------------------------------------
-proc ::harness::settle {} {
-    update
+# A bare `update` spins at 100% CPU under VMD's aqua Tk 8.6.12 in one case: a
+# never-mapped withdrawn toplevel (the panel, in every Tk test here) whose
+# transcript changes again after it has already had one `update` pass. `after
+# <ms> {...}; vwait` pumps the same event loop without hitting that
+# reentrancy quirk (I4).
+proc ::harness::_pump {ms} {
+    set ::harness::_tick 0
+    set id [after $ms {set ::harness::_tick 1}]
+    vwait ::harness::_tick
+    after cancel $id
     update idletasks
 }
+proc ::harness::settle {} { ::harness::_pump 5 }
 proc ::harness::wait_until {script {ms 2000}} {
     set deadline [expr {[clock milliseconds] + $ms}]
     while {![uplevel #0 $script]} {
         if {[clock milliseconds] > $deadline} { return 0 }
-        after 10
-        update
+        ::harness::_pump 10
     }
     return 1
+}
+# Without this, a background error (e.g. a fake-transport callback raising
+# inside `after 0`) pops aqua's modal bgerror dialog and the file hangs for
+# the full tcltest timeout (M3).
+proc ::bgerror {message} {
+    lappend ::harness::bgerrors $message
+    puts stderr "background error: $message\n$::errorInfo"
 }
 # Run the bindings for `seq` on `w` through its bindtags, with %W
 # substituted, stopping at `break`, as Tk does for a real event.
@@ -200,7 +216,7 @@ proc ::harness::stub_bridge {} {
         return [dict create session_id sess_harness chat_id "" busy $::harness::busy \
             request_id $rid after_seq 0 epoch 1]
     }
-    proc ::vmdai::bridge::send {text} { lappend ::harness::bridge_calls [list send $text] }
+    proc ::vmdai::bridge::send {text} { lappend ::harness::bridge_calls [list send $text]; return 1 }
     proc ::vmdai::bridge::cancel {args} { lappend ::harness::bridge_calls [list cancel] }
     proc ::vmdai::bridge::new_chat {args} { lappend ::harness::bridge_calls [list new_chat] }
     proc ::vmdai::bridge::apply_workdir {dir} { lappend ::harness::bridge_calls [list apply_workdir $dir] }
