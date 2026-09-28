@@ -8,7 +8,7 @@ The M3 exit criterion (spec Part A §8) is a visual review of the real panel aga
 
 | Field | Value |
 |---|---|
-| Plugin commit | 168bf33 |
+| Plugin commit | 345fefd |
 | Captured on | 2026-09-28 |
 | macOS and Tk | macOS 14.4.1, Tk 8.6.12 (VMD.app's bundled framework) |
 | System appearance while capturing | Light (each state forces its own window's appearance; the desktop's own appearance never matters) |
@@ -42,7 +42,7 @@ The Native prototype predates the grafts and the spec's required fixes (Part B V
 | A4 | The failed row's error line sits directly under it in `err`, visible without a click, also in the collapsed run 1 | V1, V4 Collapse | pass |
 | A5 | Sealed prose is Markdown: `1hck` bold, `display backgroundcolor` as tinted inline code on one line; no `**` and no backticks | V4 Markdown | fixed in 168bf33: the inline-code tint no longer fills the paragraph's 8 px gap band (was a 24 px slab); `1hck` bold and no literal `**`/backticks were already correct. This state's own final answer ("Loaded **1hck** as a cartoon on a white background.") has no inline code — the `display backgroundcolor` narration is folded into collapsed run 1's hidden work log here, so the tinted inline code itself is visible in `C_midrun.png`, not in this state; verified there (see C's note and the graft row below). |
 | A6 | The snapshot thumbnail is cropped of its border, fits 256 × 192 and is not cropped to fill; the caption is difference 7 | V4 Snapshot card | pass |
-| A7 | A hairline rule before each final answer; footer and usage line right-aligned and muted | V4 Prose, Run footer | pass |
+| A7 | A hairline rule before each final answer; footer and usage line right-aligned and muted | V4 Prose, Run footer | fixed in 85a81fa: the footer's Copy Tcl / Save .tcl links draw in accent again (a step detail's syntax colouring raised every muted tag, burying link under footer) |
 | A8 | Composer: rounded field, accent focus ring, the two-line draft; Send is the default button | V4 Composer | pass |
 | A9 | Status bar: `●` in `ok`, provider · model · host:port on the left; `Auto-run Tcl ▾ │ ~/proj/cdk2 · N runs` on the right | V4 Status bar | fixed in c86d2af: the right segment keeps its 14 px pad when idle |
 | A10 | Chrome, surface, hairline and accent match `A_light.png` region by region | V2 | pass |
@@ -64,7 +64,7 @@ The Native prototype predates the grafts and the spec's required fixes (Part B V
 |---|---|---|---|
 | C1 | Status bar: a spinner, `Step 3 · running VMD command · 00:1x`, and `Esc to stop` on the right | V4 Status bar | pass |
 | C2 | The running row shows the spinner and `running…` | V4 Tool rows | pass |
-| C3 | Step 1's detail: a `code_bg` block indented 24 with `-lmargincolor`; the rationale muted; the exact command bytes with syntax colours; the `→` output; `Copy` | V4 Step detail | pass |
+| C3 | Step 1's detail: a `code_bg` block indented 24 with `-lmargincolor`; the rationale muted; the exact command bytes with syntax colours; the `→` output; `Copy` | V4 Step detail | fixed in 85a81fa: the failing statement's ✗ gutter is err again (was faint) |
 | C4 | Composer: the busy placeholder "Reply once this run finishes — or press Esc to stop" and the Stop pill in the Send cell | V4 Composer | pass |
 | C5 | New chat and History are disabled | V4 Toolbar | pass |
 | C6 | The run header's chips show the steps so far (`✓ ✗ •`) | V4 Run header | pass |
@@ -82,7 +82,7 @@ The Native prototype predates the grafts and the spec's required fixes (Part B V
 | D3 | The Ready group with row dividers: Runtime, Model (Change), Folder (Change), and the trust row "Model-written Tcl runs unsandboxed in this VMD session. Only load files you trust." | V4 Empty state | pass |
 | D4 | The key hints row `⏎ send · ⇧⏎ newline · ↑ last prompt · esc stop` | V4 Empty state | pass |
 | D5 | Composer placeholder "Ask VMD to load, show or measure something…"; toolbar title "New chat" | V4 Composer | pass |
-| D6 | In column mode (transcript < 520 px, e.g. a 420 px window) and in pair mode below about 650 px of height, the Ready group, trust row and key hints stay reachable (the overlay scrolls or the cards compact); parked from plan 09 T02 | V4 Empty state | fixed in 1bba8df: `layout_empty_state` now also reads the transcript's real height, tightening mark/ready/keys spacing and hiding the lead line below 650 px, and (in column mode) hiding each card's description line too. Verified at 560×600 (fully reachable) and 420×300 (Runtime/Model/Folder/trust group all reachable; only the trust row's wrapped 2nd line and the key hints can still run past the bottom edge). None of the 7 committed states are this short, so `D_empty.png` (560×780) is pixel-identical before/after. A fully guaranteed fix at the panel's documented minimum size (`wm minsize` 380×420) needs a scrollable overlay (embedding it in the transcript `Text` as a window, which already has a scrollbar and the `CVScroll` wheel bindtag for exactly this) — left for round 2 as a bigger, riskier change than this review's scope. |
+| D6 | In column mode (transcript < 520 px, e.g. a 420 px window) and in pair mode below about 650 px of height, the Ready group, trust row and key hints stay reachable (the overlay scrolls or the cards compact); parked from plan 09 T02 | V4 Empty state | partly fixed in 1bba8df: `layout_empty_state` now also reads the transcript's real height, tightening mark/ready/keys spacing and hiding the lead line below 650 px, and (in column mode) hiding each card's description line too. Verified at 560×600 (fully reachable) and 420×300 (Runtime/Model/Folder/trust group all reachable). None of the 7 committed states are this short, so `D_empty.png` (560×780) is pixel-identical before/after; residual at the documented `wm minsize` 380×420 (the trust row's second line and the key hints can run past the bottom edge) → round 2 (needs a scrollable overlay, embedding the empty state in the transcript `Text` as a window, which already has a scrollbar and the `CVScroll` wheel bindtag for exactly this) |
 
 ## E — Settings (`E_settings.png`)
 
@@ -102,7 +102,7 @@ The Native prototype predates the grafts and the spec's required fixes (Part B V
 |---|---|---|---|
 | F1 | Narrow class: `-padx 14`, prose wraps, nothing scrolls sideways | V6 | pass |
 | F2 | Rows stay one line; long commands end in an ellipsis and never drop below 12 characters | V6 Row refit | pass (this fixture's commands are all short enough not to need eliding at 466 px; the row-refit mechanism itself is unchanged M2/M3 code, exercised at forcing widths by `tests/tcl/test_tool_rows.tcl`) |
-| F3 | The run header drops the model name first | V6 Run header | pass (`ChatVMD qwen3.8:27b … ✓ 1 step · 8 s` already fits at 466 px in this fixture, so dropping never triggers here; the refit itself — "drop the model name, then shorten…" — is `plugin/transcript.tcl`'s header-refit code, exercised at forcing widths elsewhere) |
+| F3 | The run header drops the model name first; the chips stay | V6 Run header | pass (`ChatVMD qwen3.8:27b … ✓ 1 step · 8 s` already fits at 466 px in this fixture, so dropping never triggers here; the refit itself — "drop the model name, then shorten…" — is `plugin/transcript.tcl`'s header-refit code, exercised at forcing widths elsewhere) |
 | F4 | The snapshot caption stacks under the image | V4 Snapshot card, V6 | pass |
 | F5 | Status segments drop in the order host, run count, folder, provider; `Auto-run ▾` stays | V4 Status bar | fixed in c86d2af: the right segment keeps its 14 px pad when idle. This is the exact narrow state the finding named (466 px, where the missing pad let the window corner clip the "s" of "runs"); the drop-order mechanism itself is unchanged (both status segments already fit at 466 px in this fixture without dropping) and is exercised directly by `tests/tcl/test_statusbar_banner.tcl`. |
 | F6 | Inline code never breaks across lines | V4 Markdown, V8 | pass |
@@ -112,7 +112,7 @@ The Native prototype predates the grafts and the spec's required fixes (Part B V
 | # | Check | Spec | Result |
 |---|---|---|---|
 | G1 | The banner in slot 2: `warn_bg`, the warning triangle, bold "Runtime not reachable", a detail line with host:port and a countdown, pill buttons Retry now and Open log | V4 Banner | pass |
-| G2 | One timeline note "Connection lost at … · your draft is kept", centred and muted | V4 Timeline notes | pass |
+| G2 | One timeline note "Connection lost at … · your draft is kept", centred and muted | V4 Timeline notes | pass. Warn-level notes are muted by design since 85a81fa (V4 "centred and muted") |
 | G3 | The status bar shows the reconnecting state with the dot in `warn`, and no "tunnel" | V4 Status bar | pass |
 | G4 | Send is disabled while the banner shows; the draft is kept | V4 Banner | pass |
 
@@ -121,7 +121,7 @@ The Native prototype predates the grafts and the spec's required fixes (Part B V
 | Graft | Seen in | Result |
 |---|---|---|
 | Paint registry (console `theme::paint/repaint`) | B: every colour switched, including the native controls | pass |
-| Tcl syntax colours (console `syntax::tokens`) | C: step 1's detail; B: the same in dark | pass |
+| Tcl syntax colours (console `syntax::tokens`) | C: step 1's detail; B: the same in dark | fixed in 85a81fa: the syn_* colours themselves were always right, but the same `theme::syntax_tags` call also raised every other muted/faint tag in the widget, burying the failure gutter and the footer/note links under their muted base tags whenever a detail or tcl block rendered (see A7, C3) |
 | Snapshot card (console `snap::autocrop/thumb/card`) | A, F | pass |
 | Status bar fitting (console `ui::status_fit`) | F | pass (mechanism `::vmdai::statusbar::_fit`; this fixture's segments already fit at 466 px, so dropping isn't visible in `F_narrow.png` itself — see F5) |
 | Width classes (console `wide`/`narrow` elide tags) | F | pass |
@@ -134,18 +134,18 @@ The Native prototype predates the grafts and the spec's required fixes (Part B V
 
 | # | Criterion | Measured by | Result |
 |---|---|---|---|
-| S1 | A follow-up sees prior turns, tool blocks included | pytest (the 2nd `chat.send`'s prior) in `tests` | pass (tests: 1356 passed, 5 skipped, 10 subtests passed in 46.04 s) |
-| S2 | No transcript glue | Tk goldens `03_conversation`, `reasoning_answer` and the P10-T06 goldens | pass (tests: 1356 passed, 5 skipped, 10 subtests passed in 46.04 s) |
-| S3 | Kill or restart: at most 1 notice per state change, recovery within 10 s | tclsh bridge test in `tests` | pass (tests: 1356 passed, 5 skipped, 10 subtests passed in 46.04 s) |
-| S4 | Close/reopen and reload repeat cleanly; SIGTERM exit within 2 s | pytest SIGTERM test and tclsh registry test in `tests` | pass (tests: 1356 passed, 5 skipped, 10 subtests passed in 46.04 s) |
+| S1 | A follow-up sees prior turns, tool blocks included | pytest (the 2nd `chat.send`'s prior) in `tests` | pass (tests: 1359 passed, 5 skipped, 10 subtests passed in 45.89 s) |
+| S2 | No transcript glue | Tk goldens `03_conversation`, `reasoning_answer` and the P10-T06 goldens | pass (tests: 1359 passed, 5 skipped, 10 subtests passed in 45.89 s) |
+| S3 | Kill or restart: at most 1 notice per state change, recovery within 10 s | tclsh bridge test in `tests` | pass (tests: 1359 passed, 5 skipped, 10 subtests passed in 45.89 s) |
+| S4 | Close/reopen and reload repeat cleanly; SIGTERM exit within 2 s | pytest SIGTERM test and tclsh registry test in `tests` | pass (tests: 1359 passed, 5 skipped, 10 subtests passed in 45.89 s) |
 | S5 | Ollama `qwen3.8:27b` sees snapshots | `tests/test_live_ollama.py` against the live server | pass (tests/test_live_ollama.py: 2 passed, 2026-09-28) |
-| S6 | An unreachable Ollama fails within 3 s with the right hint | socket tests in `tests` | pass (tests: 1356 passed, 5 skipped, 10 subtests passed in 46.04 s) |
-| S7 | No benchmark-visible change with `options=None` | golden requests, retry pin, bridge guard, hashes in `tests` | pass (tests: 1356 passed, 5 skipped, 10 subtests passed in 46.04 s) |
-| S8 | Å, → and ° round-trip | tclsh 8.6 with http 2.9.5 in `tests` | pass (tests: 1356 passed, 5 skipped, 10 subtests passed in 46.04 s) |
-| S9 | Suite green, hermetic, under 60 s | `env -u VMD_AI_PROVIDER python -m pytest tests -q` | pass (1356 passed, 5 skipped, 10 subtests passed in 46.04 s, well under 60 s) |
-| S10 | `save_path` writes a real file; `puts` output reaches the model | executor tests in `tests` | pass (tests: 1356 passed, 5 skipped, 10 subtests passed in 46.04 s) |
-| S11 | Foreign Host or Origin rejected; privileged RPCs need the token | security tests in `tests` | pass (tests: 1356 passed, 5 skipped, 10 subtests passed in 46.04 s) |
-| S12 | A ```` ```tcl ```` block in prose runs nothing | pytest (no `tool_start`) in `tests` | pass (tests: 1356 passed, 5 skipped, 10 subtests passed in 46.04 s) |
+| S6 | An unreachable Ollama fails within 3 s with the right hint | socket tests in `tests` | pass (tests: 1359 passed, 5 skipped, 10 subtests passed in 45.89 s) |
+| S7 | No benchmark-visible change with `options=None` | golden requests, retry pin, bridge guard, hashes in `tests` | pass (tests: 1359 passed, 5 skipped, 10 subtests passed in 45.89 s) |
+| S8 | Å, → and ° round-trip | tclsh 8.6 with http 2.9.5 in `tests` | pass (tests: 1359 passed, 5 skipped, 10 subtests passed in 45.89 s) |
+| S9 | Suite green, hermetic, under 60 s | `env -u VMD_AI_PROVIDER python -m pytest tests -q` | pass (1359 passed, 5 skipped, 10 subtests passed in 45.89 s, well under 60 s) |
+| S10 | `save_path` writes a real file; `puts` output reaches the model | executor tests in `tests` | pass (tests: 1359 passed, 5 skipped, 10 subtests passed in 45.89 s) |
+| S11 | Foreign Host or Origin rejected; privileged RPCs need the token | security tests in `tests` | pass (tests: 1359 passed, 5 skipped, 10 subtests passed in 45.89 s) |
+| S12 | A ```` ```tcl ```` block in prose runs nothing | pytest (no `tool_start`) in `tests` | pass (tests: 1359 passed, 5 skipped, 10 subtests passed in 45.89 s) |
 | V | Visual review A–G with the grafts | this file | pass (every A–G and graft row is `pass` or `fixed in <sha>`; D6 is `fixed in 1bba8df` with a documented residual limit at the panel's minimum size, left for round 2; A9/F5 are `fixed in c86d2af` (status bar right pad) and A5/the NBSP graft row are `fixed in 168bf33` (inline-code tint), both recaptured) |
 | — | `vmdbench` 90 passed; `explore_arm` + `scivisagentbench` 62 passed; no runtime, integrations, vmdbench or scripts change in M3 | the Step 6 commands | pass (90 / 62 / no diff — `python -m pytest vmdbench/tests -q`: 90 passed in 13.00 s; `python -m pytest integrations/explore_arm/tests integrations/scivisagentbench -q`: 62 passed in 1.15 s; `git diff main --stat -- runtime/ integrations/ vmdbench/ scripts/` printed nothing; `perl -ne '...' plugin/syntax.tcl plugin/markdown.tcl` printed nothing) |
 
