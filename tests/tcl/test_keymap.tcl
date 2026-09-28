@@ -79,4 +79,32 @@ test keys-tab_order {Tab: composer -> Send -> toolbar -> transcript, then back t
         [expr {[bind $first <Tab>] ne ""}]
 } -result {Text 1 TButton 1 1 1 1 1 1}
 
+# V5 sticky autoscroll (live-demo fix): _at_bottom answers 0 here, so every
+# gesture below ends "off the bottom" whatever the headless panel's view is.
+test keys-scroll_follow {PageUp/Mod-Up stop following; Mod-Down and an accepted send follow again} -setup {
+    ::harness::fresh_panel
+    rename ::vmdai::transcript::_at_bottom ::harness::real_at_bottom
+    proc ::vmdai::transcript::_at_bottom {args} { return 0 }
+} -body {
+    set ct [::vmdai::panel::composer_text]
+    set mod [::vmdai::panel::mod_key]
+    ::harness::fire $ct <Prior>
+    set r [list $::vmdai::transcript::S(follow)]
+    ::vmdai::transcript::apply_ops {{block.open x1 assistant 1} {block.append x1 "new output"}}
+    lappend r [::vmdai::transcript::pill_shown]
+    lappend r [::vmdai::panel::on_send "show it"] $::vmdai::transcript::S(follow) \
+        [::vmdai::transcript::pill_shown]
+    ::harness::fire $ct <$mod-Up>
+    lappend r $::vmdai::transcript::S(follow)
+    proc ::vmdai::bridge::send {text} { return 0 }
+    lappend r [::vmdai::panel::on_send "refused"] $::vmdai::transcript::S(follow)
+    ::vmdai::transcript::_pill 1
+    ::harness::fire $ct <$mod-Down>
+    lappend r $::vmdai::transcript::S(follow) [::vmdai::transcript::pill_shown]
+} -cleanup {
+    rename ::vmdai::transcript::_at_bottom {}
+    rename ::harness::real_at_bottom ::vmdai::transcript::_at_bottom
+    ::harness::stub_bridge
+} -result {0 1 1 1 0 0 0 0 1 0}
+
 cleanupTests

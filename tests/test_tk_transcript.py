@@ -18,6 +18,10 @@ TESTS = [
     "notice-1",
     "error-card-1",
     "sticky-autoscroll",
+    "follow-stale-fraction",
+    "follow-user-scroll",
+    "follow-end",
+    "follow-gesture-bottom",
     "non-bmp",
     "clear-1",
     "menu-prose",
@@ -58,6 +62,13 @@ def test_notes_and_error_cards(result):
 
 def test_sticky_autoscroll(result):
     assert_tcltests(result, ["sticky-autoscroll"])
+
+
+def test_follow_state(result):
+    """Live-demo fix: an explicit follow state, so a stale yview fraction
+    never parks the view; only a user scroll gesture stops following."""
+    assert_tcltests(result, ["follow-stale-fraction", "follow-user-scroll",
+                             "follow-end", "follow-gesture-bottom"])
 
 
 def test_non_bmp(result):

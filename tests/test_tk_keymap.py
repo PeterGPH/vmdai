@@ -5,7 +5,7 @@ import pytest
 
 from helpers.tk_cases import assert_case, run_tk_file
 
-TOTAL = 5
+TOTAL = 6
 
 
 @pytest.fixture(scope="module")
@@ -31,3 +31,9 @@ def test_up_down_history(results):
 
 def test_tab_order(results):
     assert_case(results, "keys-tab_order", TOTAL)
+
+
+def test_scroll_keys_and_send_follow(results):
+    """Live-demo fix: PageUp/Mod-Up stop following; Mod-Down and an
+    accepted send follow again (V5 sticky autoscroll)."""
+    assert_case(results, "keys-scroll_follow", TOTAL)

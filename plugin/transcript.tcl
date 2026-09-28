@@ -45,7 +45,7 @@ proc ::vmdai::transcript::_reset {} {
     variable B
     array unset S
     array set S {cur_run "" answer 0 lastw 0 relayout "" link 0 rules {} photos {}
-                 last_user "" flash "" tick "" errors 0 last_error ""}
+                 last_user "" flash "" tick "" errors 0 last_error "" follow 1}
     array unset B
     array set B {}
 }
@@ -70,7 +70,7 @@ proc ::vmdai::transcript::create {path} {
         -cursor arrow -exportselection 1 -undo 0 -takefocus 1 -insertwidth 0 \
         -width 10 -height 10 -font ChatBody \
         -yscrollcommand [list ::vmdai::transcript::_on_yview]
-    ttk::scrollbar $path.sb -orient vertical -command [list $T yview]
+    ttk::scrollbar $path.sb -orient vertical -command ::vmdai::transcript::user_scroll
     grid $T -row 0 -column 0 -sticky nsew
     grid $path.sb -row 0 -column 1 -sticky ns
     grid columnconfigure $path 0 -weight 1
@@ -95,6 +95,13 @@ proc ::vmdai::transcript::create {path} {
         bind $T $seq [list ::vmdai::transcript::_context %x %y %X %Y]
     }
     bind ChatVMDScroll <MouseWheel> {::vmdai::transcript::_wheel %D}
+    # After the Text class binding has scrolled (wheel) or moved the view
+    # (navigation keys in the focused transcript), ChatVMDFollow decides
+    # whether the user left the bottom (V5 sticky autoscroll).
+    bindtags $T [linsert [bindtags $T] [expr {[lsearch -exact [bindtags $T] Text] + 1}] ChatVMDFollow]
+    set seqs {<MouseWheel> <Prior> <Next> <Up> <Down> <Home> <End>}
+    if {[tk windowingsystem] eq "x11"} { lappend seqs <Button-4> <Button-5> }
+    foreach seq $seqs { bind ChatVMDFollow $seq ::vmdai::transcript::user_scroll }
     return $T
 }
 
@@ -156,7 +163,7 @@ proc ::vmdai::transcript::apply_ops {ops} {
     variable W
     variable S
     if {$W eq "" || [info commands $W] eq ""} { return }
-    set bottom [_at_bottom]
+    set follow [_follows]
     set before [$W index "end -1c"]
     foreach op $ops {
         set name [lindex $op 0]
@@ -167,12 +174,7 @@ proc ::vmdai::transcript::apply_ops {ops} {
             catch {::vmdai::config::log "transcript: $name failed: $err"}
         }
     }
-    if {$bottom} {
-        $W see end
-        _pill 0
-    } elseif {[$W compare "end -1c" != $before]} {
-        _pill 1
-    }
+    _followed $follow [$W compare "end -1c" != $before]
 }
 
 # Blocks inside a run's work log get wl:$run (collapse, P08-T06); the
@@ -407,15 +409,69 @@ proc ::vmdai::transcript::_do_retry {} {
 
 # ---- scrolling: sticky autoscroll and the "↓ New output" pill (V5) --------------
 
+#
+# S(follow) is the follow state: 1 after create/clear, set to 0 only by a user
+# scroll gesture (user_scroll) that leaves the view off the bottom, and set to
+# 1 again by reaching the bottom (_on_yview, a gesture, the pill, follow_end).
+# An insert follows the end while S(follow) is set or the view is at the
+# bottom. The yview fraction alone is not enough: Tk 8.6 computes line
+# metrics lazily, so right after `see end` it can read < 0.999 on a long
+# transcript (embedded windows, a collapsed work log, a re-rendered seal)
+# although nobody scrolled; the view then stayed parked (live demo).
+
+# Does the view show the end? The fraction, or the last line on screen (a
+# display line, which does not depend on the lazily computed line metrics).
 proc ::vmdai::transcript::_at_bottom {} {
     variable W
-    return [expr {[lindex [$W yview] 1] >= 0.999}]
+    if {[lindex [$W yview] 1] >= 0.999} { return 1 }
+    return [expr {[llength [$W dlineinfo "end -1c"]] > 0}]
+}
+
+# Before an insert: will it follow the end? Every insert asks this.
+proc ::vmdai::transcript::_follows {} {
+    variable S
+    return [expr {$S(follow) || [_at_bottom]}]
+}
+
+# After an insert: follow the end, or show the pill if the insert added text.
+proc ::vmdai::transcript::_followed {follow grew} {
+    if {$follow} {
+        follow_end
+    } elseif {$grew} {
+        _pill 1
+    }
+}
+
+# Jump to the end and follow it again (a sent prompt, the pill, scroll to end).
+proc ::vmdai::transcript::follow_end {} {
+    variable W
+    variable S
+    if {$W eq "" || [info commands $W] eq ""} { return }
+    $W see end
+    set S(follow) 1
+    _pill 0
+}
+
+# user_scroll ?yview-args?: a user scroll gesture (the scrollbar's -command,
+# the wheel, scroll keys). Applies the yview args if any, then follows only
+# if the view is left at the bottom.
+proc ::vmdai::transcript::user_scroll {args} {
+    variable W
+    variable S
+    if {$W eq "" || [info commands $W] eq ""} { return }
+    if {[llength $args]} { $W yview {*}$args }
+    set S(follow) [_at_bottom]
+    if {$S(follow)} { _pill 0 }
 }
 
 proc ::vmdai::transcript::_on_yview {first last} {
     variable F
+    variable S
     if {[winfo exists $F.sb]} { $F.sb set $first $last }
-    if {$last >= 0.999} { _pill 0 }
+    if {$last >= 0.999} {
+        set S(follow) 1
+        _pill 0
+    }
 }
 
 proc ::vmdai::transcript::_draw_pill {} {
@@ -449,9 +505,7 @@ proc ::vmdai::transcript::pill_shown {} {
 }
 
 proc ::vmdai::transcript::_pill_clicked {} {
-    variable W
-    $W yview moveto 1.0
-    _pill 0
+    follow_end
 }
 
 # Embedded windows get the ChatVMDScroll bindtag, so the wheel keeps
@@ -465,9 +519,9 @@ proc ::vmdai::transcript::_wheel {delta} {
     variable W
     if {$W eq "" || [info commands $W] eq ""} { return }
     if {[tk windowingsystem] eq "aqua"} {
-        $W yview scroll [expr {-$delta}] units
+        user_scroll scroll [expr {-$delta}] units
     } else {
-        $W yview scroll [expr {-$delta / 120}] units
+        user_scroll scroll [expr {-$delta / 120}] units
     }
 }
 
@@ -519,6 +573,8 @@ proc ::vmdai::transcript::jump_to {k} {
         if {[string match wl:* $tag]} { _show_run [string range $tag 3 end] }
     }
     $W see [lindex $r 0]
+    # A jump is user navigation: it follows again only if it ends at the bottom.
+    user_scroll
     _flash $r
     return 1
 }
@@ -2129,7 +2185,7 @@ proc ::vmdai::transcript::reasoning_open {t b turn {live 1}} {
     variable reasoning_hidden
     _reasoning_tags $t
     set w [_rw $t]
-    set bottom [expr {[lindex [$t yview] 1] >= 0.999}]
+    set follow [_follows]
     if {[$w index "end -1c"] ne "1.0" && [$w get "end -2c"] ne "\n"} { $w insert end "\n" }
     set start [$w index "end -1c"]
     # Inside a run's work log the lines also carry wl:$run (plan 08's
@@ -2157,7 +2213,7 @@ proc ::vmdai::transcript::reasoning_open {t b turn {live 1}} {
         set R($b,timer) [::vmdai::sched::after 1000 [list ::vmdai::transcript::reasoning_tick $t $b]]
     }
     if {$reasoning_hidden} { $t tag raise reasoning }
-    if {$bottom} { $t see end }
+    _followed $follow 1
 }
 
 proc ::vmdai::transcript::reasoning_append {t b chunk} {

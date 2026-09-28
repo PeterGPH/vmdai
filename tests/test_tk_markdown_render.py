@@ -5,7 +5,7 @@ import pytest
 
 from helpers.tk_cases import assert_case, run_tk_file
 
-TOTAL = 10
+TOTAL = 11
 
 
 @pytest.fixture(scope="module")
@@ -51,3 +51,8 @@ def test_code_block_lines_tight(results):
 
 def test_inline_code_tint_hugs_line(results):
     assert_case(results, "md-icode-tint", TOTAL)
+
+
+def test_pipe_table_as_code_block(results):
+    """Live demo: a pipe table shows its lines in the code style (no renderer)."""
+    assert_case(results, "md-table", TOTAL)
