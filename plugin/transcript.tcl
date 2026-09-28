@@ -789,18 +789,20 @@ proc ::vmdai::transcript::op_run.close {run status steps failed recovered durati
     _render_header $run
 }
 
-# The footer appears once a run applied at least one statement; M2 prints
-# the links only (the usage line is plan 10's).
+# The footer (Part B V4): "Copy Tcl · Save .tcl…" once the run applied at
+# least one statement, then (M3) the muted usage line whenever the run
+# reported usage, even when it applied nothing (loop_guard's stuck run).
 proc ::vmdai::transcript::op_footer {run applied usage_text} {
     variable W
     variable RUN
-    if {![info exists RUN($run,req)] || ![string is integer -strict $applied] || $applied < 1} {
-        return
+    if {![info exists RUN($run,req)]} { return }
+    if {[string is integer -strict $applied] && $applied >= 1} {
+        set req $RUN($run,req)
+        set tags [list footer]
+        $W insert end "Copy Tcl" [concat $tags link [_link copy_run_tcl $req]] " · " $tags \
+            "Save .tcl…" [concat $tags link [_link save_run_tcl $req]] "\n" $tags
     }
-    set req $RUN($run,req)
-    set tags [list footer]
-    $W insert end "Copy Tcl" [concat $tags link [_link copy_run_tcl $req]] " · " $tags \
-        "Save .tcl…" [concat $tags link [_link save_run_tcl $req]] "\n" $tags
+    usage_line $W end $run $usage_text
 }
 
 # A run stays expanded while it runs, and when it ended with an error, stuck,
@@ -2193,4 +2195,18 @@ proc ::vmdai::transcript::reasoning_reset {{t ""}} {
     }
     array unset R
     array set R {}
+}
+
+# ---- M3 (plan 10, P10-T05): the run footer's usage line ----------------------
+# usage_line W at run text: a muted, right-aligned "20.1k evaluated · 640 out"
+# line under the run footer (Part B V4); "" inserts nothing.  W is the
+# writable widget command the footer branch inserts with.
+proc ::vmdai::transcript::usage_line {W at run text} {
+    if {$text eq ""} {
+        return
+    }
+    $W tag configure usage -font ChatMeta -foreground [::vmdai::theme::c muted] \
+        -justify right -spacing1 2 -spacing3 8
+    set tags [list usage usage:$run]
+    $W insert $at $text $tags "\n" $tags
 }

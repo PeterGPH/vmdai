@@ -28,6 +28,6 @@ block.discard b4
 rule r1
 block.open b5 assistant 2
 block.seal b5 "Done: 1hck is loaded."
-footer r1 1 ""
+footer r1 1 "10.3k evaluated · 42 out"
 run.close r1 complete 1 0 0 10 0 28
 status idle

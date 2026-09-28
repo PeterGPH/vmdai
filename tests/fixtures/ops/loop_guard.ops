@@ -77,5 +77,6 @@ rule r1
 block.open b4 assistant 5
 block.seal b4 "I could not color by residue type: VMD rejected `mol modcolor 0 top ResidueType` four times, so the scene is unchanged. The coloring method is called `ResType`; try `mol modcolor 0 top ResType`."
 notice warn "Stopped: the model kept repeating the same step"
+footer r1 0 "21.6k evaluated · 108 out"
 run.close r1 stuck 4 4 0 32 0 28
 status idle
