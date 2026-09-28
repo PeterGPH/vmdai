@@ -227,6 +227,13 @@ proc ::vmdai::panel::render {ops} {
                     _sync_composer
                 }
             }
+            reasoning.open - reasoning.append - reasoning.seal {
+                if {[llength $batch]} {
+                    _apply_transcript $batch
+                    set batch {}
+                }
+                _apply_reasoning $op
+            }
             default { lappend batch $op }
         }
     }
@@ -601,6 +608,7 @@ proc ::vmdai::panel::reset_view {} {
     set stopping 0
     ::vmdai::transcript::hide_empty_state
     ::vmdai::transcript::clear
+    ::vmdai::transcript::reasoning_reset $::vmdai::panel::text
     ::vmdai::vm::init ::vmdai::panel::vm
     ::vmdai::tclexport::reset
     array unset ::vmdai::panel::commands
@@ -649,6 +657,7 @@ proc ::vmdai::panel::on_session_started {result} {
     variable win
     if {![winfo exists $win]} { return }
     refresh_info
+    _load_persisted
 }
 
 proc ::vmdai::panel::_on_info {form args} {
@@ -707,5 +716,48 @@ proc ::vmdai::panel::on_runtime_state {old new detail} {
     _update_status
     if {$new eq "ready" && $old ne "ready" && [winfo exists $::vmdai::settings::win]} {
         ::vmdai::settings::reload
+    }
+}
+
+# ---- reasoning (P09-T08) --------------------------------------------------------
+
+namespace eval ::vmdai::panel {
+    if {![info exists ::vmdai::panel::reasoning_visible]} { variable reasoning_visible 1 }
+}
+
+proc ::vmdai::panel::_apply_reasoning {op} {
+    variable text
+    variable has_content
+    variable replaying
+    set has_content 1
+    ::vmdai::transcript::hide_empty_state
+    lassign $op name b arg
+    switch -- $name {
+        reasoning.open   { ::vmdai::transcript::reasoning_open $text $b $arg [expr {!$replaying}] }
+        reasoning.append { ::vmdai::transcript::reasoning_append $text $b $arg }
+        reasoning.seal   { ::vmdai::transcript::reasoning_seal $text $b $arg }
+    }
+}
+
+proc ::vmdai::panel::set_reasoning_visible {on} {
+    variable reasoning_visible
+    variable text
+    set reasoning_visible [expr {$on ? 1 : 0}]
+    if {$text ne "" && [winfo exists $text]} {
+        ::vmdai::transcript::set_reasoning_visible $text $reasoning_visible
+    }
+}
+
+# An empty settings.set patch returns the persisted settings without writing.
+proc ::vmdai::panel::_load_persisted {} {
+    ::vmdai::net::call settings.set [list patch j "{}"] [list ::vmdai::panel::_on_persisted]
+}
+
+proc ::vmdai::panel::_on_persisted {form args} {
+    if {$form ne "ok"} { return }
+    set persisted {}
+    catch {set persisted [dict get [lindex $args 0] persisted]}
+    if {[dict exists $persisted reasoning_visible]} {
+        set_reasoning_visible [string is true -strict [dict get $persisted reasoning_visible]]
     }
 }

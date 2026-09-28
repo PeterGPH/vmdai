@@ -1031,7 +1031,7 @@ proc ::vmdai::settings::_after_key {id rest k form args} {
 
 namespace eval ::vmdai::settings {
     # settings.json key -> form field, for the persisted toggles.
-    variable PERSISTED_FIELDS {wiki_enabled wiki}
+    variable PERSISTED_FIELDS {wiki_enabled wiki reasoning_visible reasoning}
     if {![info exists ::vmdai::settings::persisted]} { variable persisted {} }
 }
 
@@ -1063,7 +1063,8 @@ proc ::vmdai::settings::_build_panel {p} {
     ttk::label $p.tcl_l -text "Tcl execution"
     ttk::label $p.tcl -text "Auto-run (model-written Tcl runs without asking)" -foreground $muted
     ttk::button $p.log -text "Open log" -command ::vmdai::panel::open_log
-    # Row 1 is left for "Show model reasoning" (P09-T08).
+    ttk::checkbutton $p.reasoning -text "Show model reasoning" -variable ::vmdai::settings::v(reasoning)
+    grid $p.reasoning -row 1 -column 1 -columnspan 2 -sticky w -pady 4
     grid $p.appearance_l -row 0 -column 0 -sticky e -padx {0 10} -pady 4
     grid $p.appearance   -row 0 -column 1 -sticky w -pady 4
     grid $p.expand       -row 2 -column 1 -columnspan 2 -sticky w -pady 4
@@ -1166,6 +1167,8 @@ proc ::vmdai::settings::_after_persisted {k form args} {
         return
     }
     catch {set persisted [dict get [lindex $args 0] persisted]}
+    variable v
+    if {[info exists v(reasoning)]} { ::vmdai::panel::set_reasoning_visible $v(reasoning) }
     {*}$k
 }
 

@@ -2037,3 +2037,151 @@ proc ::vmdai::transcript::_empty_ready {f info} {
     }
     grid columnconfigure $f 2 -weight 1
 }
+
+# ===========================================================================
+# Reasoning display (Part B V4 "Reasoning"; P09-T08).
+#
+# While a turn streams, its reasoning is one muted italic line
+# "Thinking... 00:03" that ticks every second; the text itself is collected,
+# hidden, underneath. Sealed, the line becomes "Thought for 3 s >" and a
+# click expands the muted, indented text. Reasoning is always its own
+# lines, so it never shares a block with the answer. The tag `reasoning`
+# covers every reasoning line, so set_reasoning_visible hides them all.
+#
+# Writes go through a hidden peer of the transcript text: the read-only
+# proxy (Part B V4) rejects insert/delete but passes `peer`, and a peer
+# shares the text, tags and marks.
+# ===========================================================================
+namespace eval ::vmdai::transcript {
+    if {![array exists ::vmdai::transcript::R]} {
+        variable R
+        array set R {}
+    }
+    if {![info exists ::vmdai::transcript::reasoning_hidden]} { variable reasoning_hidden 0 }
+}
+
+proc ::vmdai::transcript::_rw {t} {
+    set peer $t.__rw
+    if {![winfo exists $peer]} { $t peer create $peer }
+    return $peer
+}
+
+proc ::vmdai::transcript::_reasoning_tags {t} {
+    set C ::vmdai::theme::c
+    if {[lsearch -exact [font names] ChatMetaItal] < 0} {
+        font create ChatMetaItal {*}[font actual ChatMeta] -slant italic
+    }
+    $t tag configure rhead -font ChatMetaItal -foreground [$C muted] -spacing1 6 -spacing3 4
+    $t tag configure rbody -font ChatMeta -foreground [$C muted] -lmargin1 24 -lmargin2 24 -spacing3 6
+}
+
+proc ::vmdai::transcript::reasoning_open {t b turn {live 1}} {
+    variable R
+    variable reasoning_hidden
+    _reasoning_tags $t
+    set w [_rw $t]
+    set bottom [expr {[lindex [$t yview] 1] >= 0.999}]
+    if {[$w index "end -1c"] ne "1.0" && [$w get "end -2c"] ne "\n"} { $w insert end "\n" }
+    set start [$w index "end -1c"]
+    # Inside a run's work log the lines also carry wl:$run (plan 08's
+    # _wl), so the run's collapse hides its reasoning with its rows.
+    set wl {}
+    catch {set wl [_wl]}
+    set head_tags [concat reasoning rhead rhead:$b $wl]
+    set body_tags [concat reasoning rbody rbody:$b $wl]
+    $w insert end "Thinking\u2026 00:00" $head_tags "\n" $head_tags
+    $w mark set rs:$b $start
+    $w mark gravity rs:$b left
+    $w mark set re:$b "$start lineend"
+    $w mark gravity re:$b right
+    set body [$w index "end -1c"]
+    $w insert end "\n" $body_tags
+    $w mark set rb:$b $body
+    $w mark gravity rb:$b right
+    $t tag configure rbody:$b -elide 1
+    $t tag bind rhead:$b <ButtonRelease-1> [list ::vmdai::transcript::reasoning_toggle $t $b]
+    $t tag bind rhead:$b <Enter> [list $t configure -cursor hand2]
+    $t tag bind rhead:$b <Leave> [list $t configure -cursor arrow]
+    array set R [list $b,t0 [clock seconds] $b,sealed 0 $b,open 0 $b,secs 0 $b,timer "" \
+        $b,head $head_tags $b,body $body_tags]
+    if {$live} {
+        set R($b,timer) [::vmdai::sched::after 1000 [list ::vmdai::transcript::reasoning_tick $t $b]]
+    }
+    if {$reasoning_hidden} { $t tag raise reasoning }
+    if {$bottom} { $t see end }
+}
+
+proc ::vmdai::transcript::reasoning_append {t b chunk} {
+    variable R
+    if {![info exists R($b,t0)]} { return }
+    [_rw $t] insert rb:$b $chunk $R($b,body)
+}
+
+proc ::vmdai::transcript::reasoning_seal {t b duration_s} {
+    variable R
+    if {![info exists R($b,t0)]} { return }
+    if {$R($b,timer) ne ""} {
+        ::vmdai::sched::cancel $R($b,timer)
+        set R($b,timer) ""
+    }
+    set secs 1
+    if {[string is double -strict $duration_s]} { set secs [expr {int(round($duration_s))}] }
+    if {$secs < 1} { set secs 1 }
+    set R($b,secs) $secs
+    set R($b,sealed) 1
+    _set_head $t $b [_sealed_head $b]
+}
+
+proc ::vmdai::transcript::reasoning_tick {t b {now ""}} {
+    variable R
+    if {![info exists R($b,t0)] || $R($b,sealed) || ![winfo exists $t]} { return }
+    if {$R($b,timer) ne ""} { ::vmdai::sched::cancel $R($b,timer) }
+    if {$now eq ""} { set now [clock seconds] }
+    set s [expr {$now - $R($b,t0)}]
+    if {$s < 0} { set s 0 }
+    _set_head $t $b [format "Thinking\u2026 %02d:%02d" [expr {$s / 60}] [expr {$s % 60}]]
+    set R($b,timer) [::vmdai::sched::after 1000 [list ::vmdai::transcript::reasoning_tick $t $b]]
+}
+
+proc ::vmdai::transcript::reasoning_toggle {t b} {
+    variable R
+    if {![info exists R($b,sealed)] || !$R($b,sealed)} { return }
+    set R($b,open) [expr {!$R($b,open)}]
+    # Open: stop specifying -elide (not 0), so a collapsed run's wl:$run still hides it.
+    $t tag configure rbody:$b -elide [expr {$R($b,open) ? "" : 1}]
+    _set_head $t $b [_sealed_head $b]
+}
+
+proc ::vmdai::transcript::_sealed_head {b} {
+    variable R
+    return "Thought for $R($b,secs) s [expr {$R($b,open) ? "\u25be" : "\u25b8"}]"
+}
+
+proc ::vmdai::transcript::_set_head {t b label} {
+    variable R
+    set w [_rw $t]
+    $w delete rs:$b re:$b
+    $w insert rs:$b $label $R($b,head)
+}
+
+# Hidden: `reasoning` elides and outranks the per-block tags. Shown: it
+# stops specifying -elide, so each block's own collapsed/expanded state holds.
+proc ::vmdai::transcript::set_reasoning_visible {t on} {
+    variable reasoning_hidden
+    set reasoning_hidden [expr {$on ? 0 : 1}]
+    if {$on} {
+        $t tag configure reasoning -elide ""
+    } else {
+        $t tag configure reasoning -elide 1
+        $t tag raise reasoning
+    }
+}
+
+proc ::vmdai::transcript::reasoning_reset {{t ""}} {
+    variable R
+    foreach key [array names R *,timer] {
+        if {$R($key) ne ""} { ::vmdai::sched::cancel $R($key) }
+    }
+    array unset R
+    array set R {}
+}
