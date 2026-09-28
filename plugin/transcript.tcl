@@ -1912,6 +1912,13 @@ proc ::vmdai::transcript::layout_empty_state {width {t ""}} {
         grid columnconfigure $cards 1 -weight 0 -uniform ""
     }
     [_empty_path $t].col.lead configure -wraplength [expr {$inner < 480 ? $inner : 480}]
+    set wrap [expr {$inner - 170}]
+    if {$wrap > 300} { set wrap 300 }
+    if {$wrap < 120} { set wrap 120 }
+    set ready [_empty_path $t].col.ready
+    for {set i 0} {[winfo exists $ready.v$i]} {incr i} {
+        $ready.v$i configure -wraplength $wrap
+    }
     return [expr {$pair ? "pair" : "column"}]
 }
 
@@ -1924,7 +1931,12 @@ proc ::vmdai::transcript::_empty_configure {t width} {
 proc ::vmdai::transcript::_empty_relayout {t width} {
     variable empty_after
     set empty_after ""
-    layout_empty_state $width $t
+    if {![winfo exists $t]} { return "" }
+    # %w is the overlay's width: place -in $t sizes it to the text's inner
+    # area, 2 x (padx + borderwidth + highlightthickness) narrower than the
+    # transcript. The layout thresholds are in transcript width.
+    set width [expr {$width + 2 * ([$t cget -padx] + [$t cget -borderwidth] + [$t cget -highlightthickness])}]
+    return [layout_empty_state $width $t]
 }
 
 proc ::vmdai::transcript::example_clicked {index} {

@@ -22,7 +22,13 @@ test empty-cards_2x2_or_column {four cards: 2x2 from 520 px, one column below} -
         lappend r [dict get [grid info $cards.c$i] -row] [dict get [grid info $cards.c$i] -column]
     }
     lappend r [$cards.c0.title cget -text] [$cards.c3.title cget -text]
-} -result {pair 0 0 0 1 1 0 1 1 column 0 0 1 0 2 0 3 0 {Load & style} {Trajectory RMSD}}
+    lappend r [$t.empty.col.ready.v0 cget -wraplength]
+    ::vmdai::transcript::layout_empty_state 560 $t
+    lappend r [$t.empty.col.ready.v0 cget -wraplength]
+    # <Configure> reports the overlay's width (the text's inner area): 505 is
+    # the overlay at the default 560 px window, 470 one below the threshold.
+    lappend r [::vmdai::transcript::_empty_relayout $t 505] [::vmdai::transcript::_empty_relayout $t 470]
+} -result {pair 0 0 0 1 1 0 1 1 column 0 0 1 0 2 0 3 0 {Load & style} {Trajectory RMSD} 246 300 pair column}
 
 test empty-card_fills_composer_never_sends {a card fills the composer and never sends} -body {
     ::harness::fresh_panel
