@@ -215,5 +215,30 @@ test banner_kinds_actions {each kind has its title, detail and actions; the coun
     lappend r [llength [::vmdai::sched::pending]]
 } -result {{127.0.0.1:8765 is not answering. Retrying in 1 s.} {127.0.0.1:8765 is not answering. Retrying now…} {127.0.0.1:8765 is not answering. Retrying now…} {{Retry now} {Open log}} {127.0.0.1:8765 is not answering. Retrying in 1 s.} {Runtime didn't start} {ModuleNotFoundError: No module named 'x'} {Retry {Choose Python…} {Open log}} {} {Hide details} {pipe line 9} {pipe line 20} {Log: /Users/me/.vmdai/logs/plugin.log} {This runtime is too old (protocol 1)} {{Restart runtime}} {} 1 4 0 {retry_now open_log retry choose_python open_log restart} 0}
 
+proc pad_gap {} {
+    set w [winfo width .sb]
+    set maxedge 0
+    foreach child {.sb.trust .sb.sep .sb.folder .sb.hint} {
+        if {[winfo manager $child] eq ""} { continue }
+        set edge [expr {[winfo x $child] + [winfo width $child]}]
+        if {$edge > $maxedge} { set maxedge $edge }
+    }
+    return [expr {$w - $maxedge}]
+}
+
+test status_right_pad {the status bar's right segment keeps its 14 px pad when idle and busy} -body {
+    fresh
+    sb connection ready provider ollama model qwen3.8:27b host 127.0.0.1:11435 \
+        folder /tmp/proj/cdk2 runs 3 busy 0
+    ::vmdai::statusbar::_render
+    update idletasks
+    set idle [pad_gap]
+    sb busy 1 activity "Step 3"
+    ::vmdai::statusbar::_render
+    update idletasks
+    set busy [pad_gap]
+    list $idle $busy
+} -result {14 14}
+
 cleanupTests
 exit

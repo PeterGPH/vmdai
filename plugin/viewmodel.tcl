@@ -459,15 +459,15 @@ proc ::vmdai::vm::_on_turn_started {sv md ts} {
     return [_phase S "Thinking" $ts]
 }
 
-proc ::vmdai::vm::_close_run {sv req status final_text_empty duration_s} {
+proc ::vmdai::vm::_close_run {sv req status final_text_empty duration_s {usage_text ""}} {
     upvar 1 $sv S
     set run [dict get $S runs $req]
     dict set S runs $req status $status
     set failed [dict get $run failed]
     set recovered [expr {$failed > 0 && [dict get $run last_tcl] eq "ok" && $status ne "error"}]
     set ops {}
-    if {[dict get $run applied] > 0} {
-        lappend ops [list footer [dict get $run id] [dict get $run applied] ""]
+    if {[dict get $run applied] > 0 || $usage_text ne ""} {
+        lappend ops [list footer [dict get $run id] [dict get $run applied] $usage_text]
     }
     lappend ops [list run.close [dict get $run id] $status [dict get $run steps] $failed \
         $recovered $duration_s $final_text_empty [dict get $run max_turns]]
@@ -498,7 +498,7 @@ proc ::vmdai::vm::_on_request_finished {sv md ts} {
     set calls [_get $md tool_calls [dict get $S runs $req steps]]
     set ops [_finish_notes [dict get $S runs $req] $status $calls $empty \
         [_bool [_get $md wrapped_up false]] [_get $md error]]
-    lappend ops {*}[_close_run S $req $status $empty $secs]
+    lappend ops {*}[_close_run S $req $status $empty $secs [usage_text [_get $md usage]]]
     return $ops
 }
 
@@ -762,4 +762,41 @@ proc ::vmdai::vm::stop_requested {stateVar} {
     dict set S phase "Stopping…"
     dict set S phase_t0 ""
     return [list [list status busy "Stopping…" ""]]
+}
+
+# ---- M3 (plan 10, P10-T05): the run footer's usage line ----------------------
+# usage_text usage -> "20.1k evaluated \u00b7 640 out" (Part B V4 Run footer).
+# usage is request.finished.usage: a dict whose values may be null (json
+# "null") or missing, or null/absent as a whole.  An unreported figure is left
+# out, never shown as 0; "" means "no usage line".  The input figure is
+# Ollama's prompt_eval_count, which leaves out the cached prefix, so the line
+# says "evaluated" and is never labelled as the context (spec 2c).
+proc ::vmdai::vm::usage_text {usage} {
+    set parts {}
+    foreach {key label} {input_tokens_evaluated evaluated output_tokens out} {
+        if {[catch {dict get $usage $key} v]} {
+            continue
+        }
+        if {![string is wideinteger -strict $v] || $v < 0} {
+            continue
+        }
+        lappend parts "[_count $v] $label"
+    }
+    return [join $parts " \u00b7 "]
+}
+
+# _count n -> 640, 5k, 20.1k, 1.2M
+proc ::vmdai::vm::_count {n} {
+    if {$n < 1000} {
+        return $n
+    }
+    if {$n < 999950} {
+        set s [format %.1f [expr {$n / 1000.0}]]
+        set unit k
+    } else {
+        set s [format %.1f [expr {$n / 1000000.0}]]
+        set unit M
+    }
+    regsub {\.0$} $s {} s
+    return $s$unit
 }

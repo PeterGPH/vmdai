@@ -1,0 +1,12 @@
+images 0
+001 role rolemeta | You⇥12:00 AM
+002 user | load 1hck
+003 chip chip_ok runhdr runmodel runsum | ChatVMD  qwen3.8:27b⇥✓  1 step · 10 s
+004 md_p prose | Loading 1hck now.
+005 md_sp prose | 
+006 chev cmd extra g_ok meta row | ✓⇥mol new 1hck.pdb  Load it.⇥0.5 s  ▸
+007 rule | <rule>
+008 md_p prose | Done: 1hck is loaded.
+009 md_sp prose | 
+010 footer link | Copy Tcl · Save .tcl…
+011 usage | 10.3k evaluated · 42 out

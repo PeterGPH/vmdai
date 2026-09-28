@@ -40,6 +40,10 @@ foreach ::harness::module $::harness::modules {
     set ::harness::path [file join $::harness::plugin $::harness::module.tcl]
     if {[file exists $::harness::path]} { source -encoding utf-8 $::harness::path }
 }
+# M3 (plan 10): no test reads the real OS appearance. With a MacWindowStyle
+# command that does not exist, System resolves to light and Settings offers
+# only Light and Dark; M3 tests install ::m3::mws when they need one.
+set ::vmdai::theme::macstyle ::harness::no_macwindowstyle
 # namespace eval, not `set`: before P09-T01 creates panel.tcl the namespace
 # does not exist yet, and the fail-first run must reach the test bodies.
 namespace eval ::vmdai::panel { variable headless 1 }

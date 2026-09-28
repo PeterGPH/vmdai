@@ -16,6 +16,7 @@ TESTS = [
     "never_tunnel",
     "offline-1",
     "banner_kinds_actions",
+    "status_right_pad",
 ]
 
 
@@ -51,3 +52,7 @@ def test_never_tunnel(result):
 
 def test_banner_kinds_actions(result):
     assert_tcltests(result, ["banner_kinds_actions"])
+
+
+def test_status_right_pad(result):
+    assert_tcltests(result, ["status_right_pad"])

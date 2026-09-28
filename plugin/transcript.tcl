@@ -17,6 +17,12 @@
 # and it is never -state disabled. Every element ends with its own newline,
 # so prose, reasoning, notes and tool rows never share a line (S2).
 
+# M3 (plan 10): the step detail colours its command with syntax.tcl.  Sourced
+# here so every file that sources transcript.tcl gets it; syntax.tcl is safe
+# to source again.
+source [file join [file dirname [info script]] syntax.tcl]
+source [file join [file dirname [info script]] markdown.tcl]
+
 namespace eval ::vmdai::transcript {
     variable W
     if {![info exists W]} { set W "" }
@@ -122,7 +128,9 @@ proc ::vmdai::transcript::_tags {} {
         -lmargin1 24 -lmargin2 24 -spacing3 6
     $W tag configure note -font ChatMeta -foreground [$C muted] -justify center \
         -spacing1 12 -spacing3 4
-    $W tag configure notewarn -foreground [$C warn]
+    # Warn-level notes stay muted like every timeline note (V4 "Timeline
+    # notes": centred and muted); notewarn only marks them.
+    $W tag configure notewarn
     $W tag configure ecard -background [$C err_bg] -lmargin1 12 -lmargin2 12 -rmargin 12
     $W tag configure ecard_t -font ChatBodyBold -foreground [$C text] -spacing1 10
     $W tag configure ecard_x -foreground [$C err]
@@ -219,7 +227,7 @@ proc ::vmdai::transcript::op_block.seal {b canonical} {
     $W delete $at "[lindex $r end] -1c"
     set text [string trimright $canonical "\n"]
     set tags $B($b,tags)
-    $W insert $at $text $tags
+    ::vmdai::md::render_into $W $at $text $tags
     set B($b,sealed) 1
 }
 
@@ -783,18 +791,20 @@ proc ::vmdai::transcript::op_run.close {run status steps failed recovered durati
     _render_header $run
 }
 
-# The footer appears once a run applied at least one statement; M2 prints
-# the links only (the usage line is plan 10's).
+# The footer (Part B V4): "Copy Tcl \u00b7 Save .tcl\u2026" once the run applied at
+# least one statement, then (M3) the muted usage line whenever the run
+# reported usage, even when it applied nothing (loop_guard's stuck run).
 proc ::vmdai::transcript::op_footer {run applied usage_text} {
     variable W
     variable RUN
-    if {![info exists RUN($run,req)] || ![string is integer -strict $applied] || $applied < 1} {
-        return
+    if {![info exists RUN($run,req)]} { return }
+    if {[string is integer -strict $applied] && $applied >= 1} {
+        set req $RUN($run,req)
+        set tags [list footer]
+        $W insert end "Copy Tcl" [concat $tags link [_link copy_run_tcl $req]] " · " $tags \
+            "Save .tcl…" [concat $tags link [_link save_run_tcl $req]] "\n" $tags
     }
-    set req $RUN($run,req)
-    set tags [list footer]
-    $W insert end "Copy Tcl" [concat $tags link [_link copy_run_tcl $req]] " · " $tags \
-        "Save .tcl…" [concat $tags link [_link save_run_tcl $req]] "\n" $tags
+    usage_line $W end $run $usage_text
 }
 
 # A run stays expanded while it runs, and when it ended with an error, stuck,
@@ -1290,7 +1300,7 @@ proc ::vmdai::transcript::_build_detail {k} {
         }
         $W insert dins:$k {*}$gutter
         foreach {text class} $line {
-            if {$text ne ""} { $W insert dins:$k $text [concat $base dcode $class] }
+            if {$text ne ""} { $W insert dins:$k $text [concat $base dcode $class dcmd:$k] }
         }
         $W insert dins:$k "\n" $base
     }
@@ -1319,6 +1329,7 @@ proc ::vmdai::transcript::_build_detail {k} {
     $W insert dins:$k "Copy" [concat $base dlink link [_link copy_text $cmd]] "\n" $base
     $W tag add dfirst $first "$first lineend +1c"
     $W tag add dlast "dins:$k -1l linestart" dins:$k
+    ::vmdai::syntax::highlight_tag $W dcmd:$k
 }
 
 proc ::vmdai::transcript::_do_show_all {k} {
@@ -1746,6 +1757,12 @@ namespace eval ::vmdai::transcript {
         [list bfactor "Color by B-factor" "Color the protein by B-factor and render a snapshot"] \
         [list rmsd    "Trajectory RMSD"   "Measure the backbone RMSD over the loaded trajectory"]]
     variable PAIR_MIN_WIDTH 520
+    # Below this transcript height the Ready group, trust row and key hints
+    # can run off the bottom with no way to reach them (the overlay has no
+    # scrollbar of its own, spec D6): tighten row spacing and drop the lead
+    # line to buy back room. It is not a full fix at the panel's documented
+    # minimum size (wm minsize 380x420; P10-T07 visual review).
+    variable EMPTY_SHORT_H 650
     if {![info exists ::vmdai::transcript::empty_host]} { variable empty_host "" }
     if {![info exists ::vmdai::transcript::empty_after]} { variable empty_after "" }
 }
@@ -1885,12 +1902,26 @@ proc ::vmdai::transcript::empty_state_shown {{t ""}} {
     return [expr {$t ne "" && [winfo exists [_empty_path $t]]}]
 }
 
-# Two columns from PAIR_MIN_WIDTH px of transcript width, else one.
+# Two columns from PAIR_MIN_WIDTH px of transcript width, else one; below
+# EMPTY_SHORT_H px of transcript height, row spacing tightens and the lead
+# line hides so the Ready group/trust row/key hints stay reachable sooner.
 proc ::vmdai::transcript::layout_empty_state {width {t ""}} {
     variable PAIR_MIN_WIDTH
+    variable EMPTY_SHORT_H
     if {$t eq ""} { set t $::vmdai::panel::text }
-    set cards [_empty_path $t].col.cards
+    set col [_empty_path $t].col
+    set cards $col.cards
     if {![winfo exists $cards]} { return "" }
+    set h [winfo height $t]
+    set short [expr {$h > 1 && $h < $EMPTY_SHORT_H}]
+    grid $col.mark -pady [expr {$short ? {0 2} : {0 6}}]
+    if {$short} {
+        grid remove $col.lead
+    } else {
+        grid $col.lead
+    }
+    grid $col.ready -pady [expr {$short ? {8 0} : {16 0}}]
+    grid $col.keys -pady [expr {$short ? {6 0} : {12 0}}]
     set pair [expr {$width >= $PAIR_MIN_WIDTH}]
     set inner [expr {$width > 96 ? $width - 64 : 360}]
     set card_w [expr {$pair ? ($inner - 12) / 2 : $inner}]
@@ -1904,6 +1935,15 @@ proc ::vmdai::transcript::layout_empty_state {width {t ""}} {
             grid $c -row $i -column 0 -sticky ew -padx 6 -pady 6
         }
         $c.desc configure -wraplength [expr {$card_w - 48}]
+        # Column mode's four stacked cards are the tallest part of the
+        # overlay; drop each card's one-line description first (title and
+        # click-to-fill still work) so a short+narrow window has a chance of
+        # keeping the Ready group reachable without it.
+        if {$short && !$pair} {
+            grid remove $c.desc
+        } else {
+            grid $c.desc
+        }
     }
     grid columnconfigure $cards 0 -weight 1 -uniform card
     if {$pair} {
@@ -1911,11 +1951,11 @@ proc ::vmdai::transcript::layout_empty_state {width {t ""}} {
     } else {
         grid columnconfigure $cards 1 -weight 0 -uniform ""
     }
-    [_empty_path $t].col.lead configure -wraplength [expr {$inner < 480 ? $inner : 480}]
+    $col.lead configure -wraplength [expr {$inner < 480 ? $inner : 480}]
     set wrap [expr {$inner - 170}]
     if {$wrap > 300} { set wrap 300 }
     if {$wrap < 120} { set wrap 120 }
-    set ready [_empty_path $t].col.ready
+    set ready $col.ready
     for {set i 0} {[winfo exists $ready.v$i]} {incr i} {
         $ready.v$i configure -wraplength $wrap
     }
@@ -1998,9 +2038,16 @@ proc ::vmdai::transcript::_empty_card {c index key title prompt} {
     grid columnconfigure $c 1 -weight 1
     foreach w [list $c $c.icon $c.title $c.desc] {
         bind $w <ButtonRelease-1> [list ::vmdai::transcript::example_clicked $index]
-        bind $w <Enter> [list $c configure -highlightbackground $accent]
-        bind $w <Leave> [list $c configure -highlightbackground $hairline]
+        bind $w <Enter> [list ::vmdai::transcript::_empty_hover $c 1]
+        bind $w <Leave> [list ::vmdai::transcript::_empty_hover $c 0]
     }
+}
+
+# _empty_hover c on: a card's border colour, read from the theme when the
+# pointer moves, so a live appearance switch never brings back the old one.
+proc ::vmdai::transcript::_empty_hover {c on} {
+    if {![winfo exists $c]} { return }
+    $c configure -highlightbackground [::vmdai::theme::c [expr {$on ? "accent" : "hairline"}]]
 }
 
 proc ::vmdai::transcript::_empty_ready {f info} {
@@ -2186,4 +2233,18 @@ proc ::vmdai::transcript::reasoning_reset {{t ""}} {
     }
     array unset R
     array set R {}
+}
+
+# ---- M3 (plan 10, P10-T05): the run footer's usage line ----------------------
+# usage_line W at run text: a muted, right-aligned "20.1k evaluated \u00b7 640 out"
+# line under the run footer (Part B V4); "" inserts nothing.  W is the
+# writable widget command the footer branch inserts with.
+proc ::vmdai::transcript::usage_line {W at run text} {
+    if {$text eq ""} {
+        return
+    }
+    $W tag configure usage -font ChatMeta -foreground [::vmdai::theme::c muted] \
+        -justify right -spacing1 2 -spacing3 8
+    set tags [list usage usage:$run]
+    $W insert $at $text $tags "\n" $tags
 }

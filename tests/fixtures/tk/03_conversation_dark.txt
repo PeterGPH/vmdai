@@ -1,0 +1,95 @@
+images 1
+001 role rolemeta | You⇥12:00 AM
+002 user | load 1hck and show it as a cartoon
+003 chip chip_err chip_ok runhdr runmodel runsum | ChatVMD  qwen3.8:27b⇥✓ ✗ ✓ ✓  1 failed, recovered · 27 s
+013 chev cmd extra g_err meta row | ✗⇥display backgroundcolor white  +1 lines  Make the background white.⇥0.5 s  ▾
+014 errline | display: invalid option "backgroundcolor"
+015 detail dfirst dnote | Make the background white.
+016 dcode detail dgut syn_cmd |   color Display Background white
+017 dcode detail dfail dgut dgutx syn_cmd | ✗ display backgroundcolor white
+018 detail dnote | Statement 1 ran and is kept in Save .tcl; the rest is commented out
+019 detail dlast dlink link | Copy
+024 thumb | <card>
+025 rule | <rule>
+026 md_b md_p prose | Loaded 1hck as a cartoon on a white background.
+027 md_sp prose | 
+028 footer link | Copy Tcl · Save .tcl…
+029 usage | 28.4k evaluated · 188 out
+030 role rolemeta | You⇥12:00 AM
+031 user | what is its radius of gyration?
+032 chip chip_ok runhdr runmodel runsum | ChatVMD  qwen3.8:27b⇥✓  1 step · 8 s
+033 chev cmd extra g_ok meta row | ✓⇥… measure rgyr $sel  +1 lines⇥→ 20.8431  0.5 s  ▸
+034 rule | <rule>
+035 md_p prose | The radius of gyration is 20.84 Å.
+036 md_sp prose | 
+037 footer link | Copy Tcl · Save .tcl…
+038 usage | 13.9k evaluated · 49 out
+# tag colours
+chev -foreground #9a9aa1
+chip_err -foreground #ff6b64
+chip_notrun -foreground #9a9aa1
+chip_ok -foreground #3bd16f
+chip_running -foreground #9a9aa1
+chip_warn -foreground #e6aa3f
+cmd -foreground #c9c9ce
+detail -foreground #e6e6eb
+detail -background #28282b
+detail -lmargincolor #28282b
+dfail -background #3a1f1e
+dfail -lmargincolor #3a1f1e
+dgut -foreground #5f5f65
+dgutx -foreground #ff6b64
+dmuted -foreground #9a9aa1
+dnote -foreground #9a9aa1
+dout -foreground #9a9aa1
+ecard -background #3a1f1e
+ecard -lmargincolor #3a1f1e
+ecard -rmargincolor #3a1f1e
+ecard_c -foreground #e6e6eb
+ecard_h -foreground #9a9aa1
+ecard_t -foreground #e6e6eb
+ecard_x -foreground #ff6b64
+errline -foreground #ff6b64
+extra -foreground #9a9aa1
+flash -background #29292c
+footer -foreground #9a9aa1
+g_err -foreground #ff6b64
+g_no -foreground #9a9aa1
+g_ok -foreground #3bd16f
+g_run -foreground #9a9aa1
+g_warn -foreground #e6aa3f
+link -foreground #4ea1ff
+md_code -background #313135
+md_codehdr -foreground #9a9aa1
+md_codehdr -background #28282b
+md_codehdr -lmargincolor #28282b
+md_codehdr -rmargincolor #28282b
+md_copy -foreground #4ea1ff
+md_marker -foreground #9a9aa1
+md_pre -background #28282b
+md_pre -lmargincolor #28282b
+md_pre -rmargincolor #28282b
+md_pretail -background #28282b
+md_pretail -lmargincolor #28282b
+md_pretail -rmargincolor #28282b
+meta -foreground #9a9aa1
+note -foreground #9a9aa1
+preview -foreground #9a9aa1
+prose -foreground #e6e6eb
+role -foreground #e6e6eb
+rolemeta -foreground #9a9aa1
+runhdr -foreground #e6e6eb
+runmodel -foreground #9a9aa1
+runsum -foreground #9a9aa1
+snapcmd -foreground #e6e6eb
+syn_brace -foreground #e3b341
+syn_cmd -foreground #79c0ff
+syn_cmt -foreground #8b949e
+syn_num -foreground #d2a8ff
+syn_opt -foreground #c3cad3
+syn_str -foreground #a5d6ff
+syn_var -foreground #ffa657
+think -foreground #9a9aa1
+thinkbody -foreground #9a9aa1
+usage -foreground #9a9aa1
+user -foreground #e6e6eb

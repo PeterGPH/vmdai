@@ -89,6 +89,7 @@ proc ::vmdai::panel::build {{w ""}} {
     if {$w ne ""} { set win $w }
     if {[winfo exists $win]} { return $win }
     ::vmdai::theme::init
+    ::vmdai::theme::set_appearance [::vmdai::theme::saved_appearance]
     toplevel $win
     wm withdraw $win
     $win configure -background [::vmdai::theme::c chrome]
@@ -483,7 +484,7 @@ proc ::vmdai::panel::focus_prev {w} {
 proc ::vmdai::panel::copy_selection {} {
     variable text
     if {[catch {$text get -displaychars sel.first sel.last} s]} { return "" }
-    set s [string map [list "\t" "  "] $s]
+    set s [::vmdai::md::plain_text [string map [list "\t" "  "] $s]]
     _set_clipboard $s
     return $s
 }

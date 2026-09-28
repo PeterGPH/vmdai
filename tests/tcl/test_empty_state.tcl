@@ -1,5 +1,6 @@
 # P09-T02: the empty state (Part B V4 "Empty state").
 source [file join $env(VMDAI_REPO) tests tcl panel_harness.tcl]
+source [file join $env(VMDAI_REPO) tests tcl m3_helpers.tcl]
 ::harness::stub_bridge
 ::harness::stub_desktop
 ::harness::stub_settings_open
@@ -79,5 +80,28 @@ test empty-hide {hide_empty_state removes the overlay} -body {
     ::vmdai::transcript::hide_empty_state $t
     list $before [::vmdai::transcript::empty_state_shown $t] [winfo exists $t.empty]
 } -result {1 0 0}
+
+# D6 (P10-T07 visual review): below EMPTY_SHORT_H the Ready group, trust row
+# and key hints can otherwise run off the bottom of the overlay, which has
+# no scrollbar of its own; a real "." (real size while withdrawn, unlike a
+# child toplevel) stands in for the panel's transcript at two sizes.
+test empty-short_height_compacts {a short transcript hides the lead line, tightens spacing, and (in column mode) drops card descriptions} -body {
+    set t [::m3::root_transcript 560x780]
+    ::vmdai::transcript::show_empty_state $::INFO $t
+    ::vmdai::transcript::layout_empty_state 560 $t
+    set r [list [winfo height $t]]
+    lappend r [expr {[grid info $t.empty.col.lead] ne ""}]
+    lappend r [dict get [grid info $t.empty.col.ready] -pady]
+    lappend r [expr {[grid info $t.empty.col.cards.c0.desc] ne ""}]
+
+    set t2 [::m3::root_transcript 420x300]
+    ::vmdai::transcript::show_empty_state $::INFO $t2
+    ::vmdai::transcript::layout_empty_state 420 $t2
+    lappend r [winfo height $t2]
+    lappend r [expr {[grid info $t2.empty.col.lead] ne ""}]
+    lappend r [dict get [grid info $t2.empty.col.ready] -pady]
+    lappend r [expr {[grid info $t2.empty.col.cards.c0.desc] ne ""}]
+    set r
+} -result {780 1 {16 0} 1 300 0 {8 0} 0}
 
 cleanupTests

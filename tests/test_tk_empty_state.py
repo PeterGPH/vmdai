@@ -5,7 +5,7 @@ import pytest
 
 from helpers.tk_cases import assert_case, run_tk_file
 
-TOTAL = 5
+TOTAL = 6
 
 
 @pytest.fixture(scope="module")
@@ -31,3 +31,7 @@ def test_trust_row(results):
 
 def test_hide(results):
     assert_case(results, "empty-hide", TOTAL)
+
+
+def test_short_height_compacts(results):
+    assert_case(results, "empty-short_height_compacts", TOTAL)

@@ -68,7 +68,7 @@ block.discard b4
 rule r1
 block.open b5 assistant 5
 block.seal b5 "Loaded **1hck** as a cartoon on a white background."
-footer r1 6 ""
+footer r1 6 "28.4k evaluated · 188 out"
 run.close r1 complete 4 1 1 27 0 28
 status idle
 block.open b6 user 0 1790208028
@@ -94,6 +94,6 @@ block.discard b7
 rule r2
 block.open b8 assistant 2
 block.seal b8 "The radius of gyration is 20.84 Å."
-footer r2 2 ""
+footer r2 2 "13.9k evaluated · 49 out"
 run.close r2 complete 1 0 0 8 0 28
 status idle

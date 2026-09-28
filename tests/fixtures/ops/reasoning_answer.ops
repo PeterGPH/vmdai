@@ -45,6 +45,6 @@ block.discard b4
 rule r1
 block.open b5 assistant 2
 block.seal b5 "1hck has 2442 atoms."
-footer r1 2 ""
+footer r1 2 "10.4k evaluated · 70 out"
 run.close r1 complete 1 0 0 19 0 28
 status idle
