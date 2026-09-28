@@ -209,4 +209,20 @@ test exec-snap-2 {a render error posts ok false with the message} -setup fresh -
     pick [lindex $::posts 0 1] ok error
 } -cleanup { rename ::render {}; rename ::render_ok ::render } -result {false {Snapshot failed: Tachyon failed}}
 
+test exec-unknown-1 {VMD runs with tcl_interactive 1: a statement never reaches unknown's abbreviation or auto-exec paths, and the flag is restored} -setup fresh -body {
+    proc ::zz_probe_target {args} { set ::zz_called 1 }
+    set ::zz_called 0
+    set saved_script [info script]
+    set saved_interactive $::tcl_interactive
+    # As in VMD: an interactive interpreter, no script being sourced.
+    set ::tcl_interactive 1
+    info script ""
+    set r1 [::vmdai::executor::exec_command "zz_probe"]
+    set r2 [::vmdai::executor::exec_command "true"]
+    set after_flag $::tcl_interactive
+    info script $saved_script
+    set ::tcl_interactive $saved_interactive
+    list [pick $r1 ok error] $::zz_called [pick $r2 ok error] $after_flag
+} -cleanup { rename ::zz_probe_target {} } -result {{0 {invalid command name "zz_probe"}} 0 {0 {invalid command name "true"}} 1}
+
 cleanupTests

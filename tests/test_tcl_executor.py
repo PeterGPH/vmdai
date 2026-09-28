@@ -12,7 +12,7 @@ import pytest
 from helpers.tcl import REPO, TclTestResult, module_result, module_run, run_tcltest
 
 TCL_FILE = REPO / "tests" / "tcl" / "test_executor.tcl"
-TOTAL = 16
+TOTAL = 17
 
 
 @module_run
@@ -77,3 +77,7 @@ def test_approval_ask_posts_no_without_ack(result):
 
 def test_snapshot_tachyon_to_snapshot_path(result):
     _assert_passed(result, ["exec-snap-1", "exec-snap-2"])
+
+
+def test_statements_bypass_interactive_unknown(result):
+    _assert_passed(result, ["exec-unknown-1"])

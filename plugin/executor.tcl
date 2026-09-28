@@ -242,6 +242,12 @@ proc ::vmdai::executor::exec_command {command} {
         dict set result error "Could not capture the command's output: $err"
         return $result
     }
+    # VMD runs its interpreter with tcl_interactive 1, which makes `unknown`
+    # expand abbreviations (zoom -> zoomseq_tk) and run unknown words as
+    # shell programs, past the runtime's exec guard. Model statements run
+    # with it off, so an unknown word fails as "invalid command name".
+    set interactive [expr {[info exists ::tcl_interactive] ? $::tcl_interactive : ""}]
+    set ::tcl_interactive 0
     set rc [catch {
         foreach span $spans {
             set statement [string range $command [lindex $span 0] [lindex $span 1]]
@@ -265,6 +271,7 @@ proc ::vmdai::executor::exec_command {command} {
             break
         }
     } err]
+    if {$interactive eq ""} { unset -nocomplain ::tcl_interactive } else { set ::tcl_interactive $interactive }
     _restore_puts
     set executing 0
     if {$rc} {
