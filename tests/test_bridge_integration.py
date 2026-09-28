@@ -196,7 +196,7 @@ def test_has_more_draining_200(request, tmp_path):
 
 def _kill_then_restart(runtime: RunningRuntime) -> None:
     runtime.stop()
-    time.sleep(1.0)
+    time.sleep(3.0)
     runtime.restart_same_port()
 
 
@@ -218,24 +218,25 @@ RUNS: Dict[str, Tuple[str, Optional[Callable[[RunningRuntime], None]]]] = {
 
 @_uses("kill")
 def test_kill_restart_one_notice_send_within_10s(request, tmp_path):
-    """S3: recovery and a working chat.send within 10 s, at most one notice
+    """S3: recovery and a working chat.send within 10 s, exactly one notice
     per state change.
 
-    P09-T07 (event_protocol 2, long-poll): the poll's own timeout is now
-    5 s (was 3 s), so the plugin's single outstanding chat.events.poll can
-    outlast a short (~1 s) outage without ever failing at the transport
-    level; recovery then happens silently, through AUTH_FAILED on the next
-    RPC, with no reconnecting/ready transition or notice at all. Both paths
-    satisfy S3 (a bounded outage is repaired without duplicate notices), so
-    this accepts either.
+    I3 (plan-09 final-review.md): a 1 s outage never reached the transport
+    layer, so this used to take the "silent" AUTH_FAILED path with no
+    transitions and no notices, and the assertion below was dead code. The
+    cause isn't the poll's own 5 s timeout (P09-T07's long-poll) - it's that
+    RunningRuntime.stop() leaves the in-process server's in-flight
+    chat.events.poll long-poll handler thread alive, and it still answers
+    (with whatever it last saw) after its own wait_ms of 2000. A 1 s outage
+    is over before that answer, so the plugin's single outstanding poll
+    never notices the runtime was gone. The outage must outlast that 2 s
+    long-poll wait for a real kill -9 (which resets the socket at once) to
+    be reproduced here.
     """
     data, _, runtime = _cached(request, tmp_path)
-    if data["transitions"]:
-        assert data["transitions"] == ["ready>reconnecting", "reconnecting>ready"]
-        assert data["notices"] == ["warn Lost the connection to the AI runtime; reconnecting.",
-                                   "info Reconnected to the AI runtime."]
-    else:
-        assert data["notices"] == []
+    assert data["transitions"] == ["ready>reconnecting", "reconnecting>ready"]
+    assert data["notices"] == ["warn Lost the connection to the AI runtime; reconnecting.",
+                               "info Reconnected to the AI runtime."]
     assert data["elapsed_ms"] < 10000
     assert data["chat_id"] == data["chat_before"]
     assert data["session_starts"] == 2
