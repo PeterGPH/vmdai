@@ -6,7 +6,9 @@
 #
 # Supported: **bold**, `code`, "- " / "* " / "1. " list items, "# " / "## "
 # headings and ``` fenced code blocks.  Everything else, including an
-# unclosed ``` or **, stays literal text.  Sourcing this file needs no Tk.
+# unclosed ``` or **, stays literal text.  Tables are not rendered (Part B
+# V9): a run of lines starting with "|" becomes one preformatted block, shown
+# like a fenced block without a language.  Sourcing this file needs no Tk.
 
 namespace eval ::vmdai::md {
     if {![info exists ::vmdai::md::seq]} { set ::vmdai::md::seq 0 }
@@ -38,7 +40,8 @@ proc ::vmdai::md::inline {s} {
 #   {item    <raw> {marker <m> inline <inl>}}    <m> is \u2022 or "<n>."
 #   {heading <raw> {level 1|2 inline <inl>}}
 #   {code    <body> {lang <lang>}}               body is byte-exact
-# where <inl> is the list [inline <raw>] returns.
+# where <inl> is the list [inline <raw>] returns.  A pipe table (consecutive
+# lines whose first non-space character is "|") is {code <lines> {lang {}}}.
 proc ::vmdai::md::spans {text} {
     set lines [split [string map [list "\r\n" "\n"] $text] "\n"]
     set n [llength $lines]
@@ -62,6 +65,16 @@ proc ::vmdai::md::spans {text} {
                 continue
             }
             # An unclosed fence is not a code block: the line stays literal.
+        }
+        if {[regexp {^\s*\|} $line]} {
+            set j $i
+            while {$j + 1 < $n && [regexp {^\s*\|} [lindex $lines [expr {$j + 1}]]]} {
+                incr j
+            }
+            _flush out para
+            lappend out [list code [join [lrange $lines $i $j] "\n"] [list lang ""]]
+            set i $j
+            continue
         }
         if {[regexp {^(#{1,2})\s+(.*)$} $line -> hashes head]} {
             _flush out para

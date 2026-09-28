@@ -115,4 +115,19 @@ test md-icode-tint {inline code's tint hugs its own line; the 8 px paragraph gap
         [$w count -update -ypixels 5.0 6.0] [expr {"md_sp" in [$w tag names 5.0]}] $e
 } -result {1 8 {} 1 {Next para.} 8 1 5.0}
 
+test md-table {a pipe table renders as a code block: a "code ... Copy" header, one mono line per table line} -body {
+    set w [::m3::root_text]
+    ::vmdai::md::render_into $w end "Intro:\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nAfter."
+    set r {}
+    foreach s [list "| a | b |" "|---|---|" "| 1 | 2 |"] {
+        set at [$w search -exact $s 1.0]
+        lappend r $at [expr {"md_pre" in [$w tag names $at]}] [expr {[$w get $at "$at lineend"] eq $s}]
+    }
+    set ::harness::clipboard ""
+    ::vmdai::md::copy_at $w [lindex [$w tag ranges md_copy] 0]
+    lappend r [::m3::ranges_text $w md_codehdr] [$w tag cget md_pre -font] $::harness::clipboard \
+        [::m3::ranges_text $w md_p]
+} -result [list 4.0 1 1 5.0 1 1 6.0 1 1 [list "code\tCopy\n"] ChatCode \
+    "| a | b |\n|---|---|\n| 1 | 2 |" {Intro: After.}]
+
 cleanupTests

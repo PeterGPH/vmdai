@@ -35,6 +35,24 @@ test md-subset-5 {links, italics and tables stay literal text} -body {
     ::vmdai::md::spans {see [docs](http://x) and *this* | a | b |}
 } -result {{para {see [docs](http://x) and *this* | a | b |} {inline {{text {see [docs](http://x) and *this* | a | b |} {}}}}}}
 
+# Tables are not rendered (V9 non-goal); a pipe table falls back to one
+# preformatted block, like a fenced block without a language (live demo).
+test md-table-1 {a pipe table is one preformatted block, its lines verbatim, between paragraphs} -body {
+    ::vmdai::md::spans "Intro:\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nAfter."
+} -result [list {para Intro: {inline {{text Intro: {}}}}} \
+    [list code "| a | b |\n|---|---|\n| 1 | 2 |" {lang {}}] \
+    {para After. {inline {{text After. {}}}}}]
+
+test md-table-2 {table lines end a paragraph and keep their indentation; a | inside a sentence stays prose} -body {
+    ::vmdai::md::spans "See below:\n  | # | Residue |\n  |---|---|\nThat is a | b, not a table."
+} -result [list {para {See below:} {inline {{text {See below:} {}}}}} \
+    [list code "  | # | Residue |\n  |---|---|" {lang {}}] \
+    {para {That is a | b, not a table.} {inline {{text {That is a | b, not a table.} {}}}}}]
+
+test md-table-3 {plain_text (Copy) keeps table lines intact} -body {
+    ::vmdai::md::plain_text "| a | b |\n|---|---|\n| 1 | 2 |"
+} -result "| a | b |\n|---|---|\n| 1 | 2 |"
+
 test md-literal-1 {an unclosed ** stays literal} -body {
     ::vmdai::md::spans "Use **bold without end"
 } -result {{para {Use **bold without end} {inline {{text {Use **bold without end} {}}}}}}
