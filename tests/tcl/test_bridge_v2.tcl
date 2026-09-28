@@ -66,6 +66,14 @@ proc ::test::start {session} {
 proc ::test::event {role type text metadata} {
     return [dict create seq 1 ts 1790000000 role $role type $type text $text metadata $metadata]
 }
+# The index of the last ::fake::calls entry for `method`, or -1.
+proc ::test::last_index {method} {
+    set idx -1
+    for {set i 0} {$i < [llength $::fake::calls]} {incr i} {
+        if {[lindex $::fake::calls $i 0] eq $method} { set idx $i }
+    }
+    return $idx
+}
 
 test v2-event_protocol_2_negotiated {session.start asks for event_protocol 2 with the launch token} -body {
     ::test::start $::SESSION
@@ -199,26 +207,42 @@ test v2-resume_replays_history {New chat shows the empty state; resume replays t
         [string match "*mol new 1hck.pdb*" [::vmdai::tclexport::chat_tcl]]
 } -result {0 1 1 1 1 0 {CDK2 view} chat_000000000001 local.request_ended 0 0 {{Load 1hck} {Now color it}} 1}
 
-test v2-settings_after_restart {Settings reloads from the new runtime after a restart and Save works} -body {
-    ::test::reset
+test v2-settings_after_restart {Settings reloads from the new (post-recover) runtime, not from on_runtime_state, and Save works} -body {
+    ::test::start $::SESSION
+    set ::vmdai::bridge::chat_id chat_000000000001
     ::fake::reply profiles.list hold
     ::fake::reply models.list ok {models {} source server}
     ::fake::reply keys.test ok {ok false message {key missing} source none}
     ::vmdai::settings::open
     ::harness::settle
-    set held [llength $::fake::held]
-    ::fake::reply profiles.list ok $::PROFILES
+    # ::fake::held also holds the session's own chat.events.poll long-poll;
+    # only the Settings dialog's own profiles.list matters here.
+    set held_profiles [lsearch -all -inline -index 0 $::fake::held profiles.list]
+    set held [llength $held_profiles]
+    set before_ready [::fake::count profiles.list]
+    # I2: a runtime-state transition alone must not reload Settings (it would
+    # still be using the old session and token); only on_recovered does.
+    set ::harness::runtime_state reconnecting
+    ::vmdai::panel::on_runtime_state ready reconnecting ""
+    set ::harness::runtime_state ready
     ::vmdai::panel::on_runtime_state reconnecting ready ""
+    set at_ready [::fake::count profiles.list]
+    ::fake::reply profiles.list ok $::PROFILES
+    ::fake::reply session.start ok [dict replace $::SESSION session_id sess_2]
+    ::fake::reply chat.resume ok {chat_id chat_000000000001 last_seq 0}
+    ::vmdai::bridge::recover
     set loaded [::harness::wait_until {expr {$::vmdai::settings::v(profile) eq "qwen"}}]
+    set resume_before_reload [expr {[::test::last_index chat.resume] < [::test::last_index profiles.list]}]
     # The old runtime's profiles.list answer arrives late: it is dropped.
-    lassign [lindex $::fake::held 0] method callback
+    lassign [lindex $held_profiles 0] method callback
     uplevel #0 [list {*}$callback ok [dict create active old settings_source file profiles \
         [dict create old [dict create provider ollama base_url http://127.0.0.1:1 model x options {}]]]]
     set kept [list $::vmdai::settings::v(profile) [dict exists $::vmdai::settings::profiles old]]
     ::fake::reply provider.set ok {ok true}
     ::vmdai::settings::save
     ::harness::wait_until {expr {![winfo exists .vmd_ai_settings]}}
-    list $held $loaded $kept [::fake::param [::fake::last provider.set] profile]
-} -result {1 1 {qwen 0} qwen}
+    list $held [expr {$at_ready == $before_ready}] $loaded $resume_before_reload $kept \
+        [::fake::param [::fake::last provider.set] profile]
+} -result {1 1 1 1 {qwen 0} qwen}
 
 cleanupTests

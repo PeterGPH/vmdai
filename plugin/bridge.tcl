@@ -262,12 +262,23 @@ proc ::vmdai::bridge::recover {} {
     _op [list ::vmdai::bridge::_start_session ::vmdai::bridge::_recovered]
 }
 
+# Recovery has nothing further to wait on: a session-start failure (already
+# reported by _on_session_started) or a fresh session with no chat to
+# resume. Tell the panel so an open Settings dialog reloads from the new
+# session instead of the stale one (I2).
+proc ::vmdai::bridge::_recover_finished {} {
+    if {[catch {::vmdai::ui::recovered} err]} {
+        _log "ui: $err"
+    }
+}
+
 proc ::vmdai::bridge::_recovered {kind args} {
     variable recovering
     variable chat_id
     variable recover_retries
     if {$kind ne "ok" || $chat_id eq ""} {
         set recovering 0
+        if {$kind eq "ok"} { _recover_finished }
         return
     }
     set recover_retries 1
@@ -311,6 +322,7 @@ proc ::vmdai::bridge::_on_recover_resume {target callback kind args} {
             _log "ui: $err"
         }
     }
+    _recover_finished
     _op_done
 }
 

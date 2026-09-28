@@ -23,6 +23,12 @@ proc ::vmdai::ui::session_started {result} {
     if {[_panel_ready]} { ::vmdai::panel::on_session_started $result }
 }
 
+# Recovery finished: a fresh session with no chat to resume, chat.resume
+# answered, or recovery gave up (bridge::_recover_finished).
+proc ::vmdai::ui::recovered {} {
+    if {[_panel_ready]} { ::vmdai::panel::on_recovered }
+}
+
 proc ::vmdai::ui::replay {chat_id events title} {
     if {[_panel_ready]} { ::vmdai::panel::replay $chat_id $events $title }
 }

@@ -21,6 +21,9 @@ namespace eval ::vmdai::panel {
     if {![info exists ::vmdai::panel::last_sent]} { variable last_sent "" }
     if {![info exists ::vmdai::panel::rt_info]} { variable rt_info {} }
     if {![info exists ::vmdai::panel::server_host]} { variable server_host "" }
+    # An open Settings dialog missed a reload while the runtime was not
+    # ready (I2); the next session_started/on_recovered catches it up.
+    if {![info exists ::vmdai::panel::settings_stale]} { variable settings_stale 0 }
     # The view-model state; ::vmdai::vm::init fills it in build.
     if {![info exists ::vmdai::panel::vm]} { variable vm {} }
 }
@@ -658,9 +661,14 @@ proc ::vmdai::panel::replay {chat_id events {title ""}} {
 
 proc ::vmdai::panel::on_session_started {result} {
     variable win
+    variable settings_stale
     if {![winfo exists $win]} { return }
+    # A recovering session_started is followed by chat.resume or a give-up;
+    # on_recovered is the point that actually ends recovery (I2).
+    if {[info exists ::vmdai::bridge::recovering] && $::vmdai::bridge::recovering} { return }
     refresh_info
     _load_persisted
+    if {$settings_stale} { _reload_settings }
 }
 
 proc ::vmdai::panel::_on_info {form args} {
@@ -709,17 +717,36 @@ proc ::vmdai::panel::empty_info {} {
     return $info
 }
 
-# runtime::subscribe callback: banner, status bar, composer, and a reload of
-# an open Settings dialog once a (possibly new) runtime is ready again.
+# runtime::subscribe callback: banner, status bar and composer. Settings
+# reloads only from on_session_started/on_recovered (I2): runtime::_became_ready
+# runs subscribers before recover starts the new session, so a reload from
+# here would still use the old session and token; mark it stale instead and
+# catch it up once the new session is in place.
 proc ::vmdai::panel::on_runtime_state {old new detail} {
     variable win
+    variable settings_stale
     if {![winfo exists $win]} { return }
     ::vmdai::banner::on_runtime_state $old $new $detail
     _sync_composer
     _update_status
-    if {$new eq "ready" && $old ne "ready" && [winfo exists $::vmdai::settings::win]} {
-        ::vmdai::settings::reload
-    }
+    if {$new ne "ready"} { set settings_stale 1 }
+}
+
+# bridge::_recover_finished (I2): recovery has ended, with a new session
+# (and, for a resumed chat, a new chat.resume answer) in place.
+proc ::vmdai::panel::on_recovered {} {
+    variable win
+    if {![winfo exists $win]} { return }
+    refresh_info
+    _load_persisted
+    _reload_settings
+}
+
+# Reload an open Settings dialog from the runtime that is current right now.
+proc ::vmdai::panel::_reload_settings {} {
+    variable settings_stale
+    set settings_stale 0
+    if {[winfo exists $::vmdai::settings::win]} { ::vmdai::settings::reload }
 }
 
 # ---- reasoning (P09-T08) --------------------------------------------------------

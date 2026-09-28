@@ -219,7 +219,11 @@ proc ::vmdai::settings::select {which} {
 
 proc ::vmdai::settings::reload {} {
     variable win
+    variable saving
     if {![winfo exists $win]} { return }
+    # A resume/recover mid-Save drops the pending reply (net's epoch bump),
+    # so saving would otherwise stick at 1 forever (M1).
+    if {$saving} { set saving 0; _footer_msg "" }
     foreach step [reload_steps] { ::vmdai::settings::$step }
 }
 
