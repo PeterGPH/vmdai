@@ -5,7 +5,7 @@ import pytest
 
 from helpers.tk_cases import assert_case, run_tk_file
 
-TOTAL = 8
+TOTAL = 9
 
 
 @pytest.fixture(scope="module")
@@ -43,3 +43,7 @@ def test_only_sealed_blocks_rendered(results):
 
 def test_copy_gives_plain_spaces(results):
     assert_case(results, "md-copy-plain", TOTAL)
+
+
+def test_code_block_lines_tight(results):
+    assert_case(results, "md-pre-spacing", TOTAL)

@@ -118,14 +118,17 @@ proc ::vmdai::md::configure_tags {t} {
     $t tag configure md_codehdr -font ChatMeta -foreground [$C muted] \
         -background [$C code_bg] -lmargin1 12 -lmargin2 12 -spacing1 8 -spacing3 2
     $t tag configure md_copy -foreground [$C accent]
+    # Code lines are tight; the block's last line carries md_pretail, i.e.
+    # 8 px below the block (Part B V2 "Detail and code blocks. 8 vertical").
     $t tag configure md_pre -font ChatCode -background [$C code_bg] \
-        -lmargin1 12 -lmargin2 12 -rmargin 12
-    $t tag configure md_pretail -background [$C code_bg] -spacing3 8
+        -lmargin1 12 -lmargin2 12 -rmargin 12 -spacing1 0 -spacing2 0 -spacing3 0
+    $t tag configure md_pretail -font ChatCode -background [$C code_bg] -spacing3 8
     catch {
         foreach tag {md_codehdr md_pre md_pretail} {
             $t tag configure $tag -lmargincolor [$C code_bg] -rmargincolor [$C code_bg]
         }
     }
+    $t tag raise md_pretail md_pre
     foreach tag {md_code md_b md_h1 md_h2 md_marker md_copy} {
         $t tag raise $tag
     }
@@ -271,6 +274,9 @@ proc ::vmdai::md::_code_block {t mark body lang tags} {
     $t insert $mark $label $hdr "\t" $hdr "Copy" [concat $hdr md_copy] "\n" $hdr
     set start [$t index $mark]
     $t insert $mark $body [concat $tags md_pre]
+    # The block's last line carries the 8 px below it; Tk takes a line's
+    # spacing from its first character.
+    $t tag add md_pretail "$mark linestart" $mark
     if {[string tolower $lang] eq "tcl"} {
         ::vmdai::syntax::highlight $t $start $body
         ::vmdai::theme::syntax_tags $t

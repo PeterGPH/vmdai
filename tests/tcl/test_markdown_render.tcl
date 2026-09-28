@@ -92,4 +92,14 @@ test md-copy-plain {copying rendered inline code gives plain spaces} -body {
     set ::harness::clipboard
 } -result {mol new}
 
+test md-pre-spacing {fenced code lines are not spaced by the base prose tag; the block ends 8 px below} -body {
+    set w [::m3::root_text]
+    $w tag configure prose -font ChatBody -spacing3 8
+    ::vmdai::md::render_into $w end "Para one.\n\n```tcl\nset a 1\nset b 2\nset c 3\n```\nAfter." prose
+    set h3 [$w count -update -ypixels 3.0 4.0]
+    set h4 [$w count -update -ypixels 4.0 5.0]
+    set h5 [$w count -update -ypixels 5.0 6.0]
+    list [expr {$h3 == [font metrics ChatCode -linespace] && $h4 == $h3}] [expr {$h5 - $h4 >= 8}]
+} -result {1 1}
+
 cleanupTests
