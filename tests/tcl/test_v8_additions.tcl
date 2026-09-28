@@ -231,7 +231,9 @@ test v8-add-sticky_on_seal {V8 add: a scrolled-up view stays put while the final
     set last [::v8::last_final $evs]
     ::m3::feed [lrange $evs 0 [expr {$last - 1}]]
     ::harness::settle
-    $t yview moveto 0.0
+    # The user drags the scrollbar to the top (a user gesture; a raw
+    # `$t yview` no longer stops following, V5 follow state).
+    {*}[.m3tx.sb cget -command] moveto 0.0
     ::harness::settle
     set before [$t yview]
 } -body {

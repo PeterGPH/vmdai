@@ -266,6 +266,8 @@ proc ::vmdai::panel::on_send {args} {
     # A refused send (not connected, or a request already running) keeps the
     # draft and the chat title untouched, and never joins recall (I1).
     if {![::vmdai::bridge::send $prompt]} { return 0 }
+    # Sending jumps to the end and follows the new run (V5 sticky autoscroll).
+    ::vmdai::transcript::follow_end
     set last_sent $prompt
     ::vmdai::composer::push_history $prompt
     ::vmdai::composer::set_text ""
@@ -489,12 +491,13 @@ proc ::vmdai::panel::copy_selection {} {
     return $s
 }
 
+# Scroll keys are user scroll gestures (V5): paging or jumping to the top
+# stops following unless the view ends at the bottom; the end follows again.
 proc ::vmdai::panel::scroll_transcript {how {n 1}} {
-    variable text
     switch -- $how {
-        page   { $text yview scroll $n pages }
-        top    { $text yview moveto 0 }
-        bottom { $text yview moveto 1 }
+        page   { ::vmdai::transcript::user_scroll scroll $n pages }
+        top    { ::vmdai::transcript::user_scroll moveto 0 }
+        bottom { ::vmdai::transcript::follow_end }
     }
 }
 

@@ -108,7 +108,9 @@ test sticky-autoscroll {scrolled up: no jump and the pill shows; at the bottom: 
     }
     update
     set r [list [expr {[lindex [$t yview] 1] >= 0.999}] [::vmdai::transcript::pill_shown]]
-    $t yview moveto 0
+    # The user drags the scrollbar to the top (a raw `$t yview` is not a
+    # user gesture: only gestures stop following, see follow-* below).
+    {*}[.tx.sb cget -command] moveto 0
     update
     ops {block.open x1 assistant 1} {block.append x1 "new output"}
     update
@@ -120,6 +122,130 @@ test sticky-autoscroll {scrolled up: no jump and the pill shows; at the bottom: 
     update
     lappend r [expr {[lindex [$t yview] 1] >= 0.999}] [::vmdai::transcript::pill_shown]
 } -result {1 0 0.0 1 0 1 0}
+
+# Sticky autoscroll keeps an explicit follow state (V5; live-demo fix): right
+# after `see end` the yview fraction can read < 0.999 (Tk 8.6 computes line
+# metrics lazily), so only a user scroll gesture that leaves the view off the
+# bottom stops following.
+proc fill {} {
+    fresh
+    for {set i 1} {$i <= 60} {incr i} {
+        ops [list block.open u$i assistant 1] [list block.append u$i "line $i"]
+    }
+    update
+}
+proc at_end {} { return [expr {[lindex [$::t yview] 1] >= 0.999}] }
+proc following {} { return $::vmdai::transcript::S(follow) }
+# stale_bottom 1: the before-insert check answers "not at the bottom" whatever
+# the view shows (a stale fraction); stale_bottom 0 restores it.
+proc stale_bottom {on} {
+    if {$on && [info commands ::real_at_bottom] eq ""} {
+        rename ::vmdai::transcript::_at_bottom ::real_at_bottom
+        proc ::vmdai::transcript::_at_bottom {args} { return 0 }
+    } elseif {!$on && [info commands ::real_at_bottom] ne ""} {
+        rename ::vmdai::transcript::_at_bottom {}
+        rename ::real_at_bottom ::vmdai::transcript::_at_bottom
+    }
+}
+# The wheel over the transcript text, run through its bindtags with %W and %D
+# substituted (event generate does not reach a never-mapped toplevel).
+proc wheel_on_text {delta} {
+    foreach tag [bindtags $::t] {
+        set script [bind $tag <MouseWheel>]
+        if {$script eq ""} { continue }
+        set code [catch {uplevel #0 [string map [list %W $::t %D $delta %% %] $script]} err]
+        if {$code == 1} { return -code error $err }
+        if {$code == 3} { break }
+    }
+}
+
+test follow-stale-fraction {following: a stale before-insert fraction neither parks the view nor shows the pill} -setup {
+    fill
+    stale_bottom 1
+} -body {
+    ops {block.open x1 assistant 1} {block.append x1 "new output"}
+    update
+    set r [list [at_end] [::vmdai::transcript::pill_shown]]
+    ::vmdai::transcript::reasoning_open $t r1 2 0
+    update
+    lappend r [at_end] [::vmdai::transcript::pill_shown]
+} -cleanup {
+    stale_bottom 0
+    ::vmdai::transcript::reasoning_reset
+} -result {1 0 1 0}
+
+test follow-user-scroll {a user scroll off the bottom (wheel on the text, wheel on a card, scrollbar) stops following} -body {
+    set r [list [expr {[lsearch [bindtags $t] ChatVMDFollow] > [lsearch [bindtags $t] Text]}]]
+    foreach gesture {
+        {wheel_on_text 120}
+        {::vmdai::transcript::_wheel 120}
+        {{*}[.tx.sb cget -command] scroll -5 units}
+    } {
+        fill
+        eval $gesture
+        update
+        set top [$t index @0,0]
+        lappend r [following]
+        ops {block.open x1 assistant 1} {block.append x1 "new output"}
+        update
+        lappend r [expr {[$t index @0,0] eq $top}] [at_end] [::vmdai::transcript::pill_shown]
+    }
+    set r
+} -result {1 0 1 0 1 0 1 0 1 0 1 0 1}
+
+test follow-end {follow_end (a send) and a pill click jump to the end and follow again} -setup {
+    fill
+    ::vmdai::transcript::_wheel 120
+    update
+    ops {block.open x1 assistant 1} {block.append x1 "new output"}
+    update
+} -body {
+    set r [list [::vmdai::transcript::pill_shown]]
+    ::vmdai::transcript::follow_end
+    update
+    lappend r [at_end] [::vmdai::transcript::pill_shown] [following]
+    stale_bottom 1
+    ops {block.open x2 assistant 1} {block.append x2 "more output"}
+    update
+    stale_bottom 0
+    lappend r [at_end] [::vmdai::transcript::pill_shown]
+    ::vmdai::transcript::_wheel 120
+    update
+    ops {block.open x3 assistant 1} {block.append x3 "even more"}
+    update
+    lappend r [following] [::vmdai::transcript::pill_shown]
+    ::vmdai::transcript::_pill_clicked
+    update
+    lappend r [at_end] [::vmdai::transcript::pill_shown] [following]
+} -cleanup {
+    stale_bottom 0
+} -result {1 1 0 1 1 0 0 1 1 0 1}
+
+test follow-gesture-bottom {a user gesture that ends at the bottom follows again and hides the pill} -setup {
+    fill
+    ::vmdai::transcript::_wheel 120
+    update
+    ops {block.open x1 assistant 1} {block.append x1 "new output"}
+    update
+} -body {
+    set r [list [following] [::vmdai::transcript::pill_shown]]
+    {*}[.tx.sb cget -command] moveto 1.0
+    lappend r [following] [::vmdai::transcript::pill_shown]
+    update
+    stale_bottom 1
+    ops {block.open x2 assistant 1} {block.append x2 "more output"}
+    update
+    stale_bottom 0
+    lappend r [at_end] [::vmdai::transcript::pill_shown]
+    ::vmdai::transcript::_wheel 120
+    update
+    lappend r [following]
+    ::vmdai::transcript::_wheel -100000
+    update
+    lappend r [following] [::vmdai::transcript::pill_shown]
+} -cleanup {
+    stale_bottom 0
+} -result {0 1 1 0 1 0 0 1 0}
 
 test non-bmp {emoji and a lone surrogate degrade without error in blocks, seals, notes and the dump} -body {
     fresh
