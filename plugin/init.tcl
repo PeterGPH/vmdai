@@ -14,10 +14,23 @@ source [file join $::vmdai::config::plugin_dir bridge.tcl]
 source [file join $::vmdai::config::plugin_dir executor.tcl]
 source [file join $::vmdai::config::plugin_dir ui.tcl]
 
+# The M2 panel and its components (plan 08/09). Sourced only when Tk is
+# loaded, so the tclsh bridge driver (tests/tcl/driver.tcl, no Tk) keeps
+# sourcing just the M1 modules above. These files carry literal UTF-8 glyphs
+# (spinner frames, ellipsis, the status bar's middle dot), so each is sourced
+# with an explicit -encoding utf-8: a plain `source` would decode them using
+# the process's system encoding instead and mangle them.
+if {[info commands ::winfo] ne ""} {
+    foreach ::vmdai::_m {theme viewmodel transcript viewer composer statusbar banner toolbar tclexport panel} {
+        source -encoding utf-8 [file join $::vmdai::config::plugin_dir $::vmdai::_m.tcl]
+    }
+    unset ::vmdai::_m
+}
+
 # Open the panel and make sure the runtime is up (launch, or attach with
 # VMD_AI_ATTACH). Returns the panel's window path, as VMD's menu expects.
 proc ::vmdai::start {} {
-    set w [::vmdai::ui::show_panel]
+    set w [::vmdai::panel::show]
     ::vmdai::runtime::ensure
     return $w
 }
@@ -28,9 +41,7 @@ proc ::vmdai::start {} {
 # session.stop the same synchronous treatment, so it releases its chat lock
 # before a following cleanup resets the http tokens.
 proc ::vmdai::stop {args} {
-    if {[llength [info commands ::winfo]]} {
-        catch {destroy $::vmdai::ui::win}
-    }
+    if {[info commands ::vmdai::panel::dispose] ne ""} { ::vmdai::panel::dispose }
     if {[lsearch -exact $args -sync] >= 0} {
         ::vmdai::bridge::shutdown -sync
         ::vmdai::runtime::stop -sync
