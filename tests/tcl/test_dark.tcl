@@ -5,6 +5,13 @@ source [file join $env(VMDAI_REPO) tests tcl m3_helpers.tcl]
 ::harness::stub_desktop
 testConstraint aquaWs [expr {[tk windowingsystem] eq "aqua"}]
 
+proc ::m3::mws_old {args} {
+    if {[lindex $args 0] in {isdark appearance}} {
+        error "bad subcommand \"[lindex $args 0]\": must be style"
+    }
+    return ""
+}
+
 test theme-1 {dark palette swaps tokens; every item re-renders without error} -setup {
     ::m3::use_mws
     set t [::m3::replay 03_conversation]
@@ -139,5 +146,35 @@ test dark-other_windows_untouched {windows that are not ChatVMD's keep their col
     destroy .m3other
     ::vmdai::theme::set_appearance light
 } -result [list #636366 #ffffff 0]
+
+test dark-empty_card_hover {an example card's hover border uses the colours in effect when the pointer moves} -setup {
+    ::m3::use_mws
+    ::vmdai::theme::set_appearance light
+    ::harness::fresh_panel
+    set t $::vmdai::panel::text
+    ::vmdai::transcript::show_empty_state [dict create] $t
+    ::harness::settle
+} -body {
+    ::vmdai::theme::set_appearance dark
+    ::harness::settle
+    set c [::vmdai::transcript::_empty_path $t].col.cards.c0
+    uplevel #0 [bind $c.title <Enter>]
+    set in [$c cget -highlightbackground]
+    uplevel #0 [bind $c.title <Leave>]
+    list [expr {$in eq [::vmdai::theme::c accent]}] \
+        [expr {[$c cget -highlightbackground] eq [::vmdai::theme::c hairline]}] [::vmdai::theme::mode]
+} -cleanup {
+    ::vmdai::theme::set_appearance light
+} -result {1 1 dark}
+
+test dark-no_isdark {a MacWindowStyle without isdark (Tk before 8.6.10) offers only Light and Dark} -setup {
+    set ::vmdai::theme::macstyle ::m3::mws_old
+} -body {
+    list [::vmdai::theme::appearance_choices] [::vmdai::theme::set_appearance system] \
+        [::vmdai::theme::set_appearance dark] [::vmdai::theme::set_appearance light]
+} -cleanup {
+    ::m3::use_mws
+    ::vmdai::theme::set_appearance light
+} -result {{Light Dark} light dark light}
 
 cleanupTests

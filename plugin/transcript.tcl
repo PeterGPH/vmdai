@@ -2038,9 +2038,16 @@ proc ::vmdai::transcript::_empty_card {c index key title prompt} {
     grid columnconfigure $c 1 -weight 1
     foreach w [list $c $c.icon $c.title $c.desc] {
         bind $w <ButtonRelease-1> [list ::vmdai::transcript::example_clicked $index]
-        bind $w <Enter> [list $c configure -highlightbackground $accent]
-        bind $w <Leave> [list $c configure -highlightbackground $hairline]
+        bind $w <Enter> [list ::vmdai::transcript::_empty_hover $c 1]
+        bind $w <Leave> [list ::vmdai::transcript::_empty_hover $c 0]
     }
+}
+
+# _empty_hover c on: a card's border colour, read from the theme when the
+# pointer moves, so a live appearance switch never brings back the old one.
+proc ::vmdai::transcript::_empty_hover {c on} {
+    if {![winfo exists $c]} { return }
+    $c configure -highlightbackground [::vmdai::theme::c [expr {$on ? "accent" : "hairline"}]]
 }
 
 proc ::vmdai::transcript::_empty_ready {f info} {

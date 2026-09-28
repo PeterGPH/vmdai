@@ -335,12 +335,17 @@ proc ::vmdai::theme::palette {m} {
     return $p
 }
 
+# MacWindowStyle exists on every aqua Tk, but only 8.6.10 and later answer
+# "isdark" (and take "appearance"); older builds get Light/Dark only (V7).
 proc ::vmdai::theme::has_macwindowstyle {} {
     variable macstyle
     if {[catch {tk windowingsystem} ws] || $ws ne "aqua"} {
         return 0
     }
-    return [expr {[llength [info commands $macstyle]] > 0}]
+    if {![llength [info commands $macstyle]]} {
+        return 0
+    }
+    return [expr {![catch {{*}$macstyle isdark .}]}]
 }
 
 # The Appearance values Settings offers (V7: no System without MacWindowStyle).

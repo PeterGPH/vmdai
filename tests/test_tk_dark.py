@@ -5,7 +5,7 @@ import pytest
 
 from helpers.tk_cases import assert_case, run_tk_file
 
-TOTAL = 8
+TOTAL = 10
 
 
 @pytest.fixture(scope="module")
@@ -43,3 +43,11 @@ def test_every_m2_token_has_a_dark_value(results):
 
 def test_other_windows_untouched(results):
     assert_case(results, "dark-other_windows_untouched", TOTAL)
+
+
+def test_empty_card_hover_follows_theme(results):
+    assert_case(results, "dark-empty_card_hover", TOTAL)
+
+
+def test_no_isdark_offers_light_dark(results):
+    assert_case(results, "dark-no_isdark", TOTAL)
