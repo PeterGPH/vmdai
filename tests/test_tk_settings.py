@@ -5,7 +5,7 @@ import pytest
 
 from helpers.tk_cases import assert_case, run_tk_file
 
-TOTAL = 6
+TOTAL = 10
 
 
 @pytest.fixture(scope="module")
@@ -35,3 +35,19 @@ def test_test_connection_lines(results):
 
 def test_new_delete_profile(results):
     assert_case(results, "settings-new_delete_profile", TOTAL)
+
+
+def test_no_keychain_message(results):
+    assert_case(results, "settings-no_keychain_message", TOTAL)
+
+
+def test_panel_prefs_saved(results):
+    assert_case(results, "settings-panel_prefs_saved", TOTAL)
+
+
+def test_save_while_busy(results):
+    assert_case(results, "settings-save_while_busy", TOTAL)
+
+
+def test_return_saves_esc_cancels(results):
+    assert_case(results, "settings-return_saves_esc_cancels", TOTAL)

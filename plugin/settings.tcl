@@ -224,7 +224,7 @@ proc ::vmdai::settings::reload {} {
 }
 
 proc ::vmdai::settings::reload_steps {} {
-    return {_load_profiles}
+    return {_load_profiles _load_keys _load_persisted _load_panel_prefs}
 }
 
 # A fresh form: every field (typed keys included) is rebuilt from the
@@ -256,6 +256,8 @@ proc ::vmdai::settings::_build {} {
     }
     pack $win.bg.nb -fill both -expand 1
     _build_model [tab model]
+    _build_keys [tab keys]
+    _build_panel [tab panel]
     set f [footer]
     ttk::frame $f
     ttk::label $f.note -text $FOOTER_TEXT -font ChatMeta -foreground [$C muted]
@@ -268,6 +270,9 @@ proc ::vmdai::settings::_build {} {
     grid $f.msg -row 1 -column 0 -columnspan 3 -sticky w -pady {4 0}
     grid columnconfigure $f 0 -weight 1
     pack $f -fill x -pady {12 0}
+    bind $win <Return> {::vmdai::settings::save; break}
+    bind $win <KP_Enter> {::vmdai::settings::save; break}
+    bind $win <Escape> {::vmdai::settings::close; break}
 }
 
 proc ::vmdai::settings::_build_model {m} {
@@ -747,7 +752,7 @@ proc ::vmdai::settings::save {} {
 }
 
 proc ::vmdai::settings::save_steps {} {
-    return {_save_profile _finish_save}
+    return {_save_profile _save_keys _save_persisted _save_plugin_prefs _finish_save}
 }
 
 # Each step is called with a continuation; it calls {*}$k when done, or
@@ -869,5 +874,314 @@ proc ::vmdai::settings::_finish_save {k} {
         # refresh_info re-read runtime.info and profiles.list).
         ::vmdai::panel::refresh_info
     }
+    {*}$k
+}
+
+# ---- Keys tab (section 2f Providers and keys) ----------------------------------------
+
+namespace eval ::vmdai::settings {
+    variable KEY_PROVIDERS {anthropic Anthropic ANTHROPIC_API_KEY openrouter OpenRouter OPENROUTER_API_KEY}
+    variable NO_KEYCHAIN_MESSAGE "No keychain backend available"
+    variable NO_KEYCHAIN "No keychain backend: set ANTHROPIC_API_KEY/OPENROUTER_API_KEY in the environment, or install `keyring`"
+    if {![info exists ::vmdai::settings::nokeychain]} { variable nokeychain 0 }
+}
+
+proc ::vmdai::settings::_build_keys {k} {
+    variable KEY_PROVIDERS
+    variable NO_KEYCHAIN
+    variable nokeychain
+    set C ::vmdai::theme::c
+    set nokeychain 0
+    set r 0
+    foreach {id label env} $KEY_PROVIDERS {
+        ttk::label $k.l_$id -text $label
+        ttk::entry $k.e_$id -width 30 -show "\u2022" -textvariable ::vmdai::settings::v(key,$id)
+        ttk::button $k.s_$id -text Show -width 6 -command [list ::vmdai::settings::_toggle_show $id]
+        ttk::label $k.src_$id -text "" -font ChatMeta -foreground [$C muted]
+        grid $k.l_$id -row $r -column 0 -sticky e -padx {0 10} -pady {6 0}
+        grid $k.e_$id -row $r -column 1 -sticky ew -pady {6 0}
+        grid $k.s_$id -row $r -column 2 -sticky w -padx {6 0} -pady {6 0}
+        incr r
+        grid $k.src_$id -row $r -column 1 -columnspan 2 -sticky w
+        incr r
+    }
+    ttk::button $k.save -text "Save keys" -command ::vmdai::settings::save_keys
+    ttk::label $k.nokey -text $NO_KEYCHAIN -font ChatMeta -foreground [$C warn] -wraplength 360 -justify left
+    grid $k.save -row $r -column 1 -sticky w -pady {12 0}
+    grid $k.nokey -row [expr {$r + 1}] -column 0 -columnspan 3 -sticky w -pady {12 0}
+    grid remove $k.nokey
+    grid columnconfigure $k 1 -weight 1
+}
+
+proc ::vmdai::settings::_toggle_show {id} {
+    set k [tab keys]
+    if {[$k.e_$id cget -show] eq ""} {
+        $k.e_$id configure -show "\u2022"
+        $k.s_$id configure -text Show
+    } else {
+        $k.e_$id configure -show ""
+        $k.s_$id configure -text Hide
+    }
+}
+
+proc ::vmdai::settings::key_source_text {id r} {
+    variable KEY_PROVIDERS
+    set env ""
+    foreach {pid label var} $KEY_PROVIDERS {
+        if {$pid eq $id} { set env $var }
+    }
+    switch -- [_dget $r source none] {
+        env     { return "From the environment ($env)" }
+        keyring { return "Saved in the Keychain" }
+    }
+    return "Not set"
+}
+
+proc ::vmdai::settings::_set_nokeychain {on} {
+    variable nokeychain
+    variable win
+    set nokeychain [expr {$on ? 1 : 0}]
+    if {![winfo exists $win]} { return }
+    set k [tab keys]
+    if {$nokeychain} {
+        grid remove $k.save
+        grid $k.nokey
+    } else {
+        grid $k.save
+        grid remove $k.nokey
+    }
+}
+
+proc ::vmdai::settings::_load_keys {} {
+    variable KEY_PROVIDERS
+    foreach {id label env} $KEY_PROVIDERS {
+        ::vmdai::net::call keys.test [list provider s $id] [list ::vmdai::settings::_on_key_test $id]
+    }
+}
+
+proc ::vmdai::settings::_on_key_test {id form args} {
+    variable win
+    variable NO_KEYCHAIN_MESSAGE
+    if {![winfo exists $win]} { return }
+    set src [tab keys].src_$id
+    if {$form ne "ok"} {
+        $src configure -text "Unknown: the runtime did not answer"
+        return
+    }
+    set r [lindex $args 0]
+    if {[_dget $r message ""] eq $NO_KEYCHAIN_MESSAGE} { _set_nokeychain 1 }
+    $src configure -text [key_source_text $id $r]
+}
+
+# The Keys tab's own button: save the typed keys now.
+proc ::vmdai::settings::save_keys {} {
+    _save_keys [list ::vmdai::settings::_footer_msg "Keys saved."]
+}
+
+proc ::vmdai::settings::_save_keys {k} {
+    variable nokeychain
+    variable v
+    variable KEY_PROVIDERS
+    if {$nokeychain} {
+        {*}$k
+        return
+    }
+    set todo {}
+    foreach {id label env} $KEY_PROVIDERS {
+        if {[info exists v(key,$id)] && [string trim $v(key,$id)] ne ""} { lappend todo $id }
+    }
+    _save_next_key $todo $k
+}
+
+proc ::vmdai::settings::_save_next_key {todo k} {
+    variable v
+    if {![llength $todo]} {
+        {*}$k
+        return
+    }
+    set id [lindex $todo 0]
+    ::vmdai::net::call keys.save [list provider s $id key s [string trim $v(key,$id)]] \
+        [list ::vmdai::settings::_after_key $id [lrange $todo 1 end] $k]
+}
+
+proc ::vmdai::settings::_after_key {id rest k form args} {
+    variable v
+    variable win
+    variable NO_KEYCHAIN_MESSAGE
+    if {$form ne "ok"} {
+        _fail [_failure "Could not save the $id key" $form $args]
+        return
+    }
+    set r [lindex $args 0]
+    if {![string is true -strict [_dget $r ok false]]} {
+        if {[_dget $r message ""] eq $NO_KEYCHAIN_MESSAGE} {
+            _set_nokeychain 1
+            {*}$k
+            return
+        }
+        _fail "Could not save the $id key: [_dget $r message {}]"
+        return
+    }
+    set v(key,$id) ""
+    if {[winfo exists $win]} { [tab keys].src_$id configure -text "Saved in the Keychain" }
+    _save_next_key $rest $k
+}
+
+# ---- Panel tab ----------------------------------------------------------------
+
+namespace eval ::vmdai::settings {
+    # settings.json key -> form field, for the persisted toggles.
+    variable PERSISTED_FIELDS {wiki_enabled wiki}
+    if {![info exists ::vmdai::settings::persisted]} { variable persisted {} }
+}
+
+# System needs MacWindowStyle (Tk 8.6 on aqua); elsewhere only Light and Dark (V7).
+proc ::vmdai::settings::appearance_values {} {
+    if {[tk windowingsystem] eq "aqua" && ![catch {::tk::unsupported::MacWindowStyle isdark .}]} {
+        return {System Light Dark}
+    }
+    return {Light Dark}
+}
+
+proc ::vmdai::settings::_build_panel {p} {
+    set C ::vmdai::theme::c
+    set muted [$C muted]
+    ttk::label $p.appearance_l -text Appearance
+    ttk::combobox $p.appearance -state readonly -width 10 -values [appearance_values] \
+        -textvariable ::vmdai::settings::v(appearance_label)
+    ttk::checkbutton $p.expand -text "Expand steps by default" -variable ::vmdai::settings::v(expand)
+    ttk::label $p.folder_l -text "Project folder"
+    ttk::entry $p.folder -state readonly -width 30 -textvariable ::vmdai::settings::v(folder)
+    ttk::button $p.folder_b -text "Choose\u2026" -command ::vmdai::settings::choose_folder
+    ttk::label $p.python_l -text "Python for the runtime"
+    ttk::entry $p.python -font ChatCode -width 30 -textvariable ::vmdai::settings::v(python)
+    ttk::button $p.python_b -text "Choose\u2026" -command ::vmdai::settings::choose_python
+    ttk::label $p.python_hint -font ChatMeta -foreground $muted -wraplength 340 -justify left \
+        -text "Empty: VMD_AI_PYTHON, then python3 on PATH. Used the next time the runtime starts."
+    ttk::checkbutton $p.wiki -text "Use project wiki (slower)" -variable ::vmdai::settings::v(wiki)
+    ttk::label $p.wiki_hint -text "Adds about 17 s to every request." -font ChatMeta -foreground $muted
+    ttk::label $p.tcl_l -text "Tcl execution"
+    ttk::label $p.tcl -text "Auto-run (model-written Tcl runs without asking)" -foreground $muted
+    ttk::button $p.log -text "Open log" -command ::vmdai::panel::open_log
+    # Row 1 is left for "Show model reasoning" (P09-T08).
+    grid $p.appearance_l -row 0 -column 0 -sticky e -padx {0 10} -pady 4
+    grid $p.appearance   -row 0 -column 1 -sticky w -pady 4
+    grid $p.expand       -row 2 -column 1 -columnspan 2 -sticky w -pady 4
+    grid $p.folder_l     -row 3 -column 0 -sticky e -padx {0 10} -pady 4
+    grid $p.folder       -row 3 -column 1 -sticky ew -pady 4
+    grid $p.folder_b     -row 3 -column 2 -sticky w -padx {6 0} -pady 4
+    grid $p.python_l     -row 4 -column 0 -sticky e -padx {0 10} -pady {4 0}
+    grid $p.python       -row 4 -column 1 -sticky ew -pady {4 0}
+    grid $p.python_b     -row 4 -column 2 -sticky w -padx {6 0} -pady {4 0}
+    grid $p.python_hint  -row 5 -column 1 -columnspan 2 -sticky w
+    grid $p.wiki         -row 6 -column 1 -columnspan 2 -sticky w -pady {8 0}
+    grid $p.wiki_hint    -row 7 -column 1 -columnspan 2 -sticky w -padx {22 0}
+    grid $p.tcl_l        -row 8 -column 0 -sticky e -padx {0 10} -pady {8 0}
+    grid $p.tcl          -row 8 -column 1 -columnspan 2 -sticky w -pady {8 0}
+    grid $p.log          -row 9 -column 1 -sticky w -pady {10 0}
+    grid columnconfigure $p 1 -weight 1
+    bind $p.appearance <<ComboboxSelected>> \
+        {set ::vmdai::settings::v(appearance) [string tolower $::vmdai::settings::v(appearance_label)]}
+}
+
+proc ::vmdai::settings::choose_folder {} {
+    variable v
+    variable win
+    set dir [tk_chooseDirectory -parent $win -title "Project folder" -initialdir $v(folder) -mustexist 1]
+    if {$dir ne ""} { set v(folder) $dir }
+    return $dir
+}
+
+proc ::vmdai::settings::choose_python {} {
+    variable v
+    variable win
+    set path [tk_getOpenFile -parent $win -title "Python for the runtime"]
+    if {$path ne ""} { set v(python) $path }
+    return $path
+}
+
+proc ::vmdai::settings::_load_panel_prefs {} {
+    variable v
+    set d {}
+    catch {set d [::vmdai::config::load_plugin_settings]}
+    set v(appearance) [_dget $d appearance system]
+    if {$v(appearance) ni {system light dark}} { set v(appearance) system }
+    set v(appearance_label) [string totitle $v(appearance)]
+    set v(expand) [string is true -strict [_dget $d expand_steps false]]
+    set v(expand_loaded) $v(expand)
+    set v(python) [_dget $d python ""]
+    set v(folder) [pwd]
+}
+
+# An empty patch reads the persisted top-level settings without writing them.
+proc ::vmdai::settings::_load_persisted {} {
+    ::vmdai::net::call settings.set [list patch j "{}"] [list ::vmdai::settings::_on_persisted]
+}
+
+proc ::vmdai::settings::_on_persisted {form args} {
+    variable persisted
+    variable v
+    variable win
+    variable PERSISTED_FIELDS
+    if {$form ne "ok" || ![winfo exists $win]} { return }
+    set persisted {}
+    catch {set persisted [dict get [lindex $args 0] persisted]}
+    foreach {key field} $PERSISTED_FIELDS {
+        if {[dict exists $persisted $key]} {
+            set v($field) [string is true -strict [dict get $persisted $key]]
+        }
+    }
+}
+
+# Only keys the runtime reported and the user changed; nothing when the
+# settings could not be read (a tokenless session, or a failed read).
+proc ::vmdai::settings::_persisted_pairs {} {
+    variable persisted
+    variable v
+    variable PERSISTED_FIELDS
+    set pairs {}
+    foreach {key field} $PERSISTED_FIELDS {
+        if {![dict exists $persisted $key] || ![info exists v($field)]} { continue }
+        set old [string is true -strict [dict get $persisted $key]]
+        set new [expr {$v($field) ? 1 : 0}]
+        if {$old != $new} { lappend pairs $key b $new }
+    }
+    return $pairs
+}
+
+proc ::vmdai::settings::_save_persisted {k} {
+    set pairs [_persisted_pairs]
+    if {![llength $pairs]} {
+        {*}$k
+        return
+    }
+    ::vmdai::net::call settings.set [list patch j [::vmdai::net::encode_params $pairs]] \
+        [list ::vmdai::settings::_after_persisted $k]
+}
+
+proc ::vmdai::settings::_after_persisted {k form args} {
+    variable persisted
+    if {$form ne "ok"} {
+        _fail [_failure "Could not save the panel settings" $form $args]
+        return
+    }
+    catch {set persisted [dict get [lindex $args 0] persisted]}
+    {*}$k
+}
+
+proc ::vmdai::settings::_save_plugin_prefs {k} {
+    variable v
+    set d {}
+    catch {set d [::vmdai::config::load_plugin_settings]}
+    dict set d version 1
+    dict set d appearance $v(appearance)
+    dict set d expand_steps [expr {$v(expand) ? 1 : 0}]
+    dict set d python [string trim $v(python)]
+    if {[catch {::vmdai::config::save_plugin_settings $d} err]} {
+        _fail "Could not write plugin.json: $err"
+        return
+    }
+    if {$v(expand) != $v(expand_loaded)} { ::vmdai::panel::set_expand_all $v(expand) }
+    if {$v(folder) ne "" && $v(folder) ne [pwd]} { ::vmdai::bridge::apply_workdir $v(folder) }
     {*}$k
 }

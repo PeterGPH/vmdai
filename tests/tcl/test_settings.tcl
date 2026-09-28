@@ -130,4 +130,74 @@ test settings-new_delete_profile {New... adds an unsaved profile; the active pro
 } -result [list lab-box ollama 1 "A profile named qwen already exists." 0 qwen 0 \
     "This is the active profile. Activate another profile before deleting it." vllm qwen]
 
+test settings-no_keychain_message {no keychain backend: the Keys tab shows the section 2f message instead of Save} -body {
+    ::harness::fresh_panel
+    ::fake::reply profiles.list ok $::PROFILES
+    ::fake::reply models.list ok $::MODELS
+    ::fake::reply settings.set ok {ok true settings {} persisted {reasoning_visible true wiki_enabled false}}
+    ::fake::reply keys.test ok {ok false message {No keychain backend available} source none}
+    ::vmdai::settings::open keys
+    set k [::vmdai::settings::tab keys]
+    ::harness::wait_until {expr {[winfo manager [::vmdai::settings::tab keys].nokey] ne ""}}
+    set r [list [$k.nokey cget -text] [winfo manager $k.save] [$k.src_anthropic cget -text]]
+    set ::vmdai::settings::v(key,anthropic) sk-ant-test
+    ::fake::reply provider.set ok {ok true}
+    ::vmdai::settings::save
+    ::harness::wait_until {expr {![winfo exists .vmd_ai_settings]}}
+    lappend r [::fake::count keys.save]
+} -result [list "No keychain backend: set ANTHROPIC_API_KEY/OPENROUTER_API_KEY in the environment, or install `keyring`" \
+    {} "Not set" 0]
+
+test settings-panel_prefs_saved {Panel prefs go to plugin.json, persisted keys to settings.set} -body {
+    ::test::open_loaded panel
+    ::harness::wait_until {expr {[dict size $::vmdai::settings::persisted] > 0}}
+    ::vmdai::panel::set_expand_all 0
+    set ::vmdai::settings::v(appearance) dark
+    set ::vmdai::settings::v(expand) 1
+    set ::vmdai::settings::v(python) /opt/py/bin/python3
+    set ::vmdai::settings::v(wiki) 1
+    ::fake::reply provider.set ok {ok true}
+    ::vmdai::settings::save
+    ::harness::wait_until {expr {![winfo exists .vmd_ai_settings]}}
+    set d [::vmdai::config::load_plugin_settings]
+    list [dict get $d appearance] [string is true -strict [dict get $d expand_steps]] [dict get $d python] \
+        [::fake::param [::fake::last settings.set] patch] $::vmdai::panel::expand_all \
+        [::harness::count_calls apply_workdir]
+} -result {dark 1 /opt/py/bin/python3 {{"wiki_enabled":true}} 1 0}
+
+test settings-save_while_busy {Save during a request runs the whole chain for the next message and leaves the request alone} -body {
+    ::test::open_loaded
+    ::harness::wait_until {expr {[dict size $::vmdai::settings::persisted] > 0}}
+    set ::harness::busy 1
+    ::vmdai::panel::set_busy 1
+    set ::harness::flashes {}
+    set ::vmdai::settings::v(model) qwen3.8:30b
+    set ::vmdai::settings::v(wiki) 1
+    ::fake::reply provider.set ok {ok true provider ollama model qwen3.8:30b profile qwen agent_loop true capabilities {}}
+    ::vmdai::settings::save
+    ::harness::wait_until {expr {![winfo exists .vmd_ai_settings]}}
+    set p [::fake::last provider.set]
+    set r [list [::fake::param $p profile] [::fake::param $p model] [::fake::param $p options] \
+        [::fake::param [::fake::last settings.set] patch] \
+        [::fake::count profiles.activate] [::harness::count_calls cancel] [::harness::count_calls new_chat] \
+        [lindex $::harness::flashes end] [dict get [::vmdai::bridge::state] busy]]
+    set ::harness::busy 0
+    ::vmdai::panel::set_busy 0
+    set r
+} -result [list qwen qwen3.8:30b {{"num_ctx":32768,"think":true,"supports_vision":"auto"}} \
+    {{"wiki_enabled":true}} 0 0 0 "Settings saved · they apply to your next message" 1]
+
+test settings-return_saves_esc_cancels {Return saves, Esc cancels without saving} -body {
+    ::test::open_loaded
+    ::fake::reply provider.set ok {ok true}
+    set before [::fake::count provider.set]
+    ::harness::fire [::vmdai::settings::tab model].server <Return>
+    ::harness::wait_until {expr {![winfo exists .vmd_ai_settings]}}
+    set r [list [expr {[::fake::count provider.set] - $before}] [winfo exists .vmd_ai_settings]]
+    ::test::open_loaded
+    set before [::fake::count provider.set]
+    ::harness::fire [::vmdai::settings::tab model].server <Escape>
+    lappend r [winfo exists .vmd_ai_settings] [expr {[::fake::count provider.set] - $before}]
+} -result {1 0 0 0}
+
 cleanupTests
