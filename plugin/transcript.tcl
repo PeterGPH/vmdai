@@ -54,6 +54,9 @@ proc ::vmdai::transcript::create {path} {
     if {[winfo exists $path]} { destroy $path }
     catch {rename ::vmdai::transcript::_w {}}
     _reset
+    foreach hook {_clear_rows _clear_snaps} {
+        if {[info commands ::vmdai::transcript::$hook] ne ""} { $hook }
+    }
     set F $path
     frame $path -borderwidth 0 -highlightthickness 0
     set T $path.t
@@ -334,11 +337,15 @@ proc ::vmdai::transcript::op_rule {run} {
 
 # ---- links and actions ------------------------------------------------------------
 
+# Tk %-substitutes every binding script; double each % so the payload
+# (a command, a path) reaches the handler byte for byte.
+proc ::vmdai::transcript::_bound {script} { return [string map {% %%} $script] }
+
 proc ::vmdai::transcript::_link {args} {
     variable W
     variable S
     set tag act:[incr S(link)]
-    $W tag bind $tag <ButtonRelease-1> [list ::vmdai::transcript::_action {*}$args]
+    $W tag bind $tag <ButtonRelease-1> [_bound [list ::vmdai::transcript::_action {*}$args]]
     return $tag
 }
 
@@ -372,8 +379,9 @@ proc ::vmdai::transcript::_action {name args} {
 }
 
 proc ::vmdai::transcript::_call {target args} {
-    if {[info commands $target] eq ""} { return }
-    uplevel #0 [list $target {*}$args]
+    set cmd [namespace which -command $target]
+    if {$cmd eq ""} { return }
+    uplevel #0 [list $cmd {*}$args]
 }
 
 proc ::vmdai::transcript::_clipboard {text} {
@@ -1381,7 +1389,15 @@ proc ::vmdai::transcript::_do_save_run_tcl {request_id} {
     set path [tk_getSaveFile -parent [winfo toplevel $T] -title "Save run .tcl" \
         -defaultextension .tcl -initialfile run.tcl]
     if {$path eq ""} { return }
-    ::vmdai::tclexport::save $path [::vmdai::tclexport::run_tcl $request_id]
+    if {[catch {::vmdai::tclexport::save $path [::vmdai::tclexport::run_tcl $request_id]} err]} {
+        _save_failed $path $err
+    }
+}
+
+# A failed save is logged and noted in the transcript, never a bgerror.
+proc ::vmdai::transcript::_save_failed {path err} {
+    catch {::vmdai::config::log "transcript: save [file tail $path] failed: $err"}
+    apply_ops [list [list notice warn "Couldn't save [file tail $path]: $err"]]
 }
 
 # ===========================================================================
@@ -1589,7 +1605,7 @@ proc ::vmdai::transcript::_narrow {} {
 proc ::vmdai::transcript::_card_link {c x y text tag cmd} {
     set id [$c create text $x $y -anchor nw -text $text -font ChatMeta \
         -fill [::vmdai::theme::c accent] -tags [list link $tag]]
-    $c bind $tag <ButtonRelease-1> $cmd
+    $c bind $tag <ButtonRelease-1> [_bound $cmd]
     return [lindex [$c bbox $id] 2]
 }
 
@@ -1610,7 +1626,7 @@ proc ::vmdai::transcript::_draw_card {k} {
         $c create rectangle 0 0 [expr {$iw - 1}] [expr {$ih - 1}] -outline [$C hairline] \
             -fill [$C surface] -tags img
         $c create image 1 1 -anchor nw -image $SNAP($k,photo) -tags img
-        $c bind img <ButtonRelease-1> [list ::vmdai::transcript::_action view_image $path]
+        $c bind img <ButtonRelease-1> [_bound [list ::vmdai::transcript::_action view_image $path]]
         $c bind img <Enter> [list $c configure -cursor hand2]
         $c bind img <Leave> [list $c configure -cursor arrow]
     } elseif {$mode eq "unloaded"} {
@@ -1707,4 +1723,6 @@ proc ::vmdai::transcript::_card_menu {k rx ry} {
 proc ::vmdai::transcript::_do_view_image {path} { _call ::vmdai::viewer::open $path }
 proc ::vmdai::transcript::_do_open_file {path} { _call ::vmdai::viewer::open_external $path }
 proc ::vmdai::transcript::_do_reveal_file {path} { _call ::vmdai::viewer::reveal $path }
-proc ::vmdai::transcript::_do_save_png {path} { _call ::vmdai::viewer::save_copy $path }
+proc ::vmdai::transcript::_do_save_png {path} {
+    if {[catch {_call ::vmdai::viewer::save_copy $path} err]} { _save_failed $path $err }
+}

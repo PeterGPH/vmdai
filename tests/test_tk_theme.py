@@ -15,6 +15,7 @@ TESTS = [
     "test_repaint_registry",
     "test_only_chatvmd_styles",
     "fit_helpers",
+    "fit_middle_binary",
 ]
 
 
@@ -50,3 +51,7 @@ def test_only_chatvmd_styles(result):
 
 def test_fit_helpers(result):
     assert_tcltests(result, ["fit_helpers"])
+
+
+def test_fit_middle_binary_search(result):
+    assert_tcltests(result, ["fit_middle_binary"])

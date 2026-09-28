@@ -24,6 +24,11 @@ TESTS = ADOPTED + [
     "row-labels",
     "row-click",
     "refit-order",
+    # Final-review fix wave (plan 08).
+    "percent-copy",
+    "action-glob",
+    "save-fails-softly",
+    "create-twice",
 ]
 
 
@@ -64,3 +69,19 @@ def test_unknown_call_key_noop(result):
 
 def test_run_header_footer_expand_and_menus(result):
     assert_tcltests(result, ["header-footer", "expand-all", "menus", "row-labels", "row-click", "refit-order"])
+
+
+def test_percent_payload_reaches_copy_exactly(result):
+    assert_tcltests(result, ["percent-copy"])
+
+
+def test_action_name_is_not_a_glob(result):
+    assert_tcltests(result, ["action-glob"])
+
+
+def test_failed_save_is_a_note(result):
+    assert_tcltests(result, ["save-fails-softly"])
+
+
+def test_second_create_starts_empty(result):
+    assert_tcltests(result, ["create-twice"])

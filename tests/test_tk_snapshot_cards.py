@@ -19,6 +19,9 @@ TESTS = [
     "last-card-visible",
     "stack-narrow",
     "viewer-1",
+    # Final-review fix wave (plan 08).
+    "percent-path",
+    "save-png-fails-softly",
 ]
 
 
@@ -54,3 +57,7 @@ def test_autocrop_scale_fit(result):
 
 def test_card_actions_layout_and_viewer(result):
     assert_tcltests(result, ["card-actions", "last-card-visible", "stack-narrow", "viewer-1"])
+
+
+def test_percent_path_and_failed_save_png(result):
+    assert_tcltests(result, ["percent-path", "save-png-fails-softly"])

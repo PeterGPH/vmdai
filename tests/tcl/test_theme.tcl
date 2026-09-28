@@ -69,5 +69,28 @@ test fit_helpers {fit keeps at least min characters; fit_middle keeps both ends}
     list [string length $a] [string match "*…" $a] [string match "a_*…*.png" $b]
 } -result {13 1 1}
 
+test fit_middle_binary {fit_middle's binary search keeps as much as the linear scan did} -body {
+    proc linear {font px text} {
+        if {[font measure $font $text] <= $px} { return $text }
+        set n [string length $text]
+        for {set keep [expr {$n - 1}]} {$keep > 2} {incr keep -1} {
+            set head [expr {($keep + 1) / 2}]
+            set tail [expr {$keep - $head}]
+            set s "[string range $text 0 [expr {$head - 1}]]…[string range $text end-[expr {$tail - 1}] end]"
+            if {[font measure $font $s] <= $px} { return $s }
+        }
+        return "…"
+    }
+    set bad {}
+    foreach text {a ab abc abcd a_very_long_snapshot_file_name_for_testing.png WWWWWWiiiiiiiWWWWWW.png} {
+        foreach px {0 5 10 20 40 80 120 160 240 400} {
+            if {[::vmdai::theme::fit_middle ChatCodeSmall $px $text] ne [linear ChatCodeSmall $px $text]} {
+                lappend bad [list $text $px]
+            }
+        }
+    }
+    set bad
+} -result {}
+
 cleanupTests
 exit

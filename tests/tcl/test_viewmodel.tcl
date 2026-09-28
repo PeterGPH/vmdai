@@ -307,4 +307,25 @@ test stuck_notes {stuck: the stop note; a failed wrap-up adds a muted note, neve
     only [::vmdai::vm::apply S [st request.finished {request_id req_a status stuck wrapped_up false turns 5 tool_calls 4 final_text_empty true duration_ms 8000 error {HTTP 500: boom}}]] {notice error.card}
 } -result {{notice info {The summary could not be written: HTTP 500: boom}} {notice warn {Stopped: the model kept repeating the same step}}}
 
+test local_connection_restart {a restart (launching) keeps the loss open; a never-connected down is not "Connection lost"} -body {
+    ::vmdai::vm::init S
+    feed S [started req_a] [tstart req_a k1]
+    set ops [feed S \
+        [::vmdai::vm::local_event local.connection {state reconnecting detail x request_lost false ts 1727180000}] \
+        [::vmdai::vm::local_event local.connection {state launching detail x request_lost false ts 1727180001}] \
+        [::vmdai::vm::local_event local.connection {state ready detail x request_lost true ts 1727180002}]]
+    set r [list [only $ops notice] [lrange [lindex [only $ops tool.close] 0] 0 2]]
+    ::vmdai::vm::init N
+    lappend r [only [feed N \
+        [::vmdai::vm::local_event local.connection {state down detail x request_lost false ts 1727180003}] \
+        [::vmdai::vm::local_event local.connection {state reconnecting detail x request_lost false ts 1727180004}]] notice]
+} -result {{{notice warn {Connection lost at 12:13 PM · your draft is kept}} {notice warn {Reconnected: request lost} retry}} {tool.close k1 unknown} {{notice warn {Runtime unavailable at 12:13 PM · your draft is kept}} {notice warn {Connection lost at 12:13 PM · your draft is kept}}}}
+
+test reasoning_live_duration {a live block sealed by its reasoning/message uses duration_ms, like a replay} -body {
+    ::vmdai::vm::init S
+    only [feed S [started req_a] \
+        [ev reasoning chunk "think" {request_id req_a turn 1} 100.9] \
+        [ev reasoning message "think" {request_id req_a turn 1 duration_ms 4600} 104.2]] reasoning.seal
+} -result {{reasoning.seal b1 5}}
+
 cleanupTests

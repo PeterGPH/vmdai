@@ -187,12 +187,23 @@ proc ::vmdai::theme::fit {font px text {min 0}} {
 # Middle ellipsis for file names and chat titles.
 proc ::vmdai::theme::fit_middle {font px text} {
     if {[font measure $font $text] <= $px} { return $text }
-    set n [string length $text]
-    for {set keep [expr {$n - 1}]} {$keep > 2} {incr keep -1} {
-        set head [expr {($keep + 1) / 2}]
-        set tail [expr {$keep - $head}]
-        set s "[string range $text 0 [expr {$head - 1}]]…[string range $text end-[expr {$tail - 1}] end]"
-        if {[font measure $font $s] <= $px} { return $s }
+    set lo 2
+    set hi [expr {[string length $text] - 1}]
+    while {$lo < $hi} {
+        set mid [expr {($lo + $hi + 1) / 2}]
+        if {[font measure $font [_middle $text $mid]] <= $px} {
+            set lo $mid
+        } else {
+            set hi [expr {$mid - 1}]
+        }
     }
-    return "…"
+    if {$lo < 3} { return "\u2026" }
+    return [_middle $text $lo]
+}
+
+# text with only keep characters left, split around a middle ellipsis.
+proc ::vmdai::theme::_middle {text keep} {
+    set head [expr {($keep + 1) / 2}]
+    set tail [expr {$keep - $head}]
+    return "[string range $text 0 [expr {$head - 1}]]\u2026[string range $text end-[expr {$tail - 1}] end]"
 }

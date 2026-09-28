@@ -518,12 +518,18 @@ proc ::vmdai::vm::apply {stateVar event} {
         }
         return {}
     }
+    # A reasoning/message seals its block with the runtime's duration_ms
+    # before the generic close could seal it from chunk timestamps, so a
+    # live chat and its replay say the same "Thought for N s" (spec 2c).
+    if {$role eq "reasoning" && $type eq "message"} {
+        set ops [_on_reasoning_message S $md $text $ts]
+        return [concat $ops [_close_open S $ts]]
+    }
     set ops [_close_open S $ts]
     set kind [_get $md kind]
     switch -- $role/$type {
         user/message      { lappend ops {*}[_on_user_message S $text $ts] }
         assistant/message { lappend ops {*}[_on_assistant_message S $md $text $ts] }
-        reasoning/message { lappend ops {*}[_on_reasoning_message S $md $text $ts] }
         error/message     { lappend ops {*}[_on_error $md $text] }
         system/message {
             if {[_get $md notice] eq "tcl_trust_boundary"} {
@@ -627,7 +633,16 @@ proc ::vmdai::vm::_on_local {sv kind md ts} {
     switch -- $kind {
         local.connection {
             set new [_get $md state]
+            # launching and connecting (a restart in progress) keep the last
+            # state, so the ready that ends a restart still closes the loss.
+            if {$new ni {reconnecting down ready}} { return {} }
             set old [dict get $S conn]
+            # Never connected in this panel: not a lost connection, and conn
+            # stays "" so a later real loss is still noted.
+            if {$old eq "" && $new eq "down"} {
+                return [list [list notice warn \
+                    "Runtime unavailable at [_clock_text [_secs $ts]] \u00b7 your draft is kept"]]
+            }
             dict set S conn $new
             if {$new eq $old} { return {} }
             switch -- $new {

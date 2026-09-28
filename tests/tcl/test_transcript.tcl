@@ -29,7 +29,7 @@ proc dumped {} { return [lrange [split [::vmdai::transcript::dump] "\n"] 1 end-1
 proc click_link {label} {
     set at [$::t search -backwards -exact $label end 1.0]
     foreach tag [$::t tag names $at] {
-        if {[string match act:* $tag]} { uplevel #0 [$::t tag bind $tag <ButtonRelease-1>] }
+        if {[string match act:* $tag]} { uplevel #0 [tk_bound [$::t tag bind $tag <ButtonRelease-1>]] }
     }
 }
 

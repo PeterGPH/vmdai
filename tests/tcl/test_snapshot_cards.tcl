@@ -114,7 +114,7 @@ test max-30 {at most 30 photos stay loaded; older cards show "Show image", which
     for {set i 1} {$i <= 32} {incr i} { snap_row r1 s$i $small $small }
     set r [list [::vmdai::transcript::loaded_image_count] [mode s1] [mode s2] [mode s3] \
         [expr {"Show image" in [texts s1]}]]
-    uplevel #0 [[card s1] bind lk_show <ButtonRelease-1>]
+    uplevel #0 [tk_bound [[card s1] bind lk_show <ButtonRelease-1>]]
     lappend r [mode s1] [mode s3] [::vmdai::transcript::loaded_image_count]
     set before [llength [image names]]
     ::vmdai::transcript::clear
@@ -126,7 +126,7 @@ test card-actions {image click opens the viewer; Open, Reveal, Save PNG… and t
     ops {run.open r1 req_1 qwen3.8:27b 1790208000}
     snap_row r1 k1 $SNAP $SNAP
     set c [card k1]
-    foreach tag {img lk_open lk_reveal lk_save} { uplevel #0 [$c bind $tag <ButtonRelease-1>] }
+    foreach tag {img lk_open lk_reveal lk_save} { uplevel #0 [tk_bound [$c bind $tag <ButtonRelease-1>]] }
     set labels {}
     foreach {label cmd} [::vmdai::transcript::menu_items [lindex [$t tag ranges snap:k1] 0]] {
         lappend labels $label
@@ -165,6 +165,31 @@ test viewer-1 {the viewer shows the whole image, closes on Esc, and frees its ph
     uplevel #0 [bind $w <Escape>]
     lappend r [winfo exists $w] [expr {$p in [image names]}]
 } -result {.vmd_ai_viewer withdrawn 1 ::vmdai::viewer::close {} 0 0}
+
+test percent-path {a path with % reaches Open, Reveal, Save PNG and the viewer byte for byte} -body {
+    fresh
+    set odd [file join $TMP "fig 100%d%%.png"]
+    file copy -force $SNAP $odd
+    ops {run.open r1 req_1 qwen3.8:27b 1790208000}
+    snap_row r1 k1 $odd $odd
+    set c [card k1]
+    foreach tag {img lk_open lk_reveal lk_save} { uplevel #0 [tk_bound [$c bind $tag <ButtonRelease-1>]] }
+    list [lsort -unique [lmap a $::actions {lindex $a 1}]] [expr {[lindex $::actions 0 1] eq $odd}]
+} -result [list [list [file join $TMP "fig 100%d%%.png"]] 1]
+
+test save-png-fails-softly {a failing Save PNG... leaves a note, not a bgerror} -body {
+    fresh
+    ops {run.open r1 req_1 qwen3.8:27b 1790208000}
+    snap_row r1 k1 $SNAP $SNAP
+    proc ::vmdai::viewer::tk_getSaveFile {args} { return /nonexistent_vmdai/x.png }
+    set saved $::vmdai::transcript::on_action
+    set ::vmdai::transcript::on_action ""
+    set rc [catch {::vmdai::transcript::_action save_png $SNAP} m]
+    set ::vmdai::transcript::on_action $saved
+    rename ::vmdai::viewer::tk_getSaveFile {}
+    list $rc $m [string match "*note notewarn | Couldn't save [file tail $SNAP]: *" \
+        [lindex [split [string trim [::vmdai::transcript::dump]] "\n"] end]]
+} -result {0 {} 1}
 
 cleanupTests
 exit

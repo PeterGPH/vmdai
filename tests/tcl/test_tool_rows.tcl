@@ -65,7 +65,7 @@ proc shown {a b} { return [$::t count -displaychars $a $b] }
 proc click_link {label} {
     set at [$::t search -backwards -exact $label end 1.0]
     foreach tag [$::t tag names $at] {
-        if {[string match act:* $tag]} { uplevel #0 [$::t tag bind $tag <ButtonRelease-1>] }
+        if {[string match act:* $tag]} { uplevel #0 [tk_bound [$::t tag bind $tag <ButtonRelease-1>]] }
     }
 }
 
@@ -347,6 +347,53 @@ test refit-order {V6 row refit: drop the rationale, then +N lines, then ellipsiz
     }
     list $seen [string length [lindex [::vmdai::transcript::_row_fit k1 60] 0]]
 } -result {{{1 1 0 1} {0 1 0 1} {0 0 0 1} {0 0 1 1} {0 0 1 0}} 13}
+
+test percent-copy {a command with % reaches Copy byte for byte (Tk %-substitution)} -body {
+    fresh
+    set cmd {puts [format "%.2f %s%%" $rg]; expr {$i % 2}}
+    feed [started req_1] [tstart req_1 k1 $cmd] [tfin req_1 k1]
+    ::vmdai::transcript::toggle_detail k1
+    click_link "Copy"
+    expr {[lindex $::actions end] eq [list copy_text $cmd]}
+} -result 1
+
+test action-glob {an action name with glob characters is skipped, never an error} -body {
+    set saved $::vmdai::transcript::on_action
+    set ::vmdai::transcript::on_action ""
+    set r [list [catch {::vmdai::transcript::_action "copy_run*" req_1} m] $m]
+    set ::vmdai::transcript::on_action $saved
+    set r
+} -result {0 {}}
+
+test save-fails-softly {a failing Save .tcl... leaves a note, not a bgerror} -body {
+    fresh
+    feed [started req_1] [tstart req_1 k1 "mol new 1hck.pdb"] [tfin req_1 k1]
+    namespace eval ::vmdai::tclexport {}
+    proc ::vmdai::tclexport::run_tcl {r} { return "mol new 1hck.pdb\n" }
+    proc ::vmdai::tclexport::save {p t} { error "no such directory" }
+    proc ::vmdai::transcript::tk_getSaveFile {args} { return /nonexistent_vmdai/run.tcl }
+    set saved $::vmdai::transcript::on_action
+    set ::vmdai::transcript::on_action ""
+    set rc [catch {::vmdai::transcript::_action save_run_tcl req_1} m]
+    set ::vmdai::transcript::on_action $saved
+    rename ::vmdai::transcript::tk_getSaveFile {}
+    namespace delete ::vmdai::tclexport
+    list $rc $m [lindex [split [string trim [::vmdai::transcript::dump]] "\n"] end]
+} -result {0 {} {003 note notewarn | Couldn't save run.tcl: no such directory}}
+
+test create-twice {a second create starts from empty run, row and card state} -body {
+    fresh
+    feed [started req_1] [tstart req_1 k1 "mol new 1hck.pdb"]
+    set d1 [::vmdai::transcript::dump]
+    set ::t [::vmdai::transcript::create .tx]
+    pack .tx -fill both -expand 1
+    update
+    ::vmdai::vm::init ::S
+    feed [started req_1] [tstart req_1 k1 "mol new 1hck.pdb"]
+    set d2 [::vmdai::transcript::dump]
+    list [expr {$d1 eq $d2}] [llength [split [string trim $d2] "\n"]] $::vmdai::transcript::S(cur_run) \
+        [expr {"wl:r1" in [$::t tag names [lindex [$::t tag ranges row:k1] 0]]}]
+} -result {1 3 r1 1}
 
 cleanupTests
 exit

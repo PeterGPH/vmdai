@@ -11,3 +11,12 @@ proc load_plugin {args} {
         }
     }
 }
+
+# Run-ready form of a binding script, as Tk dispatches it: every %-sequence
+# is substituted, so a payload may carry % only as %% (Tk turns it into %).
+proc tk_bound {script} {
+    if {[string first % [string map {%% {}} $script]] >= 0} {
+        error "unescaped % in a binding script: $script"
+    }
+    return [string map {%% %} $script]
+}

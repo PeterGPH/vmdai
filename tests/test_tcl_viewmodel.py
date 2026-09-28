@@ -60,6 +60,12 @@ UNIT_TESTS += [
     "stuck_notes",
 ]
 
+# Final-review fix wave (plan 08).
+UNIT_TESTS += [
+    "local_connection_restart",
+    "reasoning_live_duration",
+]
+
 REPLAY = r"""
 source [file join $env(VMDAI_PLUGIN_DIR) viewmodel.tcl]
 set in [open $env(CHATVMD_EVENTS) r]
