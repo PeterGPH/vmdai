@@ -64,6 +64,8 @@ proc ::vmdai::ui::render_event {ev} { lappend ::rendered [dict get $ev seq] }
 proc ::vmdai::ui::notify {level text} { lappend ::notices [list $level $text] }
 proc ::vmdai::ui::set_busy {on} { lappend ::busy_calls $on }
 proc ::vmdai::ui::status {text} { lappend ::statuses $text }
+proc ::vmdai::ui::session_started {result} { lappend ::session_started_calls $result }
+proc ::vmdai::ui::local_event {kind fields} { lappend ::local_events [list $kind $fields] }
 namespace eval ::vmdai::executor { variable executing 0 }
 proc ::vmdai::executor::run {ev} { lappend ::executed [dict get $ev metadata call_key] }
 proc ::vmdai::executor::reset {} {}
@@ -84,7 +86,8 @@ proc fresh {} {
     set ::vmdai::bridge::finished {}
     set ::vmdai::executor::executing 0
     set ::rt_state ready
-    foreach v {calls transport_errors rendered notices busy_calls statuses executed cancelled} {
+    foreach v {calls transport_errors rendered notices busy_calls statuses executed cancelled \
+            session_started_calls local_events} {
         set ::$v {}
     }
     set ::oks 0
@@ -107,7 +110,10 @@ proc st {key} { dict get [::vmdai::bridge::state] $key }
 
 # --- tests --------------------------------------------------------------------
 
-test bridge-start-1 {session.start carries the launch token, event_protocol 1 and vmd_env (C6)} -setup fresh -body {
+# M2 (P09-T07) always asks for event_protocol 2; this fixture's fake runtime
+# still grants 1 (its session.start reply says so), so ::vmdai::bridge::negotiated
+# stays 1 and ::vmdai::ui::session_started fires once with that result.
+test bridge-start-1 {session.start carries the launch token, event_protocol 2 and vmd_env (C6)} -setup fresh -body {
     proc ::vmdinfo {what} {
         switch -- $what { version { return 1.9.4a57 } arch { return MACOSXARM64 } }
     }
@@ -119,9 +125,9 @@ test bridge-start-1 {session.start carries the launch token, event_protocol 1 an
         [dict get $body vmd_env arch] \
         [expr {[dict get $body vmd_env tcl_patchlevel] eq [info patchlevel]}] \
         [dict exists $body vmd_env tk_patchlevel] [st session_id] [st chat_id] \
-        [::vmdai::net::configure]
-} -cleanup fresh -result [list [string repeat a 32] 1 0 1.9.4a57 MACOSXARM64 1 0 sess_1 {} \
-    {-base_url {} -session_id sess_1 -session_token tok_1}]
+        [::vmdai::net::configure] $::vmdai::bridge::negotiated [llength $::session_started_calls]
+} -cleanup fresh -result [list [string repeat a 32] 2 0 1.9.4a57 MACOSXARM64 1 0 sess_1 {} \
+    {-base_url {} -session_id sess_1 -session_token tok_1} 1 1]
 
 test bridge-poll-bad-1 {an undecodable or malformed poll reply is a transport error; after_seq stays} -setup fresh -body {
     set ::replies(chat.events.poll) [list \
@@ -203,7 +209,10 @@ test bridge-end-1 {v1 ends a request on the final message, an error or a cancell
     set r
 } -cleanup fresh -result {1 0 0 0 1}
 
-test bridge-reconcile-1 {after a reconnect, busy with no active request goes idle with one note} -setup fresh -body {
+# P09-T07: this reconcile path now tells the view-model directly
+# (local.request_ended) instead of ::vmdai::ui::notify; the M2 shim prints
+# the same "Request ended (details may be missing)" note from that event.
+test bridge-reconcile-1 {after a reconnect, busy with no active request goes idle and reports local.request_ended} -setup fresh -body {
     started
     set ::replies(chat.send) [list {ok {request_id req_1}}]
     ::vmdai::bridge::send "long job"
@@ -211,8 +220,8 @@ test bridge-reconcile-1 {after a reconnect, busy with no active request goes idl
     set ::replies(runtime.info) [list {ok {version 0.3.0 active_request null}}]
     ::vmdai::bridge::_on_runtime_state reconnecting ready ""
     settle 60
-    list [st busy] [llength [calls runtime.info]] $::notices [lindex $::busy_calls end]
-} -cleanup fresh -result {0 1 {{info {Request ended (details may be missing).}}} 0}
+    list [st busy] [llength [calls runtime.info]] $::local_events $::notices [lindex $::busy_calls end]
+} -cleanup fresh -result {0 1 {{local.request_ended {request_id req_1}}} {} 0}
 
 test bridge-reconcile-2 {a request the runtime still runs stays busy} -setup fresh -body {
     started

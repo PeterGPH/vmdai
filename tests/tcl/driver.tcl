@@ -125,6 +125,19 @@ proc roles {} {
     foreach ev $::events { lappend out "[dict get $ev role]/[dict get $ev type]" }
     return $out
 }
+# P09-T07: v2's system/state events share role/type; metadata.kind tells
+# request.started/tool.started/tool.finished/request.finished apart (the
+# v1-only tool_result/message and system/lifecycle roles no longer occur
+# for these).
+proc kinds {} {
+    set out {}
+    foreach ev $::events {
+        set k ""
+        catch {set k [dict get $ev metadata kind]}
+        lappend out $k
+    }
+    return $out
+}
 proc record_acks {} {
     set ::acks {}
     trace add execution ::vmdai::executor::_on_ack enter {apply {{cmd op} {
@@ -136,7 +149,7 @@ proc common_out {} {
     foreach n $::notices { lappend notes "[lindex $n 1] [lindex $n 2]" }
     set moves {}
     foreach t $::transitions { lappend moves "[lindex $t 1]>[lindex $t 2]" }
-    return [list roles j [jlist [roles]] vmd_calls j [jlist $::vmd_calls] \
+    return [list roles j [jlist [roles]] kinds j [jlist [kinds]] vmd_calls j [jlist $::vmd_calls] \
         notices j [jlist $notes] transitions j [jlist $moves] statuses j [jlist $::statuses] \
         queue i [::vmdai::net::result_queue_size] chat_id s [bstate chat_id] \
         session_starts i [expr {[info exists ::rpc_count(session.start)] ? $::rpc_count(session.start) : 0}]]

@@ -117,6 +117,7 @@ proc ::vmdai::panel::build {{w ""}} {
     ::vmdai::toolbar::set_title [set ::vmdai::panel::title]
     _sync_composer
     _update_status
+    ::vmdai::runtime::subscribe ::vmdai::panel::on_runtime_state
     bind_keys
     return $win
 }
@@ -212,10 +213,13 @@ proc ::vmdai::panel::_sync_composer {} {
 
 proc ::vmdai::panel::render {ops} {
     variable nomodel
+    variable replaying
     set batch {}
     foreach op $ops {
         switch -- [lindex $op 0] {
-            status { _apply_status $op }
+            status {
+                if {!$replaying} { _apply_status $op }
+            }
             error.card {
                 lappend batch $op
                 if {[lindex $op 1] eq "NO_MODEL"} {
@@ -226,7 +230,7 @@ proc ::vmdai::panel::render {ops} {
             default { lappend batch $op }
         }
     }
-    if {[llength $batch]} { ::vmdai::transcript::apply_ops $batch }
+    if {[llength $batch]} { _apply_transcript $batch }
 }
 
 # {status busy <text> <t0>} or {status idle}
@@ -264,9 +268,15 @@ proc ::vmdai::panel::on_stop {args} {
     _sync_composer
 }
 
+# A new chat is empty, so it shows the empty state again once the runtime
+# has answered runtime.info.
 proc ::vmdai::panel::new_chat {} {
+    variable rt_info
+    variable text
     if {[bridge_busy]} { return }
+    reset_view
     ::vmdai::bridge::new_chat
+    if {[dict size $rt_info]} { ::vmdai::transcript::show_empty_state [empty_info] $text }
 }
 
 proc ::vmdai::panel::open_settings {{tab model} {prefill {}}} {
@@ -378,10 +388,11 @@ proc ::vmdai::panel::_update_status {} {
         folder [pwd] runs [run_count]]
 }
 
-# Called after Settings saves. P09-T07 replaces it with the version that
-# re-reads runtime.info and profiles.list before updating the status bar.
+# Called after Settings saves, and on session start: re-reads runtime.info
+# and profiles.list before updating the status bar and empty state.
 proc ::vmdai::panel::refresh_info {} {
-    _update_status
+    ::vmdai::net::call runtime.info {} [list ::vmdai::panel::_on_info]
+    ::vmdai::net::call profiles.list {} [list ::vmdai::panel::_on_profiles]
 }
 
 # ---- keyboard map (Part B V5; P09-T03) ----------------------------------------
@@ -504,5 +515,197 @@ proc ::vmdai::panel::bind_keys {} {
         if {$w eq ""} { continue }
         bind $w <Tab> {::vmdai::panel::focus_next %W; break}
         bind $w <<PrevWindow>> {::vmdai::panel::focus_prev %W; break}
+    }
+}
+
+# ---- view-model wiring (P09-T07) -------------------------------------------------
+
+namespace eval ::vmdai::panel {
+    if {![info exists ::vmdai::panel::replaying]} { variable replaying 0 }
+    if {![info exists ::vmdai::panel::replayed]} { variable replayed "" }
+    if {![info exists ::vmdai::panel::replay_synthetic]} { variable replay_synthetic {} }
+    if {![info exists ::vmdai::panel::has_content]} { variable has_content 0 }
+    # call_key -> {request_id command} of the Tcl commands this view has seen.
+    if {![array exists ::vmdai::panel::commands]} {
+        variable commands
+        array set commands {}
+    }
+}
+
+# Every display event (live, local or replayed) enters here.
+proc ::vmdai::panel::on_event {ev} {
+    variable win
+    variable last_sent
+    if {![winfo exists $win]} { return }
+    render [::vmdai::vm::apply ::vmdai::panel::vm $ev]
+    _record_tcl $ev
+    set kind ""
+    catch {set kind [dict get $ev metadata kind]}
+    if {$kind eq "local.send_failed" && $last_sent ne "" && [::vmdai::composer::get_text] eq ""} {
+        ::vmdai::composer::set_text $last_sent
+    }
+}
+
+# Feed the Copy/Save .tcl ledger (P08-T11) from the display events: the
+# command comes from tool.started, the statement counts from tool.finished
+# (a late tool.finished records again, so the ledger follows the late result).
+# Replay goes through here too, so a resumed chat's ledger is rebuilt.
+proc ::vmdai::panel::_record_tcl {ev} {
+    variable commands
+    set md {}
+    set kind ""
+    set key ""
+    catch {set md [dict get $ev metadata]}
+    catch {set kind [dict get $md kind]}
+    catch {set key [dict get $md call_key]}
+    if {$key eq "" || $kind ni {tool.started tool.finished}} { return }
+    if {$kind eq "tool.started"} {
+        set command ""
+        set executor tcl
+        catch {set command [dict get $md input command]}
+        catch {set executor [dict get $md executor]}
+        if {$command ne "" && $executor eq "tcl"} {
+            set rid ""
+            catch {set rid [dict get $md request_id]}
+            set commands($key) [list $rid $command]
+        }
+        return
+    }
+    if {![info exists commands($key)]} { return }
+    lassign $commands($key) rid command
+    set applied 0
+    set failed_index ""
+    catch {set applied [dict get $md statements applied]}
+    catch {set failed_index [dict get $md statements failed index]}
+    if {![string is integer -strict $applied]} { set applied 0 }
+    if {![string is integer -strict $failed_index]} { set failed_index "" }
+    if {[catch {::vmdai::tclexport::record $rid $key $command $applied $failed_index} err]} {
+        ::vmdai::config::log "panel: tclexport::record failed for $key: $err"
+    }
+}
+
+proc ::vmdai::panel::_apply_transcript {ops} {
+    variable has_content
+    set has_content 1
+    ::vmdai::transcript::hide_empty_state
+    ::vmdai::transcript::apply_ops $ops
+}
+
+# A fresh view: New chat, and before a resumed chat is replayed.
+proc ::vmdai::panel::reset_view {} {
+    variable has_content
+    variable nomodel
+    variable stopping
+    set has_content 0
+    set nomodel 0
+    set stopping 0
+    ::vmdai::transcript::hide_empty_state
+    ::vmdai::transcript::clear
+    ::vmdai::vm::init ::vmdai::panel::vm
+    ::vmdai::tclexport::reset
+    array unset ::vmdai::panel::commands
+    ::vmdai::composer::clear_history
+    set_title "New chat"
+    _sync_composer
+}
+
+# Replay a chat's display log. A request with request.started but no
+# request.finished (the runtime died) is closed with local.request_ended.
+# The chat's own prompts go back into Up/Down recall (V5 "in this chat").
+proc ::vmdai::panel::replay {chat_id events {title ""}} {
+    variable replaying
+    variable replayed
+    variable replay_synthetic
+    reset_view
+    set replaying 1
+    set replay_synthetic {}
+    set open ""
+    foreach ev $events {
+        set kind ""
+        set rid ""
+        set role ""
+        catch {set kind [dict get $ev metadata kind]}
+        catch {set rid [dict get $ev metadata request_id]}
+        catch {set role [dict get $ev role]}
+        if {$role eq "user" && [dict exists $ev text]} {
+            ::vmdai::composer::push_history [dict get $ev text]
+        }
+        if {$kind eq "request.started"} { set open $rid }
+        if {$kind eq "request.finished" && $rid eq $open} { set open "" }
+        if {[catch {on_event $ev} err]} {
+            ::vmdai::config::log "panel: replay skipped an event: $err"
+        }
+    }
+    if {$open ne ""} {
+        lappend replay_synthetic local.request_ended
+        on_event [::vmdai::vm::local_event local.request_ended [dict create request_id $open]]
+    }
+    set replaying 0
+    if {$title ne ""} { set_title $title }
+    set replayed $chat_id
+}
+
+proc ::vmdai::panel::on_session_started {result} {
+    variable win
+    if {![winfo exists $win]} { return }
+    refresh_info
+}
+
+proc ::vmdai::panel::_on_info {form args} {
+    variable win
+    variable rt_info
+    variable has_content
+    variable nomodel
+    variable text
+    if {$form ne "ok" || ![winfo exists $win]} { return }
+    set rt_info [lindex $args 0]
+    set model ""
+    set loop 0
+    catch {set model [dict get $rt_info model]}
+    catch {set loop [string is true -strict [dict get $rt_info agent_loop]]}
+    set nomodel [expr {$model eq "" || $model eq "null" || !$loop}]
+    _sync_composer
+    _update_status
+    if {!$has_content} { ::vmdai::transcript::show_empty_state [empty_info] $text }
+}
+
+proc ::vmdai::panel::_on_profiles {form args} {
+    variable server_host
+    if {$form ne "ok"} { return }
+    set r [lindex $args 0]
+    set active ""
+    set url ""
+    catch {set active [dict get $r active]}
+    catch {set url [dict get $r profiles $active base_url]}
+    set server_host [expr {$url eq "" || $url eq "null" ? "" : [hostport $url]}]
+    _update_status
+}
+
+# runtime.info plus what the empty state's Ready group shows.
+proc ::vmdai::panel::empty_info {} {
+    variable rt_info
+    set info $rt_info
+    set endpoint ""
+    catch {
+        set rt [::vmdai::runtime::info]
+        set endpoint "[dict get $rt host]:[dict get $rt port]"
+    }
+    dict set info connected [expr {[::vmdai::runtime::state] eq "ready"}]
+    dict set info endpoint $endpoint
+    dict set info folder [pwd]
+    dict set info runs [run_count]
+    return $info
+}
+
+# runtime::subscribe callback: banner, status bar, composer, and a reload of
+# an open Settings dialog once a (possibly new) runtime is ready again.
+proc ::vmdai::panel::on_runtime_state {old new detail} {
+    variable win
+    if {![winfo exists $win]} { return }
+    ::vmdai::banner::on_runtime_state $old $new $detail
+    _sync_composer
+    _update_status
+    if {$new eq "ready" && $old ne "ready" && [winfo exists $::vmdai::settings::win]} {
+        ::vmdai::settings::reload
     }
 }

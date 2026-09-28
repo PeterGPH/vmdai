@@ -6,8 +6,12 @@
 # RPC outcome is fed to the connection state machine (P06-T06 contract).
 
 namespace eval ::vmdai::bridge {
-    # The display events this plugin asks for (spec 2c). M1 renders v1.
-    variable event_protocol 1
+    # M2 asks for the display events (section 2c). A constant: re-sourcing
+    # resets it. `negotiated` is what the runtime actually granted (an older
+    # runtime may still answer 1); `long_poll` is read from its capabilities.
+    variable event_protocol 2
+    if {![info exists ::vmdai::bridge::negotiated]} { variable negotiated 1 }
+    if {![info exists ::vmdai::bridge::long_poll]} { variable long_poll 0 }
     variable session_id
     if {![info exists session_id]} { set session_id "" }
     variable session_token
@@ -213,6 +217,7 @@ proc ::vmdai::bridge::_on_session_started {callback kind args} {
     note_outcome session.start $kind {*}$args
     if {$kind eq "ok"} {
         set result [lindex $args 0]
+        note_session $result
         set session_id [_dget $result session_id ""]
         set session_token [_dget $result session_token ""]
         ::vmdai::net::configure -session_id $session_id -session_token $session_token
@@ -222,6 +227,9 @@ proc ::vmdai::bridge::_on_session_started {callback kind args} {
             set chat_id [_dget $result chat_id ""]
         }
         set after_seq 0
+        if {[catch {::vmdai::ui::session_started $result} err]} {
+            _log "ui: $err"
+        }
     } else {
         set recovering 0
         set message [lindex $args [expr {$kind eq "rpc_error" ? 1 : 0}]]
@@ -276,7 +284,7 @@ proc ::vmdai::bridge::_on_recover_resume {target callback kind args} {
     note_outcome chat.resume $kind {*}$args
     set recovering 0
     if {$kind eq "ok"} {
-        _resumed $target [lindex $args 0]
+        _resumed $target [lindex $args 0] 0
     } elseif {$kind eq "rpc_error" && [lindex $args 0] eq "CHAT_LOCKED" && $recover_retries > 0} {
         incr recover_retries -1
         _log "recover: chat.resume $target got CHAT_LOCKED, retrying ($recover_retries left)"
@@ -387,8 +395,11 @@ proc ::vmdai::bridge::_on_resume {target callback kind args} {
 
 # chat.resume succeeded: switch chat_id and after_seq (the runtime's
 # last_seq; older runtimes restart at 0), drop replies meant for the old
-# chat, and apply the folder again.
-proc ::vmdai::bridge::_resumed {target result} {
+# chat, and apply the folder again. Only a user-chosen resume replays the
+# display log ($replay 1, the default); ::vmdai::bridge::recover's automatic
+# resume after a reconnect passes 0, because the transcript already shows
+# this chat and its own connection notes (S3).
+proc ::vmdai::bridge::_resumed {target result {replay 1}} {
     variable chat_id
     variable after_seq
     variable polling
@@ -404,6 +415,9 @@ proc ::vmdai::bridge::_resumed {target result} {
         set after_seq 0
     }
     _send_cwd
+    if {$replay} {
+        replay_history $target [_dget $result title ""]
+    }
 }
 
 proc ::vmdai::bridge::_resume_failed {kind args} {
@@ -475,6 +489,7 @@ proc ::vmdai::bridge::_on_send {kind args} {
         }
         rpc_error {
             lassign $args code message
+            send_failed $code $message
             if {[catch {::vmdai::ui::notify error "Could not send: $message"} err]} {
                 _log "ui: $err"
             }
@@ -549,8 +564,9 @@ proc ::vmdai::bridge::_poll {} {
         return
     }
     set polling 1
-    ::vmdai::net::call chat.events.poll [list after_seq i $after_seq limit i $poll_limit] \
-        [list ::vmdai::bridge::_on_poll $session_id] -timeout $::vmdai::config::request_timeout_ms
+    ::vmdai::net::call chat.events.poll [list after_seq i $after_seq limit i $poll_limit \
+            {*}[::vmdai::bridge::poll_extra_params]] \
+        [list ::vmdai::bridge::_on_poll $session_id] -timeout [::vmdai::bridge::poll_timeout_ms]
 }
 
 proc ::vmdai::bridge::_on_poll {sid kind args} {
@@ -604,7 +620,7 @@ proc ::vmdai::bridge::_on_poll {sid kind args} {
     if {$op_busy} {
         return
     }
-    _schedule_poll [expr {$more ? 0 : $::vmdai::config::poll_ms}]
+    _schedule_poll [expr {$more ? 0 : [::vmdai::bridge::poll_delay_ms]}]
 }
 
 proc ::vmdai::bridge::_executing {} {
@@ -625,10 +641,9 @@ proc ::vmdai::bridge::_dispatch {ev} {
         ::vmdai::executor::run $ev
         return
     }
-    if {[catch {::vmdai::ui::render_event $ev} err]} {
-        _log "render_event: $err"
+    if {[catch {::vmdai::bridge::route_display_event $ev} err]} {
+        _log "route_display_event: $err"
     }
-    _check_end $ev
 }
 
 proc ::vmdai::bridge::_defer {ev} {
@@ -655,26 +670,6 @@ proc ::vmdai::bridge::_drain {} {
             _log "executor::run failed: $::errorInfo"
         }
     }
-}
-
-# v1 end of a request: the final assistant/message, an error event, or the
-# `cancelled` lifecycle event.
-proc ::vmdai::bridge::_check_end {ev} {
-    variable request_id
-    set role [_dget $ev role ""]
-    set type [_dget $ev type ""]
-    set text [_dget $ev text ""]
-    set rid ""
-    catch {set rid [dict get $ev metadata request_id]}
-    set ends [expr {($role eq "assistant" && $type eq "message") || $role eq "error"
-        || ($role eq "system" && $type eq "lifecycle" && $text eq "cancelled")}]
-    if {!$ends} {
-        return
-    }
-    if {$rid eq "" || $rid eq "null"} {
-        set rid $request_id
-    }
-    _request_ended $rid
 }
 
 # --- connection state (P06-T06 contract) --------------------------------------
@@ -740,7 +735,7 @@ proc ::vmdai::bridge::_on_info {rid kind args} {
         return
     }
     _request_ended $rid
-    if {[catch {::vmdai::ui::notify info "Request ended (details may be missing)."} err]} {
+    if {[catch {::vmdai::ui::local_event local.request_ended [dict create request_id $rid]} err]} {
         _log "ui: $err"
     }
 }
@@ -884,6 +879,114 @@ proc ::vmdai::bridge::history_get {target callback} {
 proc ::vmdai::bridge::set_provider {provider model {callback ""}} {
     ::vmdai::net::call provider.set [list provider s $provider model s $model] \
         [list ::vmdai::bridge::_relay provider.set $callback]
+}
+
+# ===========================================================================
+# M2: event_protocol 2, long-poll, v2 request tracking, replay (P09-T07).
+# ===========================================================================
+
+# Record what the runtime granted in session.start.
+proc ::vmdai::bridge::note_session {result} {
+    variable negotiated
+    variable long_poll
+    set negotiated 1
+    catch {set negotiated [dict get $result event_protocol]}
+    set long_poll 0
+    if {[dict exists $result capabilities long_poll]} {
+        set long_poll [string is true -strict [dict get $result capabilities long_poll]]
+    }
+}
+
+proc ::vmdai::bridge::poll_extra_params {} {
+    variable long_poll
+    if {$long_poll} { return [list wait_ms i 2000] }
+    return {}
+}
+
+# chat.events.poll: wait_ms + 3000 with long-poll, else the default timeout.
+proc ::vmdai::bridge::poll_timeout_ms {} {
+    variable long_poll
+    if {$long_poll} { return 5000 }
+    return $::vmdai::config::request_timeout_ms
+}
+
+# With long-poll the runtime blocks up to 2 s, so the next poll goes out
+# almost at once (20 ms keeps a misbehaving server from spinning us).
+proc ::vmdai::bridge::poll_delay_ms {} {
+    variable long_poll
+    if {$long_poll} { return 20 }
+    return $::vmdai::config::poll_ms
+}
+
+# Every event except tool_start goes to the panel; a v2 request ends only on
+# its request.finished (per-turn assistant/message events do not end it). A
+# runtime that only granted event_protocol 1 (negotiated < 2) keeps the v1
+# rule: the final assistant/message, an error event, or a cancelled lifecycle.
+proc ::vmdai::bridge::route_display_event {ev} {
+    variable negotiated
+    variable request_id
+    set role ""
+    set type ""
+    set text ""
+    set md {}
+    catch {set role [dict get $ev role]}
+    catch {set type [dict get $ev type]}
+    catch {set text [dict get $ev text]}
+    catch {set md [dict get $ev metadata]}
+    set rid ""
+    set kind ""
+    catch {set rid [dict get $md request_id]}
+    catch {set kind [dict get $md kind]}
+    if {$negotiated >= 2} {
+        set ends [expr {$kind eq "request.finished"}]
+    } else {
+        set ends [expr {($role eq "assistant" && $type eq "message") || $role eq "error"
+            || ($role eq "system" && $type eq "lifecycle" && $text eq "cancelled")}]
+    }
+    ::vmdai::ui::render_event $ev
+    if {$ends} {
+        if {$rid eq "" || $rid eq "null"} { set rid $request_id }
+        _end_request $rid
+    }
+}
+
+# Ends a request the way every ending path does: _request_ended records rid
+# in `finished` (so a chat.send reply that arrives after the request already
+# ended does not resurrect busy - spec 5) and clears busy/request_id only if
+# rid is still the current request.
+proc ::vmdai::bridge::_end_request {rid} {
+    _request_ended $rid
+}
+
+# chat.send failed before a request existed (NO_MODEL, REQUEST_CONFLICT, ...).
+proc ::vmdai::bridge::send_failed {code message} {
+    if {[catch {::vmdai::ui::local_event local.send_failed \
+            [dict create code $code message $message]} err]} {
+        _log "ui: $err"
+    }
+}
+
+# Resume shows the same rows as the live chat: the display log goes through
+# the view-model again (section 2c Persistence). It is never routed to the executor.
+proc ::vmdai::bridge::replay_history {chat_id {title ""}} {
+    ::vmdai::net::call chat.history.get [list chat_id s $chat_id limit i 5000] \
+        [list ::vmdai::bridge::_on_history $chat_id $title]
+}
+
+proc ::vmdai::bridge::_on_history {chat_id title form args} {
+    if {$form ne "ok"} {
+        if {[catch {::vmdai::ui::status "Could not load this chat's history."} err]} {
+            _log "ui: $err"
+        }
+        return
+    }
+    set result [lindex $args 0]
+    set events {}
+    catch {set events [dict get $result events]}
+    if {$title eq ""} { catch {set title [dict get $result manifest title]} }
+    if {[catch {::vmdai::ui::replay $chat_id $events $title} err]} {
+        _log "ui: $err"
+    }
 }
 
 if {[llength [info commands ::vmdai::runtime::subscribe]]} {

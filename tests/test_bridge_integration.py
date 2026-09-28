@@ -132,8 +132,13 @@ def test_tool_round_trip_with_ack(request, tmp_path):
     data, factory, _ = _cached(request, tmp_path)
     assert data["acks"] == ["ok proceed true", "ok proceed true"]
     assert data["vmd_calls"] == ["mol new 1abc.pdb", "display update", "render TachyonInternal"]
-    assert data["roles"].count("tool_result/message") == 2
-    assert data["roles"][-1] == "assistant/message"
+    # P09-T07 (event_protocol 2): a tool result is a system/state event with
+    # metadata.kind tool.finished, not a v1 tool_result/message role.
+    assert data["kinds"].count("tool.finished") == 2
+    # The final assistant/message precedes request.finished, now the true
+    # last event of a v2 request.
+    assert data["roles"][-2] == "assistant/message"
+    assert data["kinds"][-1] == "request.finished"
     assert data["text"].endswith("Loaded 42 atoms.")
     assert data["queue"] == 0 and data["ledger"] == 2
     assert len(factory.calls) == 3
@@ -162,7 +167,9 @@ def test_cancel_after_ack(request, tmp_path):
     data, _, _ = _cached(request, tmp_path)
     assert data["ran"] == 1 and data["acks"] == ["ok proceed true"]
     assert data["queue"] == 0
-    assert data["roles"][-1] == "system/lifecycle"
+    # P09-T07 (event_protocol 2): a stopped request ends on request.finished
+    # (status cancelled), not a v1 system/lifecycle "cancelled" event.
+    assert data["kinds"][-1] == "request.finished"
     assert data["elapsed_ms"] < 10000  # the result came back inside the grace period
 
 
@@ -211,11 +218,24 @@ RUNS: Dict[str, Tuple[str, Optional[Callable[[RunningRuntime], None]]]] = {
 
 @_uses("kill")
 def test_kill_restart_one_notice_send_within_10s(request, tmp_path):
-    """S3: one notice per state change, recovery and a working chat.send within 10 s."""
+    """S3: recovery and a working chat.send within 10 s, at most one notice
+    per state change.
+
+    P09-T07 (event_protocol 2, long-poll): the poll's own timeout is now
+    5 s (was 3 s), so the plugin's single outstanding chat.events.poll can
+    outlast a short (~1 s) outage without ever failing at the transport
+    level; recovery then happens silently, through AUTH_FAILED on the next
+    RPC, with no reconnecting/ready transition or notice at all. Both paths
+    satisfy S3 (a bounded outage is repaired without duplicate notices), so
+    this accepts either.
+    """
     data, _, runtime = _cached(request, tmp_path)
-    assert data["transitions"] == ["ready>reconnecting", "reconnecting>ready"]
-    assert data["notices"] == ["warn Lost the connection to the AI runtime; reconnecting.",
-                               "info Reconnected to the AI runtime."]
+    if data["transitions"]:
+        assert data["transitions"] == ["ready>reconnecting", "reconnecting>ready"]
+        assert data["notices"] == ["warn Lost the connection to the AI runtime; reconnecting.",
+                                   "info Reconnected to the AI runtime."]
+    else:
+        assert data["notices"] == []
     assert data["elapsed_ms"] < 10000
     assert data["chat_id"] == data["chat_before"]
     assert data["session_starts"] == 2
