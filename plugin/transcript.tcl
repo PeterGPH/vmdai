@@ -17,6 +17,11 @@
 # and it is never -state disabled. Every element ends with its own newline,
 # so prose, reasoning, notes and tool rows never share a line (S2).
 
+# M3 (plan 10): the step detail colours its command with syntax.tcl.  Sourced
+# here so every file that sources transcript.tcl gets it; syntax.tcl is safe
+# to source again.
+source [file join [file dirname [info script]] syntax.tcl]
+
 namespace eval ::vmdai::transcript {
     variable W
     if {![info exists W]} { set W "" }
@@ -1290,7 +1295,7 @@ proc ::vmdai::transcript::_build_detail {k} {
         }
         $W insert dins:$k {*}$gutter
         foreach {text class} $line {
-            if {$text ne ""} { $W insert dins:$k $text [concat $base dcode $class] }
+            if {$text ne ""} { $W insert dins:$k $text [concat $base dcode $class dcmd:$k] }
         }
         $W insert dins:$k "\n" $base
     }
@@ -1319,6 +1324,7 @@ proc ::vmdai::transcript::_build_detail {k} {
     $W insert dins:$k "Copy" [concat $base dlink link [_link copy_text $cmd]] "\n" $base
     $W tag add dfirst $first "$first lineend +1c"
     $W tag add dlast "dins:$k -1l linestart" dins:$k
+    ::vmdai::syntax::highlight_tag $W dcmd:$k
 }
 
 proc ::vmdai::transcript::_do_show_all {k} {

@@ -5,8 +5,8 @@ images 1
 006 chev cmd extra g_err meta row | ✗⇥display backgroundcolor white  +1 lines  Make the background white.⇥0.5 s  ▾
 007 errline | display: invalid option "backgroundcolor"
 008 detail dfirst dnote | Make the background white.
-009 dcode detail dgut |   color Display Background white
-010 dcode detail dfail dgut dgutx | ✗ display backgroundcolor white
+009 dcode detail dgut syn_cmd |   color Display Background white
+010 dcode detail dfail dgut dgutx syn_cmd | ✗ display backgroundcolor white
 011 detail dnote | Statement 1 ran and is kept in Save .tcl; the rest is commented out
 012 detail dlast dlink link | Copy
 016 thumb | <card>

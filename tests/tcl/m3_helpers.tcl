@@ -92,8 +92,7 @@ proc ::m3::root_text {{geom 560x780}} {
     text .m3md -wrap word -font ChatBody -padx 20 -pady 14 -width 10 -height 10 \
         -background [::vmdai::theme::c surface] -foreground [::vmdai::theme::c text]
     pack .m3md -fill both -expand 1
-    update idletasks
-    update
+    ::harness::settle
     return .m3md
 }
 

@@ -749,3 +749,23 @@ proc ::vmdai::theme::_system_changed {} {
         _apply_mode $eff
     }
 }
+
+# syntax_tags t: the syn_* tags of text widget t, from the syn_* tokens (V2).
+# A tag that dims text with muted or faint (the statements after a failure,
+# V4 "Step detail") is raised above them, so dimmed code stays dimmed.
+proc ::vmdai::theme::syntax_tags {t} {
+    foreach cls {cmd var str num brace opt cmt} {
+        $t tag configure syn_$cls -foreground [c syn_$cls]
+        $t tag raise syn_$cls
+    }
+    set dim [list [string tolower [c muted]] [string tolower [c faint]]]
+    foreach tag [$t tag names] {
+        if {[string match syn_* $tag] || [catch {$t tag cget $tag -foreground} fg]} {
+            continue
+        }
+        if {[lsearch -exact $dim [string tolower $fg]] >= 0} {
+            $t tag raise $tag
+        }
+    }
+    catch {$t tag raise sel}
+}
