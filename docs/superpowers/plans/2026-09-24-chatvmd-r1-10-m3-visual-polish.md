@@ -4079,6 +4079,7 @@ The Native prototype predates the grafts and the spec's required fixes (Part B V
 | D3 | The Ready group with row dividers: Runtime, Model (Change), Folder (Change), and the trust row "Model-written Tcl runs unsandboxed in this VMD session. Only load files you trust." | V4 Empty state | pending |
 | D4 | The key hints row `⏎ send · ⇧⏎ newline · ↑ last prompt · esc stop` | V4 Empty state | pending |
 | D5 | Composer placeholder "Ask VMD to load, show or measure something…"; toolbar title "New chat" | V4 Composer | pending |
+| D6 | In column mode (transcript < 520 px, e.g. a 420 px window) and in pair mode below about 650 px of height, the Ready group, trust row and key hints stay reachable (the overlay scrolls or the cards compact); parked from plan 09 T02 | V4 Empty state | pending |
 
 ## E — Settings (`E_settings.png`)
 

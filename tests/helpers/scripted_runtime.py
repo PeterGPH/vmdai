@@ -10,15 +10,17 @@ nothing (plan 02's factory contract); turns are taken when the loop runs.
 ``factory.calls`` holds a deep copy of the messages of every model call, so a
 test can check what the model saw (S10).
 
-``serve_runtime(home, loop_factory)`` builds a token-only RuntimeApp (like
-``main.py --announce``: no tokenless sessions) with its chats under
+``serve_runtime(home, loop_factory, **app_kw)`` builds a token-only RuntimeApp
+(like ``main.py --announce``: no tokenless sessions) with its chats under
 ``home/.vmdai/chats``, serves it on 127.0.0.1:<ephemeral> and writes the
-attach token file ``home/.vmdai/run/runtime-<port>.json``. ``stop()`` takes
-it down as a crash would (the port closes; chat locks and requests die with
-it). ``restart_same_port()`` then starts a new RuntimeApp on the same port
-with a new token and token file, sharing the chat store, like a runtime
-restarted by ``scripts/run_runtime.sh``. The pid in ``/health`` stays the
-pytest process's, so the plugin notices the restart through AUTH_FAILED.
+attach token file ``home/.vmdai/run/runtime-<port>.json``. Extra ``app_kw``
+(e.g. ``settings_store=...``) go to every ``RuntimeApp`` this ``RunningRuntime``
+builds. ``stop()`` takes it down as a crash would (the port closes; chat
+locks and requests die with it). ``restart_same_port()`` then starts a new
+RuntimeApp on the same port with a new token and token file, sharing the
+chat store and any given ``settings_store``, like a runtime restarted by
+``scripts/run_runtime.sh``. The pid in ``/health`` stays the pytest
+process's, so the plugin notices the restart through AUTH_FAILED.
 """
 from __future__ import annotations
 
@@ -92,11 +94,16 @@ class RunningRuntime:
     _server: Any = None
     _thread: Optional[threading.Thread] = None
     apps: List[RuntimeApp] = field(default_factory=list)
+    # Extra RuntimeApp kwargs (e.g. settings_store=...); passed to every
+    # make_app call, so a restart shares them (its store survives) instead
+    # of each RuntimeApp getting its own default one.
+    app_kw: Dict[str, Any] = field(default_factory=dict)
 
     def _start(self, port: int) -> None:
         self.token = generate_launch_token()
         self.app = make_app(self.home / ".vmdai", launch_token=self.token,
-                            allow_tokenless_v1=False, loop_factory=self.loop_factory)
+                            allow_tokenless_v1=False, loop_factory=self.loop_factory,
+                            **self.app_kw)
         self.apps.append(self.app)
         self._server = create_server(self.app, host="127.0.0.1", port=port)
         self.port = int(self._server.server_port)
@@ -131,7 +138,7 @@ class RunningRuntime:
         self._start(self.port)
 
 
-def serve_runtime(home: Path, loop_factory) -> RunningRuntime:
-    runtime = RunningRuntime(home=Path(home), loop_factory=loop_factory)
+def serve_runtime(home: Path, loop_factory, **app_kw: Any) -> RunningRuntime:
+    runtime = RunningRuntime(home=Path(home), loop_factory=loop_factory, app_kw=app_kw)
     runtime._start(0)
     return runtime

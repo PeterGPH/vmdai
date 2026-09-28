@@ -24,10 +24,15 @@ proc sleep_ms {ms} {
     after $ms {set ::_slept 1}
     vwait ::_slept
 }
-# The panel needs Tk; these tests only need its names.
+# The panel needs Tk; these tests only need its names. ::vmdai::panel::show
+# is only sourced when Tk is loaded (P09-T01), so without Tk it must be
+# stubbed the same way the M1 ::vmdai::ui::show_panel used to be - it never
+# gets overwritten by a re-source since init.tcl's M2 loop stays inert here.
 proc stub_panel {} {
     proc ::vmdai::ui::show_panel {} { return .vmd_ai }
     foreach p {notify render_event set_busy status} { proc ::vmdai::ui::$p {args} {} }
+    namespace eval ::vmdai::panel {}
+    proc ::vmdai::panel::show {} { return .vmd_ai }
 }
 # Attach to the fake runtime and wait for a session and a running pump.
 proc attach_and_poll {} {

@@ -1726,3 +1726,464 @@ proc ::vmdai::transcript::_do_reveal_file {path} { _call ::vmdai::viewer::reveal
 proc ::vmdai::transcript::_do_save_png {path} {
     if {[catch {_call ::vmdai::viewer::save_copy $path} err]} { _save_failed $path $err }
 }
+
+# ===========================================================================
+# Empty state (Part B V4 "Empty state"; P09-T02).
+#
+# A frame placed over the transcript text: the mark, the title, a lead line,
+# four example cards (2x2 from 520 px, else one column), the bordered Ready
+# group (Runtime, Model, the first-run servers, Folder, the trust notice) and
+# the key hints. It never inserts into the text, so the op goldens and the
+# dump are unaffected; the panel removes it before the first op it applies.
+# ===========================================================================
+namespace eval ::vmdai::transcript {
+    variable EMPTY_TITLE "What should VMD do?"
+    variable EMPTY_LEAD "Describe a view, a measurement or an analysis. ChatVMD writes the Tcl, runs it in this VMD session and checks the result."
+    variable TRUST_TEXT "Model-written Tcl runs unsandboxed in this VMD session. Only load files you trust."
+    variable EXAMPLES [list \
+        [list load    "Load & style"      "Load PDB 1HCK as NewCartoon colored by secondary structure"] \
+        [list pocket  "Binding pocket"    "Show residues within 5 \u00c5 of the ligand as Licorice"] \
+        [list bfactor "Color by B-factor" "Color the protein by B-factor and render a snapshot"] \
+        [list rmsd    "Trajectory RMSD"   "Measure the backbone RMSD over the loaded trajectory"]]
+    variable PAIR_MIN_WIDTH 520
+    if {![info exists ::vmdai::transcript::empty_host]} { variable empty_host "" }
+    if {![info exists ::vmdai::transcript::empty_after]} { variable empty_after "" }
+}
+
+proc ::vmdai::transcript::_empty_get {d key default} {
+    if {![dict exists $d $key]} { return $default }
+    set value [dict get $d $key]
+    if {$value eq "null"} { return $default }
+    return $value
+}
+
+proc ::vmdai::transcript::_empty_tilde {path} {
+    set home ""
+    catch {set home [file normalize ~]}
+    if {$home ne "" && [string first $home $path] == 0} {
+        return "~[string range $path [string length $home] end]"
+    }
+    return $path
+}
+
+proc ::vmdai::transcript::_key_hints {} {
+    if {[tk windowingsystem] eq "aqua"} {
+        return "\u23ce send \u00b7 \u21e7\u23ce newline \u00b7 \u2191 last prompt \u00b7 esc stop"
+    }
+    return "Return send \u00b7 Shift-Return newline \u00b7 Up last prompt \u00b7 Esc stop"
+}
+
+# The Ready group's rows: {state name text action_label action_cmd}, where
+# state is ok|off|info|warn.
+proc ::vmdai::transcript::empty_rows {info} {
+    variable TRUST_TEXT
+    set rows {}
+    set endpoint [_empty_get $info endpoint ""]
+    if {[string is true -strict [_empty_get $info connected false]]} {
+        set text [expr {$endpoint eq "" ? "running" : "running \u00b7 $endpoint"}]
+        lappend rows [list ok Runtime $text "" ""]
+    } else {
+        lappend rows [list off Runtime "not connected" "" ""]
+    }
+    set model [_empty_get $info model ""]
+    set settings_cmd [list ::vmdai::panel::open_settings model]
+    if {$model ne "" && [string is true -strict [_empty_get $info agent_loop false]]} {
+        set text "[::vmdai::panel::provider_label [_empty_get $info provider ""]] \u00b7 $model"
+        set caps {}
+        if {[llength [_empty_get $info tools {}]]} { lappend caps tools }
+        if {[string is true -strict [_empty_get $info vision false]]} { lappend caps vision }
+        if {[llength $caps]} { append text " \u00b7 [join $caps {, }]" }
+        lappend rows [list ok Model $text Change $settings_cmd]
+    } else {
+        lappend rows [list off Model "No model configured" "Set up\u2026" $settings_cmd]
+    }
+    set servers {}
+    catch {set servers [dict get $info first_run servers]}
+    foreach server $servers {
+        set url [_empty_get $server base_url ""]
+        set models [_empty_get $server models {}]
+        set n [llength $models]
+        set text "Found Ollama [_empty_get $server version ?] at [::vmdai::panel::hostport $url] \u00b7 $n model[expr {$n == 1 ? "" : "s"}]"
+        set prefill [dict create provider ollama base_url $url model [lindex $models 0]]
+        lappend rows [list info "" $text "Use\u2026" [list ::vmdai::panel::open_settings model $prefill]]
+    }
+    set folder [_empty_get $info folder ""]
+    if {$folder ne ""} {
+        set runs [_empty_get $info runs 0]
+        set text "[_empty_tilde $folder] \u00b7 $runs run[expr {$runs == 1 ? "" : "s"}] recorded"
+        lappend rows [list ok Folder $text Change [list ::vmdai::panel::choose_folder]]
+    }
+    lappend rows [list warn "" $TRUST_TEXT "" ""]
+    return $rows
+}
+
+proc ::vmdai::transcript::_empty_path {t} {
+    return $t.empty
+}
+
+proc ::vmdai::transcript::show_empty_state {info {t ""}} {
+    variable empty_host
+    variable EMPTY_TITLE
+    variable EMPTY_LEAD
+    variable EXAMPLES
+    if {$t eq ""} { set t $::vmdai::panel::text }
+    if {$t eq "" || ![winfo exists $t]} { return "" }
+    hide_empty_state $t
+    set empty_host $t
+    set C ::vmdai::theme::c
+    set bg [$C surface]
+    set e [_empty_path $t]
+    frame $e -background $bg -borderwidth 0 -highlightthickness 0
+    frame $e.col -background $bg
+    grid $e.col -row 0 -column 0
+    grid rowconfigure $e 0 -weight 1
+    grid columnconfigure $e 0 -weight 1
+    set col $e.col
+    _empty_mark $col.mark
+    label $col.title -text $EMPTY_TITLE -font ChatH1 -foreground [$C text] -background $bg
+    label $col.lead -text $EMPTY_LEAD -font ChatBody -foreground [$C muted] -background $bg \
+        -justify center -wraplength 420
+    frame $col.cards -background $bg
+    set i 0
+    foreach example $EXAMPLES {
+        lassign $example key title prompt
+        _empty_card $col.cards.c$i $i $key $title $prompt
+        incr i
+    }
+    frame $col.ready -background $bg -highlightthickness 1 \
+        -highlightbackground [$C hairline] -highlightcolor [$C hairline]
+    _empty_ready $col.ready $info
+    label $col.keys -text [_key_hints] -font ChatMeta -foreground [$C muted] -background $bg
+    grid $col.mark  -row 0 -column 0 -pady {0 6}
+    grid $col.title -row 1 -column 0
+    grid $col.lead  -row 2 -column 0 -pady {4 16}
+    grid $col.cards -row 3 -column 0 -sticky ew
+    grid $col.ready -row 4 -column 0 -sticky ew -pady {16 0}
+    grid $col.keys  -row 5 -column 0 -pady {12 0}
+    place $e -in $t -x 0 -y 0 -relwidth 1 -relheight 1
+    bind $e <Configure> [list ::vmdai::transcript::_empty_configure $t %w]
+    layout_empty_state [winfo width $t] $t
+    return $e
+}
+
+proc ::vmdai::transcript::hide_empty_state {{t ""}} {
+    variable empty_host
+    variable empty_after
+    if {$t eq ""} { set t $empty_host }
+    if {$t eq ""} { return }
+    if {$empty_after ne ""} {
+        ::vmdai::sched::cancel $empty_after
+        set empty_after ""
+    }
+    set e [_empty_path $t]
+    if {[winfo exists $e]} { ::destroy $e }
+}
+
+proc ::vmdai::transcript::empty_state_shown {{t ""}} {
+    variable empty_host
+    if {$t eq ""} { set t $empty_host }
+    return [expr {$t ne "" && [winfo exists [_empty_path $t]]}]
+}
+
+# Two columns from PAIR_MIN_WIDTH px of transcript width, else one.
+proc ::vmdai::transcript::layout_empty_state {width {t ""}} {
+    variable PAIR_MIN_WIDTH
+    if {$t eq ""} { set t $::vmdai::panel::text }
+    set cards [_empty_path $t].col.cards
+    if {![winfo exists $cards]} { return "" }
+    set pair [expr {$width >= $PAIR_MIN_WIDTH}]
+    set inner [expr {$width > 96 ? $width - 64 : 360}]
+    set card_w [expr {$pair ? ($inner - 12) / 2 : $inner}]
+    if {$card_w > 320} { set card_w 320 }
+    if {$card_w < 160} { set card_w 160 }
+    for {set i 0} {$i < 4} {incr i} {
+        set c $cards.c$i
+        if {$pair} {
+            grid $c -row [expr {$i / 2}] -column [expr {$i % 2}] -sticky nsew -padx 6 -pady 6
+        } else {
+            grid $c -row $i -column 0 -sticky ew -padx 6 -pady 6
+        }
+        $c.desc configure -wraplength [expr {$card_w - 48}]
+    }
+    grid columnconfigure $cards 0 -weight 1 -uniform card
+    if {$pair} {
+        grid columnconfigure $cards 1 -weight 1 -uniform card
+    } else {
+        grid columnconfigure $cards 1 -weight 0 -uniform ""
+    }
+    [_empty_path $t].col.lead configure -wraplength [expr {$inner < 480 ? $inner : 480}]
+    set wrap [expr {$inner - 170}]
+    if {$wrap > 300} { set wrap 300 }
+    if {$wrap < 120} { set wrap 120 }
+    set ready [_empty_path $t].col.ready
+    for {set i 0} {[winfo exists $ready.v$i]} {incr i} {
+        $ready.v$i configure -wraplength $wrap
+    }
+    return [expr {$pair ? "pair" : "column"}]
+}
+
+proc ::vmdai::transcript::_empty_configure {t width} {
+    variable empty_after
+    if {$empty_after ne ""} { ::vmdai::sched::cancel $empty_after }
+    set empty_after [::vmdai::sched::after_idle [list ::vmdai::transcript::_empty_relayout $t $width]]
+}
+
+proc ::vmdai::transcript::_empty_relayout {t width} {
+    variable empty_after
+    set empty_after ""
+    if {![winfo exists $t]} { return "" }
+    # %w is the overlay's width: place -in $t sizes it to the text's inner
+    # area, 2 x (padx + borderwidth + highlightthickness) narrower than the
+    # transcript. The layout thresholds are in transcript width.
+    set width [expr {$width + 2 * ([$t cget -padx] + [$t cget -borderwidth] + [$t cget -highlightthickness])}]
+    return [layout_empty_state $width $t]
+}
+
+proc ::vmdai::transcript::example_clicked {index} {
+    variable EXAMPLES
+    set prompt [lindex [lindex $EXAMPLES $index] 2]
+    ::vmdai::composer::set_text $prompt
+    ::vmdai::composer::focus
+    return $prompt
+}
+
+proc ::vmdai::transcript::_empty_mark {c} {
+    set C ::vmdai::theme::c
+    canvas $c -width 64 -height 46 -highlightthickness 0 -borderwidth 0 -background [$C surface]
+    $c create line 16 30 38 14 50 34 -width 3 -fill [$C faint] -capstyle round -joinstyle round
+    $c create oval 8 22 24 38 -fill [$C accent] -outline ""
+    $c create oval 29 5 47 23 -fill [$C accent] -outline ""
+    $c create oval 43 27 57 41 -fill [$C accent] -outline ""
+}
+
+proc ::vmdai::transcript::_empty_icon {c key color} {
+    switch -- $key {
+        load {
+            foreach y {6 11 16} {
+                $c create line 4 $y 18 $y -fill $color -width 2 -capstyle round
+            }
+        }
+        pocket {
+            $c create oval 3 3 19 19 -outline $color -width 2
+            $c create oval 9 9 13 13 -fill $color -outline $color
+        }
+        bfactor {
+            set x 3
+            foreach h {6 10 14} {
+                $c create rectangle $x [expr {19 - $h}] [expr {$x + 4}] 19 -fill $color -outline ""
+                incr x 6
+            }
+        }
+        rmsd {
+            $c create line 3 17 8 10 12 13 19 4 -fill $color -width 2 -capstyle round -joinstyle round
+        }
+    }
+}
+
+proc ::vmdai::transcript::_empty_card {c index key title prompt} {
+    set C ::vmdai::theme::c
+    set bg [$C surface]
+    set hairline [$C hairline]
+    set accent [$C accent]
+    frame $c -background $bg -highlightthickness 1 -highlightbackground $hairline \
+        -highlightcolor $hairline -cursor hand2
+    canvas $c.icon -width 22 -height 22 -highlightthickness 0 -borderwidth 0 -background $bg
+    _empty_icon $c.icon $key $accent
+    label $c.title -text $title -font ChatBodyBold -foreground [$C text] -background $bg -anchor w
+    label $c.desc -text $prompt -font ChatMeta -foreground [$C muted] -background $bg \
+        -anchor w -justify left -wraplength 220
+    grid $c.icon  -row 0 -column 0 -rowspan 2 -sticky n -padx {10 8} -pady 10
+    grid $c.title -row 0 -column 1 -sticky w -pady {9 0} -padx {0 10}
+    grid $c.desc  -row 1 -column 1 -sticky w -pady {1 10} -padx {0 10}
+    grid columnconfigure $c 1 -weight 1
+    foreach w [list $c $c.icon $c.title $c.desc] {
+        bind $w <ButtonRelease-1> [list ::vmdai::transcript::example_clicked $index]
+        bind $w <Enter> [list $c configure -highlightbackground $accent]
+        bind $w <Leave> [list $c configure -highlightbackground $hairline]
+    }
+}
+
+proc ::vmdai::transcript::_empty_ready {f info} {
+    set C ::vmdai::theme::c
+    set bg [$C surface]
+    set r 0
+    set i 0
+    foreach row [empty_rows $info] {
+        lassign $row state name text action cmd
+        if {$i > 0} {
+            frame $f.sep$i -height 1 -background [$C hairline]
+            grid $f.sep$i -row $r -column 0 -columnspan 4 -sticky ew -padx {34 0}
+            incr r
+        }
+        switch -- $state {
+            ok      { set glyph "\u2713"; set colour [$C ok] }
+            warn    { set glyph "!";      set colour [$C warn] }
+            default { set glyph "\u2022"; set colour [$C muted] }
+        }
+        label $f.g$i -text $glyph -font ChatMetaBold -foreground $colour -background $bg -width 2
+        label $f.n$i -text $name -font ChatBody -foreground [$C text] -background $bg -anchor w
+        label $f.v$i -text $text -font ChatMeta -foreground [$C muted] -background $bg \
+            -anchor w -justify left -wraplength 300
+        grid $f.g$i -row $r -column 0 -sticky nw -padx {10 4} -pady 6
+        grid $f.n$i -row $r -column 1 -sticky nw -pady 6
+        grid $f.v$i -row $r -column 2 -sticky nw -padx {8 8} -pady 6
+        if {$action ne ""} {
+            label $f.a$i -text $action -font ChatMeta -foreground [$C accent] -background $bg -cursor hand2
+            # $cmd can carry a probed server's base_url/model verbatim (M5);
+            # a literal % in it would otherwise be %-substituted by bind.
+            bind $f.a$i <ButtonRelease-1> [string map {% %%} $cmd]
+            grid $f.a$i -row $r -column 3 -sticky ne -padx {0 10} -pady 6
+        }
+        incr r
+        incr i
+    }
+    grid columnconfigure $f 2 -weight 1
+}
+
+# ===========================================================================
+# Reasoning display (Part B V4 "Reasoning"; P09-T08).
+#
+# While a turn streams, its reasoning is one muted italic line
+# "Thinking... 00:03" that ticks every second; the text itself is collected,
+# hidden, underneath. Sealed, the line becomes "Thought for 3 s >" and a
+# click expands the muted, indented text. Reasoning is always its own
+# lines, so it never shares a block with the answer. The tag `reasoning`
+# covers every reasoning line, so set_reasoning_visible hides them all.
+#
+# Writes go through a hidden peer of the transcript text: the read-only
+# proxy (Part B V4) rejects insert/delete but passes `peer`, and a peer
+# shares the text, tags and marks.
+# ===========================================================================
+namespace eval ::vmdai::transcript {
+    if {![array exists ::vmdai::transcript::R]} {
+        variable R
+        array set R {}
+    }
+    if {![info exists ::vmdai::transcript::reasoning_hidden]} { variable reasoning_hidden 0 }
+}
+
+proc ::vmdai::transcript::_rw {t} {
+    set peer $t.__rw
+    if {![winfo exists $peer]} { $t peer create $peer }
+    return $peer
+}
+
+proc ::vmdai::transcript::_reasoning_tags {t} {
+    set C ::vmdai::theme::c
+    if {[lsearch -exact [font names] ChatMetaItal] < 0} {
+        font create ChatMetaItal {*}[font actual ChatMeta] -slant italic
+    }
+    $t tag configure rhead -font ChatMetaItal -foreground [$C muted] -spacing1 6 -spacing3 4
+    $t tag configure rbody -font ChatMeta -foreground [$C muted] -lmargin1 24 -lmargin2 24 -spacing3 6
+}
+
+proc ::vmdai::transcript::reasoning_open {t b turn {live 1}} {
+    variable R
+    variable reasoning_hidden
+    _reasoning_tags $t
+    set w [_rw $t]
+    set bottom [expr {[lindex [$t yview] 1] >= 0.999}]
+    if {[$w index "end -1c"] ne "1.0" && [$w get "end -2c"] ne "\n"} { $w insert end "\n" }
+    set start [$w index "end -1c"]
+    # Inside a run's work log the lines also carry wl:$run (plan 08's
+    # _wl), so the run's collapse hides its reasoning with its rows.
+    set wl {}
+    catch {set wl [_wl]}
+    set head_tags [concat reasoning rhead rhead:$b $wl]
+    set body_tags [concat reasoning rbody rbody:$b $wl]
+    $w insert end "Thinking\u2026 00:00" $head_tags "\n" $head_tags
+    $w mark set rs:$b $start
+    $w mark gravity rs:$b left
+    $w mark set re:$b "$start lineend"
+    $w mark gravity re:$b right
+    set body [$w index "end -1c"]
+    $w insert end "\n" $body_tags
+    $w mark set rb:$b $body
+    $w mark gravity rb:$b right
+    $t tag configure rbody:$b -elide 1
+    $t tag bind rhead:$b <ButtonRelease-1> [list ::vmdai::transcript::reasoning_toggle $t $b]
+    $t tag bind rhead:$b <Enter> [list $t configure -cursor hand2]
+    $t tag bind rhead:$b <Leave> [list $t configure -cursor arrow]
+    array set R [list $b,t0 [clock seconds] $b,sealed 0 $b,open 0 $b,secs 0 $b,timer "" \
+        $b,head $head_tags $b,body $body_tags]
+    if {$live} {
+        set R($b,timer) [::vmdai::sched::after 1000 [list ::vmdai::transcript::reasoning_tick $t $b]]
+    }
+    if {$reasoning_hidden} { $t tag raise reasoning }
+    if {$bottom} { $t see end }
+}
+
+proc ::vmdai::transcript::reasoning_append {t b chunk} {
+    variable R
+    if {![info exists R($b,t0)]} { return }
+    [_rw $t] insert rb:$b $chunk $R($b,body)
+}
+
+proc ::vmdai::transcript::reasoning_seal {t b duration_s} {
+    variable R
+    if {![info exists R($b,t0)]} { return }
+    if {$R($b,timer) ne ""} {
+        ::vmdai::sched::cancel $R($b,timer)
+        set R($b,timer) ""
+    }
+    set secs 1
+    if {[string is double -strict $duration_s]} { set secs [expr {int(round($duration_s))}] }
+    if {$secs < 1} { set secs 1 }
+    set R($b,secs) $secs
+    set R($b,sealed) 1
+    _set_head $t $b [_sealed_head $b]
+}
+
+proc ::vmdai::transcript::reasoning_tick {t b {now ""}} {
+    variable R
+    if {![info exists R($b,t0)] || $R($b,sealed) || ![winfo exists $t]} { return }
+    if {$R($b,timer) ne ""} { ::vmdai::sched::cancel $R($b,timer) }
+    if {$now eq ""} { set now [clock seconds] }
+    set s [expr {$now - $R($b,t0)}]
+    if {$s < 0} { set s 0 }
+    _set_head $t $b [format "Thinking\u2026 %02d:%02d" [expr {$s / 60}] [expr {$s % 60}]]
+    set R($b,timer) [::vmdai::sched::after 1000 [list ::vmdai::transcript::reasoning_tick $t $b]]
+}
+
+proc ::vmdai::transcript::reasoning_toggle {t b} {
+    variable R
+    if {![info exists R($b,sealed)] || !$R($b,sealed)} { return }
+    set R($b,open) [expr {!$R($b,open)}]
+    # Open: stop specifying -elide (not 0), so a collapsed run's wl:$run still hides it.
+    $t tag configure rbody:$b -elide [expr {$R($b,open) ? "" : 1}]
+    _set_head $t $b [_sealed_head $b]
+}
+
+proc ::vmdai::transcript::_sealed_head {b} {
+    variable R
+    return "Thought for $R($b,secs) s [expr {$R($b,open) ? "\u25be" : "\u25b8"}]"
+}
+
+proc ::vmdai::transcript::_set_head {t b label} {
+    variable R
+    set w [_rw $t]
+    $w delete rs:$b re:$b
+    $w insert rs:$b $label $R($b,head)
+}
+
+# Hidden: `reasoning` elides and outranks the per-block tags. Shown: it
+# stops specifying -elide, so each block's own collapsed/expanded state holds.
+proc ::vmdai::transcript::set_reasoning_visible {t on} {
+    variable reasoning_hidden
+    set reasoning_hidden [expr {$on ? 0 : 1}]
+    if {$on} {
+        $t tag configure reasoning -elide ""
+    } else {
+        $t tag configure reasoning -elide 1
+        $t tag raise reasoning
+    }
+}
+
+proc ::vmdai::transcript::reasoning_reset {{t ""}} {
+    variable R
+    foreach key [array names R *,timer] {
+        if {$R($key) ne ""} { ::vmdai::sched::cancel $R($key) }
+    }
+    array unset R
+    array set R {}
+}

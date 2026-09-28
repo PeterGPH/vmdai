@@ -5,9 +5,9 @@ proc load_plugin {args} {
     foreach m $args {
         set path [file join $::env(VMDAI_PLUGIN_DIR) $m.tcl]
         if {$m in {config net}} {
-            catch {uplevel #0 [list source $path]}
+            catch {uplevel #0 [list source -encoding utf-8 $path]}
         } else {
-            uplevel #0 [list source $path]
+            uplevel #0 [list source -encoding utf-8 $path]
         }
     }
 }
