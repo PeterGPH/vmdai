@@ -21,7 +21,7 @@ source [file join $::vmdai::config::plugin_dir ui.tcl]
 # with an explicit -encoding utf-8: a plain `source` would decode them using
 # the process's system encoding instead and mangle them.
 if {[info commands ::winfo] ne ""} {
-    foreach ::vmdai::_m {theme viewmodel transcript viewer composer statusbar banner toolbar tclexport panel settings} {
+    foreach ::vmdai::_m {theme viewmodel transcript viewer composer statusbar banner toolbar tclexport panel settings history} {
         source -encoding utf-8 [file join $::vmdai::config::plugin_dir $::vmdai::_m.tcl]
     }
     unset ::vmdai::_m
