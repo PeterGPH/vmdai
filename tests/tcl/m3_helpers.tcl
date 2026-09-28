@@ -221,3 +221,128 @@ if {![llength $::m3::m2_tokens]} {
     ::vmdai::theme::init light
     set ::m3::m2_tokens [lsort [array names ::vmdai::theme::T]]
 }
+
+# ---- P10-T06 (also used by docs/design/round1/tools/capture_panel.tcl) --------
+
+# save_appearance a ?geom?: plugin.json with Appearance a, read by the next
+# ::vmdai::panel::build (P10-T01 applies it there).
+proc ::m3::save_appearance {a {geom 560x780}} {
+    ::vmdai::config::save_plugin_settings [dict create version 1 python "" appearance $a \
+        expand_steps 0 geometry $geom]
+}
+
+# index_of events kind n -> the index of the n-th event whose metadata.kind is kind.
+proc ::m3::index_of {events kind n} {
+    set i 0
+    set seen 0
+    foreach ev $events {
+        if {![catch {dict get $ev metadata kind} k] && $k eq $kind && [incr seen] == $n} {
+            return $i
+        }
+        incr i
+    }
+    error "fewer than $n $kind events"
+}
+
+# portable text -> text with this checkout and $HOME written as the fixture
+# placeholders @REPO@ and @WORK@ (::m3::events did the reverse), longest
+# path first, so goldens do not depend on temp directories.
+proc ::m3::portable {text} {
+    set pairs {}
+    foreach {path ph} [list $::env(VMDAI_REPO) @REPO@ $::env(HOME) @WORK@] {
+        foreach p [lsort -unique [list $path [file normalize $path]]] {
+            lappend pairs [list $p $ph]
+        }
+    }
+    set map {}
+    foreach pair [lsort -decreasing -command ::m3::_by_length $pairs] {
+        lappend map {*}$pair
+    }
+    return [string map $map $text]
+}
+
+proc ::m3::_by_length {a b} {
+    return [expr {[string length [lindex $a 0]] - [string length [lindex $b 0]]}]
+}
+
+# with_colours dump colours -> the dump, a newline if it lacks one, then colours.
+proc ::m3::with_colours {dump colours} {
+    if {$dump ne "" && [string index $dump end] ne "\n"} {
+        append dump "\n"
+    }
+    return $dump$colours
+}
+
+# line_diff a b -> {} when a eq b, else up to five "line N: <a> | <b>".
+proc ::m3::line_diff {a b} {
+    set la [split $a "\n"]
+    set lb [split $b "\n"]
+    set n [expr {max([llength $la], [llength $lb])}]
+    set out {}
+    for {set i 0} {$i < $n && [llength $out] < 5} {incr i} {
+        if {[lindex $la $i] ne [lindex $lb $i]} {
+            lappend out "line [expr {$i + 1}]: [lindex $la $i] | [lindex $lb $i]"
+        }
+    }
+    return $out
+}
+
+# light_left roots -> the places under roots that still hold a light-only colour.
+proc ::m3::light_left {roots} {
+    set lo [light_only]
+    set left {}
+    foreach e [colours $roots] {
+        if {[lsearch -exact $lo [lindex $e 1]] >= 0} {
+            lappend left [lindex $e 0]
+        }
+    }
+    return $left
+}
+
+# root_transcript ?geom? -> the Text of a transcript created in the withdrawn
+# root window "." (real size while withdrawn, unlike the panel's toplevel),
+# with a fresh view-model ::m3::vm for ::m3::feed.  It replaces the panel's
+# transcript (one per interpreter), so the next ::m3::replay rebuilds it.
+# A panel left over from an earlier ::m3::replay is a *toplevel* child of ".",
+# so the plain child-window sweep below never reaches it; dispose of it first
+# (::harness::fresh_panel's own cleanup) or its loaded images and timers sit
+# around for the rest of the process and make every later ``update``/settle
+# far slower.
+proc ::m3::root_transcript {{geom 560x780}} {
+    catch {::vmdai::panel::dispose}
+    foreach top {.vmd_ai .vmd_ai_settings .vmd_ai_history} {
+        if {[winfo exists $top]} {
+            destroy $top
+        }
+    }
+    foreach w [winfo children .] {
+        if {[winfo toplevel $w] eq "."} {
+            destroy $w
+        }
+    }
+    wm geometry . $geom
+    set t [::vmdai::transcript::create .m3tx]
+    pack .m3tx -fill both -expand 1
+    ::vmdai::vm::init ::m3::vm
+    update idletasks
+    update
+    ::vmdai::transcript::relayout
+    update
+    return $t
+}
+
+# feed events: events through ::m3::vm into the root transcript.  Status ops
+# go to the status bar in the panel, so they are dropped here.
+proc ::m3::feed {events} {
+    foreach ev $events {
+        set ops {}
+        foreach op [::vmdai::vm::apply ::m3::vm $ev] {
+            if {[lindex $op 0] ne "status"} {
+                lappend ops $op
+            }
+        }
+        if {[llength $ops]} {
+            ::vmdai::transcript::apply_ops $ops
+        }
+    }
+}
