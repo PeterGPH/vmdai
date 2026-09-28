@@ -108,7 +108,15 @@ proc ::vmdai::md::_flush {outVar paraVar} {
 # theme tokens, so a dark/light switch retints them with everything else.
 proc ::vmdai::md::configure_tags {t} {
     set C ::vmdai::theme::c
-    $t tag configure md_p -spacing3 8
+    # md_p carries no spacing of its own any more: the 8 px paragraph gap now
+    # lives on a dedicated blank md_sp line (a tiny ChatGap-font newline), so
+    # a tinted inline-code span on a paragraph's last line never bleeds into
+    # the gap (the cards graft avoided this the same way; prototypes/cards/
+    # proto.tcl:635-638).
+    if {"ChatGap" ni [font names]} { font create ChatGap -family Helvetica -size 1 }
+    $t tag configure md_p -spacing1 0 -spacing3 0
+    $t tag configure md_sp -font ChatGap -spacing1 0 -spacing2 0 \
+        -spacing3 [expr {max(0, 8 - [font metrics ChatGap -linespace])}]
     $t tag configure md_li -lmargin1 0 -lmargin2 18 -tabs {18 left} -spacing3 4
     $t tag configure md_marker -foreground [$C muted]
     $t tag configure md_h1 -font ChatH2 -spacing1 12 -spacing3 6
@@ -129,6 +137,8 @@ proc ::vmdai::md::configure_tags {t} {
         }
     }
     $t tag raise md_pretail md_pre
+    $t tag raise md_p
+    $t tag raise md_sp
     foreach tag {md_code md_b md_h1 md_h2 md_marker md_copy} {
         $t tag raise $tag
     }
@@ -198,8 +208,11 @@ proc ::vmdai::md::_text_windows {w} {
 
 # render_into t index text ?basetags?: insert the Markdown rendering of text
 # into writable text widget command t at index.  Every inserted character also
-# carries basetags.  Adds no trailing newline, so it can replace a plain
-# "$t insert $index $text $basetags".  Returns the index after the insertion.
+# carries basetags.  Adds no trailing newline, except the spacer line after a
+# final paragraph (see the md_sp tail rule below): the md_sp line now carries
+# the 8 px paragraph gap, so tinted inline code never fills it.  Otherwise it
+# can replace a plain "$t insert $index $text $basetags".  Returns the index
+# after the insertion.
 proc ::vmdai::md::render_into {t index text {basetags {}}} {
     configure_tags $t
     # A mark at "end" would sit after the widget's final newline; insert
@@ -217,6 +230,10 @@ proc ::vmdai::md::render_into {t index text {basetags {}}} {
         if {$prev eq "code"} {
             # The newline after a code block carries its tint to the edge.
             $t insert $mark "\n" [concat $basetags md_pretail]
+        } elseif {$prev eq "para"} {
+            # End the paragraph's line, then a separate blank md_sp line
+            # carries the 8 px gap (never a tinted inline-code background).
+            $t insert $mark "\n" $basetags "\n" [concat $basetags md_sp]
         } elseif {$prev ne ""} {
             $t insert $mark "\n" $basetags
         }
@@ -245,6 +262,10 @@ proc ::vmdai::md::render_into {t index text {basetags {}}} {
     $t mark unset $mark
     if {$prev eq "code" && [$t get $end] eq "\n"} {
         $t tag add md_pretail $end "$end + 1c"
+    } elseif {$prev eq "para" && [$t get $end] eq "\n"} {
+        $t insert $end "\n" $basetags
+        set end [$t index "$end + 1c"]
+        $t tag add md_sp $end "$end + 1c"
     }
     return $end
 }

@@ -3,9 +3,10 @@ images 0
 002 user | load 1hck
 003 chip chip_warn runhdr runmodel runsum | ChatVMD  qwen3.8:27b⇥!  Connection lost · 1 step
 004 md_p prose | Loading 1hck.
-005 chev cmd extra g_warn meta row | !⇥mol new 1hck.pdb  Load it.⇥connection lost · outcome unknown  ▸
-006 note notewarn | Connection lost at 12:00 AM · your draft is kept
-007 ecard ecard_t ecard_x | ✗ Message not sent
-008 ecard ecard_h | Runtime not reachable
-009 ecard ecard_a link | Open log
-010 link note notewarn | Reconnected: request lost · Retry
+005 md_sp prose | 
+006 chev cmd extra g_warn meta row | !⇥mol new 1hck.pdb  Load it.⇥connection lost · outcome unknown  ▸
+007 note notewarn | Connection lost at 12:00 AM · your draft is kept
+008 ecard ecard_t ecard_x | ✗ Message not sent
+009 ecard ecard_h | Runtime not reachable
+010 ecard ecard_a link | Open log
+011 link note notewarn | Reconnected: request lost · Retry

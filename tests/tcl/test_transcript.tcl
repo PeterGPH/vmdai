@@ -57,14 +57,14 @@ test blocks-seal {a user block shows You and the time; streamed text is sealed i
         {notice info "a note after the block"} \
         {block.seal b2 "I'll load 1hck.\n"}
     dumped
-} -result {{001 role rolemeta | You⇥12:00 AM} {002 user | load 1hck and show it as a cartoon} {003 md_p prose | I'll load 1hck.} {004 note | a note after the block}}
+} -result {{001 role rolemeta | You⇥12:00 AM} {002 user | load 1hck and show it as a cartoon} {003 md_p prose | I'll load 1hck.} {004 md_sp prose | } {005 note | a note after the block}}
 
 test blocks-discard {a discarded block leaves nothing; a later seal of it is ignored} -body {
     fresh
     ops {block.open b1 assistant 1} [list block.append b1 "\{\"name\": \"run_vmd_command\""] \
         {block.discard b1} {block.seal b1 "late"} {rule r1} {block.open b2 assistant 2} {block.seal b2 Done.}
     dumped
-} -result {{001 rule | <rule>} {002 md_p prose | Done.}}
+} -result {{001 rule | <rule>} {002 md_p prose | Done.} {003 md_sp prose | }}
 
 test unknown-op {an unknown op, or a bad argument list, is ignored and counted} -body {
     fresh

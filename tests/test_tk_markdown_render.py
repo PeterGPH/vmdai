@@ -5,7 +5,7 @@ import pytest
 
 from helpers.tk_cases import assert_case, run_tk_file
 
-TOTAL = 9
+TOTAL = 10
 
 
 @pytest.fixture(scope="module")
@@ -47,3 +47,7 @@ def test_copy_gives_plain_spaces(results):
 
 def test_code_block_lines_tight(results):
     assert_case(results, "md-pre-spacing", TOTAL)
+
+
+def test_inline_code_tint_hugs_line(results):
+    assert_case(results, "md-icode-tint", TOTAL)

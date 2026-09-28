@@ -49,7 +49,7 @@ test md-basetags {every inserted character carries basetags; no trailing newline
     set end [::vmdai::md::render_into $w end "A **b**\n\n- c" {prose wl:r1}]
     $w insert end "|after"
     list [$w get 2.0 "end - 1c"] [$w tag ranges wl:r1] $end
-} -result [list "A b\n•\tc|after" {2.0 3.3} 3.3]
+} -result [list "A b\n\n•\tc|after" {2.0 4.3} 4.3]
 
 test md-proxy {a renamed widget behind a read-only proxy renders and right-aligns Copy} -body {
     set w [::m3::root_text 600x700]
@@ -96,10 +96,23 @@ test md-pre-spacing {fenced code lines are not spaced by the base prose tag; the
     set w [::m3::root_text]
     $w tag configure prose -font ChatBody -spacing3 8
     ::vmdai::md::render_into $w end "Para one.\n\n```tcl\nset a 1\nset b 2\nset c 3\n```\nAfter." prose
-    set h3 [$w count -update -ypixels 3.0 4.0]
-    set h4 [$w count -update -ypixels 4.0 5.0]
-    set h5 [$w count -update -ypixels 5.0 6.0]
+    # Line 1 is the paragraph, line 2 the new md_sp spacer, line 3 the code
+    # header, lines 4-6 the code body (the last carrying md_pretail).
+    set h3 [$w count -update -ypixels 4.0 5.0]
+    set h4 [$w count -update -ypixels 5.0 6.0]
+    set h5 [$w count -update -ypixels 6.0 7.0]
     list [expr {$h3 == [font metrics ChatCode -linespace] && $h4 == $h3}] [expr {$h5 - $h4 >= 8}]
 } -result {1 1}
+
+test md-icode-tint {inline code's tint hugs its own line; the 8 px paragraph gap is a separate blank line} -body {
+    set w [::m3::root_text]
+    $w tag configure prose -font ChatBody -spacing3 8
+    $w insert end "X\n" prose
+    set e [::vmdai::md::render_into $w 2.0 "Run `measure rgyr` now.\n\nNext para." prose]
+    set ls [expr {max([font metrics ChatBody -linespace], [font metrics ChatCode -linespace])}]
+    list [expr {[$w count -update -ypixels 2.0 3.0] == $ls}] [$w count -update -ypixels 3.0 4.0] \
+        [$w get 3.0 "3.0 lineend"] [expr {"md_sp" in [$w tag names 3.0]}] [$w get 4.0 "4.0 lineend"] \
+        [$w count -update -ypixels 5.0 6.0] [expr {"md_sp" in [$w tag names 5.0]}] $e
+} -result {1 8 {} 1 {Next para.} 8 1 5.0}
 
 cleanupTests

@@ -2,18 +2,21 @@ images 1
 001 role rolemeta | You⇥<TIME>
 002 user | Load the demo structure and tell me how many atoms it has
 003 chip chip_ok runhdr runmodel runsum | ChatVMD  anthropic/claude-sonnet-4.6⇥✓  1 step · <DUR>
-008 rule | <rule>
-009 md_p prose | The structure has 42 atoms.
-010 footer link | Copy Tcl · Save .tcl…
-011 role rolemeta | You⇥<TIME>
-012 user | Set a white background and take a snapshot
-013 chip chip_err chip_ok runhdr runmodel runsum | ChatVMD  anthropic/claude-sonnet-4.6⇥✗ ✓ ✓  1 failed, recovered · <DUR>
-014 chev cmd extra g_err meta row | ✗⇥color Display Background white  White background⇥<DUR>  ▸
-015 errline | invalid command name "color"
-016 md_p prose | That command is not available here; retrying.
-017 chev cmd extra g_ok meta row | ✓⇥puts recovered  Retry⇥→ recovered  <DUR>  ▸
-018 chev extra g_ok meta row snapcmd | ✓⇥Snapshot  Check the view⇥→ Snapshot rendered (8×6).  <DUR>  ▸
-019 thumb | <card>
-020 rule | <rule>
-021 md_p prose | Done: the background command failed once, then the snapshot was taken.
-022 footer link | Copy Tcl · Save .tcl…
+009 rule | <rule>
+010 md_p prose | The structure has 42 atoms.
+011 md_sp prose | 
+012 footer link | Copy Tcl · Save .tcl…
+013 role rolemeta | You⇥<TIME>
+014 user | Set a white background and take a snapshot
+015 chip chip_err chip_ok runhdr runmodel runsum | ChatVMD  anthropic/claude-sonnet-4.6⇥✗ ✓ ✓  1 failed, recovered · <DUR>
+016 chev cmd extra g_err meta row | ✗⇥color Display Background white  White background⇥<DUR>  ▸
+017 errline | invalid command name "color"
+018 md_p prose | That command is not available here; retrying.
+019 md_sp prose | 
+020 chev cmd extra g_ok meta row | ✓⇥puts recovered  Retry⇥→ recovered  <DUR>  ▸
+021 chev extra g_ok meta row snapcmd | ✓⇥Snapshot  Check the view⇥→ Snapshot rendered (8×6).  <DUR>  ▸
+022 thumb | <card>
+023 rule | <rule>
+024 md_p prose | Done: the background command failed once, then the snapshot was taken.
+025 md_sp prose | 
+026 footer link | Copy Tcl · Save .tcl…
