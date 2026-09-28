@@ -62,6 +62,7 @@ proc ::vmdai::runtime::on_auth_failed {} { incr ::auth_failed }
 namespace eval ::vmdai::ui {}
 proc ::vmdai::ui::render_event {ev} { lappend ::rendered [dict get $ev seq] }
 proc ::vmdai::ui::notify {level text} { lappend ::notices [list $level $text] }
+proc ::vmdai::ui::note {level text} { lappend ::notices [list $level $text] }
 proc ::vmdai::ui::set_busy {on} { lappend ::busy_calls $on }
 proc ::vmdai::ui::status {text} { lappend ::statuses $text }
 proc ::vmdai::ui::session_started {result} { lappend ::session_started_calls $result }
@@ -183,8 +184,8 @@ test bridge-busy-1 {busy starts only after chat.send answers; a failed send neve
     ::vmdai::bridge::send "hello"
     settle
     list $issued $before $after [param $sent text] [param $sent conversation_mode] \
-        [param $sent model] [st busy] $::busy_calls [lindex $::notices end]
-} -cleanup fresh -result {1 {0 {}} {1 1 req_1 chat_0123456789ab} {now color it red} full <none> 0 0 {error {Could not send: No model configured.}}}
+        [param $sent model] [st busy] $::busy_calls $::notices [lindex $::local_events end 0]
+} -cleanup fresh -result {1 {0 {}} {1 1 req_1 chat_0123456789ab} {now color it red} full <none> 0 0 {} local.send_failed}
 
 test bridge-busy-2 {a request that ended before chat.send answered does not leave the panel busy} -setup fresh -body {
     started

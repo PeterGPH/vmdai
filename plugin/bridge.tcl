@@ -233,7 +233,7 @@ proc ::vmdai::bridge::_on_session_started {callback kind args} {
     } else {
         set recovering 0
         set message [lindex $args [expr {$kind eq "rpc_error" ? 1 : 0}]]
-        if {[catch {::vmdai::ui::notify error "Could not start a chat session: $message"} err]} {
+        if {[catch {::vmdai::ui::note error "Could not start a chat session: $message"} err]} {
             _log "ui: $err"
         }
     }
@@ -307,7 +307,7 @@ proc ::vmdai::bridge::_on_recover_resume {target callback kind args} {
             }
         }
         set text "Could not reopen this chat after the AI runtime restarted ($reason). Your next message starts a new chat."
-        if {[catch {::vmdai::ui::notify warn $text} err]} {
+        if {[catch {::vmdai::ui::note warn $text} err]} {
             _log "ui: $err"
         }
     }
@@ -458,7 +458,7 @@ proc ::vmdai::bridge::send {text} {
         ::vmdai::net::call chat.send $params ::vmdai::bridge::_on_send
         return 1
     }
-    if {[catch {::vmdai::ui::notify warn $why} err]} {
+    if {[catch {::vmdai::ui::status $why} err]} {
         _log "ui: $err"
     }
     return 0
@@ -490,15 +490,10 @@ proc ::vmdai::bridge::_on_send {kind args} {
         rpc_error {
             lassign $args code message
             send_failed $code $message
-            if {[catch {::vmdai::ui::notify error "Could not send: $message"} err]} {
-                _log "ui: $err"
-            }
             catch {::vmdai::ui::set_busy 0}
         }
         default {
-            if {[catch {::vmdai::ui::notify error "Could not send: the AI runtime did not answer."} err]} {
-                _log "ui: $err"
-            }
+            send_failed transport "The AI runtime did not answer."
             catch {::vmdai::ui::set_busy 0}
         }
     }
@@ -835,7 +830,7 @@ proc ::vmdai::bridge::apply_workdir {dir} {
     variable workdir
     set dir [file normalize $dir]
     if {![file isdirectory $dir] || [catch {cd $dir} err]} {
-        if {[catch {::vmdai::ui::notify error "Can't use the folder $dir."} err]} {
+        if {[catch {::vmdai::ui::note error "Can't use the folder $dir."} err]} {
             _log "ui: $err"
         }
         return 0

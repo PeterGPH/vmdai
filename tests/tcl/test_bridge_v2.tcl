@@ -100,6 +100,40 @@ test v2-runtime_state_to_banner_and_local_events {runtime states drive the banne
         [expr {"notice" in [::test::kinds]}] [lindex $::test::modes end]
 } -result [list [list ready reconnecting "Nothing answered on 127.0.0.1:18765"] 1 1 disabled]
 
+# I1: a refused send (no session yet) must not clear the draft, rename the
+# chat or join recall - only bridge::send's return value decides that.
+test v2-refused_send_keeps_draft {a refused send keeps the draft, the title and recall untouched} -body {
+    ::test::reset
+    set ::vmdai::bridge::session_id ""
+    ::vmdai::composer::set_text "hello"
+    set sent [::vmdai::panel::on_send]
+    list $sent [::vmdai::composer::get_text] [::fake::count chat.send] $::vmdai::panel::title \
+        $::vmdai::composer::recall [lindex $::harness::flashes end]
+} -result {0 hello 0 {New chat} {} {Not connected to the AI runtime yet; try again in a moment.}}
+
+# I1: chat.send never answering (a transport failure) must show the same
+# "Message not sent" card as an rpc_error, and restore the draft.
+test v2-send_transport_failure_restores_draft {a transport failure on chat.send shows Message not sent and restores the draft} -body {
+    ::test::start $::SESSION
+    set ::test::ops {}
+    ::fake::reply chat.send transport timeout
+    ::vmdai::composer::set_text "hello"
+    ::vmdai::panel::on_send
+    ::harness::wait_until {expr {"error.card" in [::test::kinds]}}
+    set card [lindex $::test::ops [lsearch -index 0 $::test::ops error.card]]
+    list [lindex $card 1] [lindex $card 2] [::vmdai::composer::get_text] [dict get [::vmdai::bridge::state] busy]
+} -result {transport {Message not sent} hello 0}
+
+# I1: a failed session.start must be visible, not swallowed by local.connection's de-dup.
+test v2-session_start_failure_noted {a failed session.start is shown as one timeline note} -body {
+    ::test::reset
+    ::fake::reply session.start rpc_error AUTH_FAILED "invalid session or token" {}
+    ::vmdai::bridge::start_session
+    ::harness::wait_until {expr {[llength $::test::ops] > 0}}
+    set note [lindex $::test::ops [lsearch -index 0 $::test::ops notice]]
+    list [lindex $note 0] [string match "*Could not start a chat session: invalid session or token*" [lindex $note 2]]
+} -result {notice 1}
+
 test v2-no_model_card {chat.send NO_MODEL shows the card, keeps the draft and never goes busy} -body {
     ::test::start $::SESSION
     set ::test::ops {}

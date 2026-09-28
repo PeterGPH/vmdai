@@ -256,12 +256,15 @@ proc ::vmdai::panel::on_send {args} {
     variable last_sent
     if {[llength $args]} { set prompt [lindex $args 0] } else { set prompt [::vmdai::composer::get_text] }
     set prompt [string trim $prompt]
-    if {$prompt eq ""} { return }
+    if {$prompt eq ""} { return 0 }
+    # A refused send (not connected, or a request already running) keeps the
+    # draft and the chat title untouched, and never joins recall (I1).
+    if {![::vmdai::bridge::send $prompt]} { return 0 }
     set last_sent $prompt
     ::vmdai::composer::push_history $prompt
     ::vmdai::composer::set_text ""
     if {$title eq "New chat"} { set_title [_title_from $prompt] }
-    ::vmdai::bridge::send $prompt
+    return 1
 }
 
 # Idempotent: Esc on the composer can reach both the composer's own Stop

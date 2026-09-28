@@ -10,7 +10,7 @@ from helpers.tk_cases import assert_case, run_tk_file
 
 REPO = Path(__file__).resolve().parents[1]
 PLUGIN = REPO / "plugin"
-TOTAL = 7
+TOTAL = 10
 
 
 @pytest.fixture(scope="module")
@@ -28,6 +28,18 @@ def test_long_poll_used(results):
 
 def test_runtime_state_to_banner_and_local_events(results):
     assert_case(results, "v2-runtime_state_to_banner_and_local_events", TOTAL)
+
+
+def test_refused_send_keeps_draft(results):
+    assert_case(results, "v2-refused_send_keeps_draft", TOTAL)
+
+
+def test_send_transport_failure_restores_draft(results):
+    assert_case(results, "v2-send_transport_failure_restores_draft", TOTAL)
+
+
+def test_session_start_failure_noted(results):
+    assert_case(results, "v2-session_start_failure_noted", TOTAL)
 
 
 def test_no_model_card(results):

@@ -56,3 +56,9 @@ proc ::vmdai::ui::set_busy {on} {
 proc ::vmdai::ui::status {text} {
     if {[_panel_ready]} { ::vmdai::statusbar::flash $text 3000 }
 }
+
+# A bridge message that is not a connection-state transition (I1): one
+# timeline note, never de-duplicated by local.connection.
+proc ::vmdai::ui::note {level text} {
+    if {[_panel_ready]} { ::vmdai::panel::render [list [list notice [expr {$level eq "info" ? "info" : "warn"}] $text]] }
+}
