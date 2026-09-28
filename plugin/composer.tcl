@@ -28,8 +28,6 @@ namespace eval ::vmdai::composer {
     if {![info exists onsend]} { set onsend "" }
     variable onstop
     if {![info exists onstop]} { set onstop "" }
-    variable history
-    if {![info exists history]} { set history {} }
     variable S
     if {![info exists S]} { array set S {lines 1 focused 0} }
 }
@@ -120,15 +118,6 @@ proc ::vmdai::composer::set_text {s} {
 proc ::vmdai::composer::focus {} {
     variable T
     if {[_live]} { ::focus $T }
-}
-
-# Kept for Up/Down recall (plan 09 replaces this proc with its recall list).
-proc ::vmdai::composer::push_history {s} {
-    variable history
-    set s [string trim $s]
-    if {$s eq ""} { return }
-    lappend history $s
-    if {[llength $history] > 50} { set history [lrange $history end-49 end] }
 }
 
 proc ::vmdai::composer::placeholder_for {m} {
@@ -288,4 +277,93 @@ proc ::vmdai::composer::_stop_clicked {} {
     variable onstop
     if {$mode ne "busy" || $onstop eq ""} { return }
     uplevel #0 $onstop
+}
+
+# ===========================================================================
+# Prompt recall (Part B V5; P09-T03).
+#
+# Up on the first display line shows the previous prompt of this chat, Down
+# on the last display line the next one; Down past the newest brings the
+# draft back. The newest 50 prompts are kept; New chat clears them.
+# ===========================================================================
+namespace eval ::vmdai::composer {
+    variable RECALL_MAX 50
+    if {![info exists ::vmdai::composer::recall]} { variable recall {} }
+    if {![info exists ::vmdai::composer::recall_pos]} { variable recall_pos -1 }
+    if {![info exists ::vmdai::composer::recall_draft]} { variable recall_draft "" }
+    # `history` is plan 08's name for this same list; tests/tcl/test_composer.tcl
+    # (P08-T08, unmodified by this task) still reads it directly, so
+    # push_history/clear_history below keep it mirroring `recall`.
+    if {![info exists ::vmdai::composer::history]} { variable history {} }
+}
+
+proc ::vmdai::composer::push_history {s} {
+    variable recall
+    variable recall_pos
+    variable history
+    variable RECALL_MAX
+    set s [string trim $s]
+    if {$s eq ""} { return }
+    if {[lindex $recall end] ne $s} { lappend recall $s }
+    if {[llength $recall] > $RECALL_MAX} {
+        set recall [lrange $recall end-[expr {$RECALL_MAX - 1}] end]
+    }
+    set recall_pos -1
+    set history $recall
+}
+
+proc ::vmdai::composer::clear_history {} {
+    variable recall
+    variable recall_pos
+    variable recall_draft
+    variable history
+    set recall {}
+    set recall_pos -1
+    set recall_draft ""
+    set history {}
+}
+
+proc ::vmdai::composer::recall_prev {} {
+    variable recall
+    variable recall_pos
+    variable recall_draft
+    if {![llength $recall]} { return 0 }
+    if {$recall_pos < 0} {
+        set recall_draft [get_text]
+        set recall_pos [llength $recall]
+    }
+    # Already at the oldest prompt: keep it and swallow the key.
+    if {$recall_pos == 0} { return 1 }
+    incr recall_pos -1
+    set_text [lindex $recall $recall_pos]
+    return 1
+}
+
+proc ::vmdai::composer::recall_next {} {
+    variable recall
+    variable recall_pos
+    variable recall_draft
+    if {$recall_pos < 0} { return 0 }
+    incr recall_pos
+    if {$recall_pos >= [llength $recall]} {
+        set recall_pos -1
+        set_text $recall_draft
+        return 1
+    }
+    set_text [lindex $recall $recall_pos]
+    return 1
+}
+
+# Bound to <Up>/<Down> on the input by ::vmdai::panel::bind_keys; returning 1
+# makes the binding `break`, so the text class binding does not move the caret.
+proc ::vmdai::composer::on_up {w} {
+    set n [$w count -displaylines 1.0 insert]
+    if {$n ne "" && $n > 0} { return 0 }
+    return [recall_prev]
+}
+
+proc ::vmdai::composer::on_down {w} {
+    set n [$w count -displaylines insert "end -1c"]
+    if {$n ne "" && $n > 0} { return 0 }
+    return [recall_next]
 }

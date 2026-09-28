@@ -117,6 +117,7 @@ proc ::vmdai::panel::build {{w ""}} {
     ::vmdai::toolbar::set_title [set ::vmdai::panel::title]
     _sync_composer
     _update_status
+    bind_keys
     return $win
 }
 
@@ -381,4 +382,127 @@ proc ::vmdai::panel::_update_status {} {
 # re-reads runtime.info and profiles.list before updating the status bar.
 proc ::vmdai::panel::refresh_info {} {
     _update_status
+}
+
+# ---- keyboard map (Part B V5; P09-T03) ----------------------------------------
+
+# Mod means Command on aqua and Control elsewhere.
+proc ::vmdai::panel::mod_key {} {
+    if {[tk windowingsystem] eq "aqua"} { return Command }
+    return Control
+}
+
+proc ::vmdai::panel::_first_of_class {w cls} {
+    set queue [list $w]
+    while {[llength $queue]} {
+        set queue [lassign $queue current]
+        foreach child [winfo children $current] {
+            if {[winfo class $child] eq $cls} { return $child }
+            lappend queue $child
+        }
+    }
+    return ""
+}
+
+# The composer's input (plan 08 builds it as the first Text under $win.cb).
+proc ::vmdai::panel::composer_text {} {
+    variable win
+    return [_first_of_class $win.cb Text]
+}
+
+# Focusable, managed descendants of w in stacking order. A disabled ttk
+# button (Send with an empty composer) is skipped, as Tk's traversal does.
+proc ::vmdai::panel::_focusables {w} {
+    set out {}
+    foreach child [winfo children $w] {
+        if {[winfo manager $child] eq ""} { continue }
+        set takefocus ""
+        catch {set takefocus [$child cget -takefocus]}
+        set cls [winfo class $child]
+        set candidate [expr {$takefocus eq "1" || ($takefocus in {"" ttk::takefocus}
+            && $cls in {Text TButton TEntry TCombobox TCheckbutton Button Entry})}]
+        if {$candidate && ![catch {$child instate disabled} disabled] && $disabled} {
+            set candidate 0
+        }
+        if {$candidate} { lappend out $child }
+        set out [concat $out [_focusables $child]]
+    }
+    return $out
+}
+
+# V5 Tab order: composer -> Send/Stop -> toolbar -> transcript.
+proc ::vmdai::panel::focus_ring {} {
+    variable win
+    variable text
+    set ring [concat [_focusables $win.cb] [_focusables $win.tb]]
+    if {$text ne ""} { lappend ring $text }
+    return $ring
+}
+
+proc ::vmdai::panel::focus_next {w {step 1}} {
+    set ring [focus_ring]
+    if {![llength $ring]} { return "" }
+    set i [lsearch -exact $ring $w]
+    set j [expr {$i < 0 ? 0 : ($i + $step) % [llength $ring]}]
+    set target [lindex $ring $j]
+    focus $target
+    return $target
+}
+
+proc ::vmdai::panel::focus_prev {w} {
+    return [focus_next $w -1]
+}
+
+# <<Copy>>: display chars only (collapsed text is skipped), tabs as two spaces.
+proc ::vmdai::panel::copy_selection {} {
+    variable text
+    if {[catch {$text get -displaychars sel.first sel.last} s]} { return "" }
+    set s [string map [list "\t" "  "] $s]
+    _set_clipboard $s
+    return $s
+}
+
+proc ::vmdai::panel::scroll_transcript {how {n 1}} {
+    variable text
+    switch -- $how {
+        page   { $text yview scroll $n pages }
+        top    { $text yview moveto 0 }
+        bottom { $text yview moveto 1 }
+    }
+}
+
+proc ::vmdai::panel::on_escape {} {
+    if {![bridge_busy]} { return 0 }
+    on_stop
+    return 1
+}
+
+proc ::vmdai::panel::bind_keys {} {
+    variable win
+    variable text
+    set mod [mod_key]
+    bind $win <Escape> {if {[::vmdai::panel::on_escape]} break}
+    foreach key {e E} { bind $win <$mod-$key> {::vmdai::panel::toggle_expand; break} }
+    foreach key {n N} { bind $win <$mod-$key> {::vmdai::panel::new_chat; break} }
+    foreach key {l L} { bind $win <$mod-$key> {::vmdai::composer::focus; break} }
+    bind $win <$mod-comma> {::vmdai::panel::open_settings; break}
+    set input [composer_text]
+    if {$input ne ""} {
+        bind $input <Up>         {if {[::vmdai::composer::on_up %W]} break}
+        bind $input <Down>       {if {[::vmdai::composer::on_down %W]} break}
+        bind $input <Prior>      {::vmdai::panel::scroll_transcript page -1; break}
+        bind $input <Next>       {::vmdai::panel::scroll_transcript page 1; break}
+        bind $input <$mod-Up>    {::vmdai::panel::scroll_transcript top; break}
+        bind $input <$mod-Down>  {::vmdai::panel::scroll_transcript bottom; break}
+    }
+    bind $text <<Copy>> {::vmdai::panel::copy_selection; break}
+    foreach key {a A} { bind $text <$mod-$key> {%W tag add sel 1.0 end; break} }
+    # Tab on the toplevel covers Send/Stop and the toolbar in any state (it
+    # runs before the `all` traversal binding). The two Text widgets need
+    # their own binding: the Text class binding for Tab inserts a tab and breaks.
+    foreach w [list $win $input $text] {
+        if {$w eq ""} { continue }
+        bind $w <Tab> {::vmdai::panel::focus_next %W; break}
+        bind $w <<PrevWindow>> {::vmdai::panel::focus_prev %W; break}
+    }
 }
