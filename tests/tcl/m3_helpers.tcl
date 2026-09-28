@@ -346,3 +346,13 @@ proc ::m3::feed {events} {
         }
     }
 }
+
+# effective_fg t index: the colour Tk draws at index, i.e. the -foreground of
+# the highest-priority tag there that sets one ("" when none does).
+proc ::m3::effective_fg {t index} {
+    set fg ""
+    foreach tag [$t tag names $index] {
+        if {![catch {$t tag cget $tag -foreground} f] && $f ne ""} { set fg $f }
+    }
+    return $fg
+}

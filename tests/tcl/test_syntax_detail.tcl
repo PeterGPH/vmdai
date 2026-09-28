@@ -38,4 +38,28 @@ test syntax-dim-wins {text dimmed with muted keeps its colour over the syntax co
     list [expr {[lsearch $names m3dim] > [lsearch $names syn_cmd]}] [$w tag cget syn_cmd -foreground]
 } -result {1 #0550ae}
 
+test syntax-keeps-other-colours {syntax colours leave the failure gutter, links, warn notes and Copy alone} -setup {
+    ::m3::use_mws
+    set t [::m3::replay 03_conversation]
+    ::vmdai::transcript::op_notice warn "Stopped: the model kept repeating the same step" retry
+    set rid req_000000000089
+    ::m3::render [::m3::ev system state "" [dict create kind request.started request_id $rid \
+        chat_id chat_000000000089 provider ollama model qwen3.8:27b max_turns 28 vision true think false]]
+    ::m3::render [::m3::ev assistant message "Run:\n\n```tcl\nset a 1\n```" \
+        [dict create request_id $rid turn 1 final true]]
+    ::harness::settle
+} -body {
+    set C ::vmdai::theme::c
+    set out {}
+    foreach {tag want} [list dgutx [$C err] notewarn [$C muted] md_copy [$C accent]] {
+        lappend out $tag [expr {[::m3::effective_fg $t [lindex [$t tag ranges $tag] 0]] eq $want}]
+    }
+    # every link (footer Copy Tcl / Save .tcl..., the note's Retry) draws in accent
+    set bad {}
+    foreach {a b} [$t tag ranges link] {
+        if {[::m3::effective_fg $t $a] ne [$C accent]} { lappend bad [$t get $a $b] }
+    }
+    lappend out links $bad [expr {[llength [$t tag ranges syn_cmd]] > 0}]
+} -result {dgutx 1 notewarn 1 md_copy 1 links {} 1}
+
 cleanupTests

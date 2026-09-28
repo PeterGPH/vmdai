@@ -128,7 +128,9 @@ proc ::vmdai::transcript::_tags {} {
         -lmargin1 24 -lmargin2 24 -spacing3 6
     $W tag configure note -font ChatMeta -foreground [$C muted] -justify center \
         -spacing1 12 -spacing3 4
-    $W tag configure notewarn -foreground [$C warn]
+    # Warn-level notes stay muted like every timeline note (V4 "Timeline
+    # notes": centred and muted); notewarn only marks them.
+    $W tag configure notewarn
     $W tag configure ecard -background [$C err_bg] -lmargin1 12 -lmargin2 12 -rmargin 12
     $W tag configure ecard_t -font ChatBodyBold -foreground [$C text] -spacing1 10
     $W tag configure ecard_x -foreground [$C err]

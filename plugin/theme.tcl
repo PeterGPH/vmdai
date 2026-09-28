@@ -751,16 +751,29 @@ proc ::vmdai::theme::_system_changed {} {
 }
 
 # syntax_tags t: the syn_* tags of text widget t, from the syn_* tokens (V2).
-# A tag that dims text with muted or faint (the statements after a failure,
-# V4 "Step detail") is raised above them, so dimmed code stays dimmed.
+# A tag that dims code with muted or faint (the statements after a failure,
+# V4 "Step detail") is raised above them, so dimmed code stays dimmed.  Only
+# tags that sit on a syn_* range are raised: tag priority is per widget, so
+# raising every muted tag would also bury the transcript's links, warn notes
+# and the failure gutter under their muted base tags.
 proc ::vmdai::theme::syntax_tags {t} {
     foreach cls {cmd var str num brace opt cmt} {
         $t tag configure syn_$cls -foreground [c syn_$cls]
         $t tag raise syn_$cls
     }
     set dim [list [string tolower [c muted]] [string tolower [c faint]]]
-    foreach tag [$t tag names] {
-        if {[string match syn_* $tag] || [catch {$t tag cget $tag -foreground} fg]} {
+    set onsyn {}
+    foreach cls {cmd var str num brace opt cmt} {
+        foreach {a b} [$t tag ranges syn_$cls] {
+            foreach tag [$t tag names $a] {
+                if {![string match syn_* $tag]} {
+                    dict set onsyn $tag 1
+                }
+            }
+        }
+    }
+    foreach tag [dict keys $onsyn] {
+        if {[catch {$t tag cget $tag -foreground} fg]} {
             continue
         }
         if {[lsearch -exact $dim [string tolower $fg]] >= 0} {

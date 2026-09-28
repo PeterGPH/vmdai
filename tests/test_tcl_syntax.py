@@ -11,7 +11,7 @@ from helpers.tk_cases import assert_case, run_tk_file
 REPO = Path(__file__).resolve().parents[1]
 TOKENS_FILE = REPO / "tests" / "tcl" / "test_syntax.tcl"
 TOKENS_TOTAL = 6
-DETAIL_TOTAL = 3
+DETAIL_TOTAL = 4
 
 
 @pytest.fixture(scope="module")
@@ -38,3 +38,7 @@ def test_syntax_stays_in_the_command(detail):
 
 def test_dimmed_text_stays_dim(detail):
     assert_case(detail, "syntax-dim-wins", DETAIL_TOTAL)
+
+
+def test_syntax_keeps_other_colours(detail):
+    assert_case(detail, "syntax-keeps-other-colours", DETAIL_TOTAL)
