@@ -68,6 +68,9 @@ if {[catch {
     cd $env(PANEL_WORKDIR)
     source [file join $env(VMDAI_PLUGIN_DIR) init.tcl]
     set ::vmdai::panel::headless 1
+    # M3 (plan 10): never read the real OS appearance (the build calls
+    # set_appearance); theme.tcl keeps this value when init.tcl re-sources it.
+    set ::vmdai::theme::macstyle ::driver_no_macwindowstyle
     trace add execution ::vmdai::panel::on_event enter ::driver_count
     ::vmdai::start
     ::driver_wait {expr {[dict get [::vmdai::bridge::state] session_id] ne ""}} 20000 "the session"

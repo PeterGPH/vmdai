@@ -89,6 +89,7 @@ proc ::vmdai::panel::build {{w ""}} {
     if {$w ne ""} { set win $w }
     if {[winfo exists $win]} { return $win }
     ::vmdai::theme::init
+    ::vmdai::theme::set_appearance [::vmdai::theme::saved_appearance]
     toplevel $win
     wm withdraw $win
     $win configure -background [::vmdai::theme::c chrome]

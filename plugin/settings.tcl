@@ -756,7 +756,7 @@ proc ::vmdai::settings::save {} {
 }
 
 proc ::vmdai::settings::save_steps {} {
-    return {_save_profile _save_keys _save_persisted _save_plugin_prefs _finish_save}
+    return {_save_profile _save_keys _save_persisted _save_plugin_prefs _apply_appearance _finish_save}
 }
 
 # Each step is called with a continuation; it calls {*}$k when done, or
@@ -1047,10 +1047,7 @@ namespace eval ::vmdai::settings {
 
 # System needs MacWindowStyle (Tk 8.6 on aqua); elsewhere only Light and Dark (V7).
 proc ::vmdai::settings::appearance_values {} {
-    if {[tk windowingsystem] eq "aqua" && ![catch {::tk::unsupported::MacWindowStyle isdark .}]} {
-        return {System Light Dark}
-    }
-    return {Light Dark}
+    return [::vmdai::theme::appearance_choices]
 }
 
 proc ::vmdai::settings::_build_panel {p} {
@@ -1118,6 +1115,10 @@ proc ::vmdai::settings::_load_panel_prefs {} {
     set v(appearance) [_dget $d appearance system]
     if {$v(appearance) ni {system light dark}} { set v(appearance) system }
     set v(appearance_label) [string totitle $v(appearance)]
+    if {[lsearch -exact [appearance_values] $v(appearance_label)] < 0} {
+        set v(appearance) light
+        set v(appearance_label) Light
+    }
     set v(expand) [string is true -strict [_dget $d expand_steps false]]
     set v(expand_loaded) $v(expand)
     set v(python) [_dget $d python ""]
@@ -1196,5 +1197,18 @@ proc ::vmdai::settings::_save_plugin_prefs {k} {
     }
     if {$v(expand) != $v(expand_loaded)} { ::vmdai::panel::set_expand_all $v(expand) }
     if {$v(folder) ne "" && $v(folder) ne [pwd]} { ::vmdai::bridge::apply_workdir $v(folder) }
+    {*}$k
+}
+
+# ---- M3 (plan 10, P10-T01): apply the Appearance on Save --------------------
+# Runs after plugin.json is written, so the panel and every open ChatVMD
+# window switch at once ("Changes apply to the next message" is about the
+# model; the look changes immediately).
+proc ::vmdai::settings::_apply_appearance {k} {
+    variable v
+    if {[catch {::vmdai::theme::set_appearance $v(appearance)} err]} {
+        _fail "Could not apply the appearance: $err"
+        return
+    }
     {*}$k
 }
