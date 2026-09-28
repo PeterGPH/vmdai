@@ -1755,6 +1755,12 @@ namespace eval ::vmdai::transcript {
         [list bfactor "Color by B-factor" "Color the protein by B-factor and render a snapshot"] \
         [list rmsd    "Trajectory RMSD"   "Measure the backbone RMSD over the loaded trajectory"]]
     variable PAIR_MIN_WIDTH 520
+    # Below this transcript height the Ready group, trust row and key hints
+    # can run off the bottom with no way to reach them (the overlay has no
+    # scrollbar of its own, spec D6): tighten row spacing and drop the lead
+    # line to buy back room. It is not a full fix at the panel's documented
+    # minimum size (wm minsize 380x420; P10-T07 visual review).
+    variable EMPTY_SHORT_H 650
     if {![info exists ::vmdai::transcript::empty_host]} { variable empty_host "" }
     if {![info exists ::vmdai::transcript::empty_after]} { variable empty_after "" }
 }
@@ -1894,12 +1900,26 @@ proc ::vmdai::transcript::empty_state_shown {{t ""}} {
     return [expr {$t ne "" && [winfo exists [_empty_path $t]]}]
 }
 
-# Two columns from PAIR_MIN_WIDTH px of transcript width, else one.
+# Two columns from PAIR_MIN_WIDTH px of transcript width, else one; below
+# EMPTY_SHORT_H px of transcript height, row spacing tightens and the lead
+# line hides so the Ready group/trust row/key hints stay reachable sooner.
 proc ::vmdai::transcript::layout_empty_state {width {t ""}} {
     variable PAIR_MIN_WIDTH
+    variable EMPTY_SHORT_H
     if {$t eq ""} { set t $::vmdai::panel::text }
-    set cards [_empty_path $t].col.cards
+    set col [_empty_path $t].col
+    set cards $col.cards
     if {![winfo exists $cards]} { return "" }
+    set h [winfo height $t]
+    set short [expr {$h > 1 && $h < $EMPTY_SHORT_H}]
+    grid $col.mark -pady [expr {$short ? {0 2} : {0 6}}]
+    if {$short} {
+        grid remove $col.lead
+    } else {
+        grid $col.lead
+    }
+    grid $col.ready -pady [expr {$short ? {8 0} : {16 0}}]
+    grid $col.keys -pady [expr {$short ? {6 0} : {12 0}}]
     set pair [expr {$width >= $PAIR_MIN_WIDTH}]
     set inner [expr {$width > 96 ? $width - 64 : 360}]
     set card_w [expr {$pair ? ($inner - 12) / 2 : $inner}]
@@ -1913,6 +1933,15 @@ proc ::vmdai::transcript::layout_empty_state {width {t ""}} {
             grid $c -row $i -column 0 -sticky ew -padx 6 -pady 6
         }
         $c.desc configure -wraplength [expr {$card_w - 48}]
+        # Column mode's four stacked cards are the tallest part of the
+        # overlay; drop each card's one-line description first (title and
+        # click-to-fill still work) so a short+narrow window has a chance of
+        # keeping the Ready group reachable without it.
+        if {$short && !$pair} {
+            grid remove $c.desc
+        } else {
+            grid $c.desc
+        }
     }
     grid columnconfigure $cards 0 -weight 1 -uniform card
     if {$pair} {
@@ -1920,11 +1949,11 @@ proc ::vmdai::transcript::layout_empty_state {width {t ""}} {
     } else {
         grid columnconfigure $cards 1 -weight 0 -uniform ""
     }
-    [_empty_path $t].col.lead configure -wraplength [expr {$inner < 480 ? $inner : 480}]
+    $col.lead configure -wraplength [expr {$inner < 480 ? $inner : 480}]
     set wrap [expr {$inner - 170}]
     if {$wrap > 300} { set wrap 300 }
     if {$wrap < 120} { set wrap 120 }
-    set ready [_empty_path $t].col.ready
+    set ready $col.ready
     for {set i 0} {[winfo exists $ready.v$i]} {incr i} {
         $ready.v$i configure -wraplength $wrap
     }
